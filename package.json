@@ -34,7 +34,6 @@
     "vitest": "^3.0.0"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.116.0",
     "@statxai/agents": "workspace:*",
     "@statxai/contracts": "workspace:*",
     "@statxai/gates": "workspace:*",

@@ -1,21 +1,19 @@
 /**
  * Model connectivity and capability probe.
  *
- * Verifies what the agent depends on beyond a plain completion: that the
- * configured provider is reachable, and that structured output actually
- * conforms to a supplied schema. Run before debugging orchestration failures —
- * a broken key or an unsupported parameter surfaces here in one call instead of
- * three layers down.
+ * Verifies what the agent depends on beyond a plain completion: that the model
+ * is reachable, and that structured output actually conforms to a supplied
+ * schema. Run before debugging orchestration failures — a broken key or an
+ * unsupported parameter surfaces here in one call instead of three layers down.
  *
  *   pnpm model:check
- *   PROVIDER=openai pnpm model:check
  */
 import * as z from 'zod/v4';
-import { ModelClient, ModelRefusal, modelFor, providerName } from '@statxai/agents';
+import { ModelClient, ModelRefusal, modelFor } from '@statxai/agents';
 
 // Exercises every constraint kind the contracts use — array minItems > 1,
 // string minLength, a regex pattern, an enum, and an optional property — so the
-// probe fails here if either provider's accepted schema surface narrows.
+// probe fails here if the accepted schema surface ever narrows.
 const Probe = z.object({
   tagline: z.string().min(1),
   sections: z.array(z.string().min(1)).min(2),
@@ -24,11 +22,8 @@ const Probe = z.object({
   aside: z.string().optional(),
 });
 
-const provider = providerName();
-const credential = provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY';
-
-if (!process.env[credential]) {
-  console.error(`\n  FAIL  ${credential} is not set (provider: ${provider}).\n`);
+if (!process.env.OPENAI_API_KEY) {
+  console.error('\n  FAIL  OPENAI_API_KEY is not set.\n');
   process.exit(1);
 }
 
@@ -46,13 +41,13 @@ try {
       'a reference id of the form QA-014, and a tone.',
   });
 
-  console.log(`\n  provider      ${provider}`);
-  console.log(`  configured    ${modelFor('sol', provider)}`);
+  console.log(`\n  configured    ${modelFor('sol')}`);
   console.log(`  served by     ${result.model}`);
   console.log(`  structured    valid (${result.value.sections.length} sections)`);
   console.log(`  optional      ${result.value.aside === undefined ? 'absent, as declared' : 'present'}`);
   console.log(`  tokens        ${result.inputTokens} in / ${result.outputTokens} out`);
   console.log(`  latency       ${((Date.now() - started) / 1000).toFixed(1)}s`);
+  console.log(`\n  tiers         sol=${modelFor('sol')}  terra=${modelFor('terra')}  luna=${modelFor('luna')}`);
   console.log(`\n  OK    model access and structured output are working.\n`);
 } catch (error) {
   if (error instanceof ModelRefusal) {

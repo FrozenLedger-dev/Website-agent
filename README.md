@@ -81,10 +81,15 @@ intake ──validate──> Sol plan ──> Terra build ──> deterministic 
 - **Luna** (repair) fixes one defect at a time, scoped to the files the defect
   lives in.
 
-Tiers map to models through `MODEL_SOL` / `MODEL_TERRA` / `MODEL_LUNA`; all
-default to `claude-opus-5`. §2's cost-control principle — smaller models for
-bounded repairs — is a config change (`MODEL_LUNA=claude-haiku-4-5`), not a code
-change.
+Tiers map to models through `MODEL_SOL` / `MODEL_TERRA` / `MODEL_LUNA`,
+defaulting to `gpt-5.6-sol`, `gpt-5.6-terra` and `gpt-5.6-luna` respectively.
+§2's cost-control principle — smaller models for bounded repairs — is a config
+change (`MODEL_LUNA=gpt-5.4-mini`), not a code change.
+
+Every vendor-specific constraint lives in `packages/agents/src/providers/` and
+nowhere else: the strict schema dialect, the reasoning-effort ladder, the
+64-character schema-name cap, and the request timeout. §1 requires the platform
+not depend on a single vendor, so adding one means implementing one interface.
 
 ## Data layer
 

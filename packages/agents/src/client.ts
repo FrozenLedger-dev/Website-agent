@@ -2,40 +2,36 @@
  * Model adapter.
  *
  * The document is explicit that Sol/Terra/Luna are orchestration tiers, not
- * model names (§1), so both the vendor and the tier → model mapping live in
- * configuration. Nothing above this file references a vendor or a model id.
+ * model names (§1), so the tier → model mapping lives in configuration.
+ * Nothing above this file references a model id.
+ *
+ * The Provider seam is retained even with a single implementation: it is what
+ * keeps the vendor's constraints — the strict schema dialect, the shorter
+ * effort ladder, the schema-name cap, the request timeout — out of the skills,
+ * gates and orchestrator. §2 lists model portability as a reason for the
+ * architecture, and adding a vendor means implementing one interface.
  */
 import type * as z from 'zod/v4';
 import { stripNulls, toModelSchema, toStrictModelSchema, type AgentTier } from '@statxai/contracts';
-import { AnthropicProvider } from './providers/anthropic.js';
 import { OpenAiProvider } from './providers/openai.js';
 import type { Effort, Provider } from './providers/types.js';
 
 export type { Effort, Provider, ProviderRequest, ProviderResponse } from './providers/types.js';
-export { AnthropicProvider } from './providers/anthropic.js';
 export { OpenAiProvider, schemaName, toReasoningEffort } from './providers/openai.js';
 
-export type ProviderName = 'anthropic' | 'openai';
-
 /**
- * Per-provider tier defaults.
+ * Tier defaults.
  *
- * The OpenAI account exposes a model per tier, which maps onto §1's labels
- * exactly. Anthropic defaults every tier to the flagship: §2 argues for smaller
- * models on bounded repairs, but that is an operator's cost decision, so it is
- * configuration (MODEL_LUNA=…) rather than an assumption made here.
+ * The account exposes a model per orchestration tier, which maps onto §1's
+ * labels directly. Override any of them with MODEL_SOL / MODEL_TERRA /
+ * MODEL_LUNA — §2's cost-control argument (smaller models for bounded repairs)
+ * is an operator decision, so it is configuration rather than an assumption
+ * made here.
  */
-const DEFAULT_MODELS: Record<ProviderName, Record<AgentTier, string>> = {
-  anthropic: {
-    sol: 'claude-opus-5',
-    terra: 'claude-opus-5',
-    luna: 'claude-opus-5',
-  },
-  openai: {
-    sol: 'gpt-5.6-sol',
-    terra: 'gpt-5.6-terra',
-    luna: 'gpt-5.6-luna',
-  },
+const DEFAULT_MODELS: Record<AgentTier, string> = {
+  sol: 'gpt-5.6-sol',
+  terra: 'gpt-5.6-terra',
+  luna: 'gpt-5.6-luna',
 };
 
 /** Model output ceiling. Retries never ask for more than the model can emit. */
@@ -52,22 +48,14 @@ export function stepDownEffort(effort: Effort): Effort {
   return index <= 0 ? 'low' : EFFORT_LADDER[index - 1]!;
 }
 
-export function providerName(): ProviderName {
-  const configured = process.env.PROVIDER?.toLowerCase();
-  if (configured === 'openai' || configured === 'anthropic') return configured;
-  // Infer from whichever credential is present, so swapping keys is enough.
-  if (process.env.OPENAI_API_KEY && !process.env.ANTHROPIC_API_KEY) return 'openai';
-  return 'anthropic';
-}
-
-export function modelFor(tier: AgentTier, provider: ProviderName = providerName()): string {
+export function modelFor(tier: AgentTier): string {
   const override =
     tier === 'sol' ? process.env.MODEL_SOL : tier === 'terra' ? process.env.MODEL_TERRA : process.env.MODEL_LUNA;
-  return override ?? DEFAULT_MODELS[provider][tier];
+  return override ?? DEFAULT_MODELS[tier];
 }
 
-export function createProvider(name: ProviderName = providerName()): Provider {
-  return name === 'openai' ? new OpenAiProvider() : new AnthropicProvider();
+export function createProvider(): Provider {
+  return new OpenAiProvider();
 }
 
 export class ModelRefusal extends Error {
@@ -116,11 +104,11 @@ export class ModelClient {
   /**
    * One structured call, retrying once if the response is cut off.
    *
-   * The output cap bounds reasoning and answer together on both providers, so
-   * how much headroom a call needs depends on how much the model chooses to
-   * think — which varies run to run for identical inputs. Three separate call
-   * sites were each truncated at a different ceiling before this existed, and
-   * every one killed a delivery outright.
+   * The output cap bounds reasoning and answer together, so how much headroom a
+   * call needs depends on how much the model chooses to think — which varies
+   * run to run for identical inputs. Three separate call sites were each
+   * truncated at a different ceiling before this existed, and every one killed
+   * a delivery outright.
    */
   async call<T>(options: CallOptions<T>): Promise<CallResult<T>> {
     try {
@@ -141,7 +129,7 @@ export class ModelClient {
     const strict = this.provider.schemaDialect === 'strict';
 
     const response = await this.provider.complete({
-      model: modelFor(options.tier, this.provider.name),
+      model: modelFor(options.tier),
       system: options.system,
       prompt: options.prompt,
       schema: strict ? toStrictModelSchema(options.schema) : toModelSchema(options.schema),
@@ -158,9 +146,9 @@ export class ModelClient {
     let value: T;
     try {
       const parsed: unknown = JSON.parse(response.text);
-      // Strict dialects express "absent" as null, because every property must
-      // be required. Convert back before the Zod schema — which is what
-      // actually enforces the contract — sees it.
+      // A strict dialect expresses "absent" as null, because every property must
+      // be required. Convert back before the Zod schema — which is what actually
+      // enforces the contract — sees it.
       value = options.schema.parse(strict ? stripNulls(parsed) : parsed);
     } catch (error) {
       throw new MalformedModelOutput(response.text, error);

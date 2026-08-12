@@ -33,7 +33,7 @@ export interface ProviderResponse {
 }
 
 export interface Provider {
-  readonly name: 'anthropic' | 'openai';
+  readonly name: string;
   /**
    * How this provider wants its JSON Schema. Providers differ on whether
    * optional properties are permitted, so the projection belongs here rather

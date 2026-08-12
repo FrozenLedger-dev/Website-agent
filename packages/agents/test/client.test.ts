@@ -5,9 +5,8 @@ import {
   ModelClient,
   ModelRefusal,
   modelFor,
-  providerName,
-  stepDownEffort,
   schemaName,
+  stepDownEffort,
   toReasoningEffort,
   type Provider,
   type ProviderRequest,
@@ -24,7 +23,7 @@ function fakeProvider(turns: Turn[], dialect: Provider['schemaDialect'] = 'stand
   let index = 0;
 
   const provider: Provider = {
-    name: 'anthropic',
+    name: 'test',
     schemaDialect: dialect,
     async complete(request) {
       calls.push(request);
@@ -53,40 +52,30 @@ const call = (provider: Provider) =>
     effort: 'xhigh',
   });
 
-describe('provider selection', () => {
-  it('infers the provider from whichever credential is present', () => {
-    const env = { ...process.env };
-    try {
-      delete process.env.PROVIDER;
-      delete process.env.ANTHROPIC_API_KEY;
-      process.env.OPENAI_API_KEY = 'x';
-      expect(providerName()).toBe('openai');
-
-      process.env.ANTHROPIC_API_KEY = 'y';
-      expect(providerName()).toBe('anthropic');
-
-      process.env.PROVIDER = 'openai';
-      expect(providerName()).toBe('openai');
-    } finally {
-      process.env = env;
-    }
-  });
-
-  it('maps each tier to its provider default', () => {
+describe('tier to model mapping', () => {
+  it('maps each orchestration tier to its model', () => {
     const env = { ...process.env };
     try {
       delete process.env.MODEL_SOL;
       delete process.env.MODEL_TERRA;
       delete process.env.MODEL_LUNA;
 
-      expect(modelFor('sol', 'openai')).toBe('gpt-5.6-sol');
-      expect(modelFor('terra', 'openai')).toBe('gpt-5.6-terra');
-      expect(modelFor('luna', 'openai')).toBe('gpt-5.6-luna');
-      expect(modelFor('sol', 'anthropic')).toBe('claude-opus-5');
+      expect(modelFor('sol')).toBe('gpt-5.6-sol');
+      expect(modelFor('terra')).toBe('gpt-5.6-terra');
+      expect(modelFor('luna')).toBe('gpt-5.6-luna');
+    } finally {
+      process.env = env;
+    }
+  });
 
-      // §2's cost control is a config change, not a code change.
-      process.env.MODEL_LUNA = 'claude-haiku-4-5';
-      expect(modelFor('luna', 'anthropic')).toBe('claude-haiku-4-5');
+  it('lets configuration override any tier', () => {
+    // §2's cost control — a smaller model for bounded repairs — is an operator
+    // decision, so it is a config change rather than a code change.
+    const env = { ...process.env };
+    try {
+      process.env.MODEL_LUNA = 'gpt-5.4-mini';
+      expect(modelFor('luna')).toBe('gpt-5.4-mini');
+      expect(modelFor('sol')).toBe(process.env.MODEL_SOL ?? 'gpt-5.6-sol');
     } finally {
       process.env = env;
     }

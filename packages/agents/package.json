@@ -9,7 +9,6 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.116.0",
     "@statxai/contracts": "workspace:*",
     "openai": "^7.4.0",
     "zod": "^3.25.76"

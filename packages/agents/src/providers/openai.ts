@@ -4,13 +4,16 @@ import type { Effort, Provider, ProviderRequest, ProviderResponse } from './type
 /**
  * OpenAI provider.
  *
- * Three shape differences from the Anthropic path, all confined to this file:
+ * Every vendor-specific constraint lives in this file and nowhere else:
  *
- *   - the output cap is `max_completion_tokens`, not `max_tokens`;
+ *   - the output cap is `max_completion_tokens`;
  *   - reasoning depth is `reasoning_effort`, whose ladder is shorter than the
- *     platform's, so the top two tiers collapse onto `high`;
- *   - strict structured output forbids optional properties, which is why this
- *     provider declares the `strict` schema dialect.
+ *     platform's five levels, so the top two collapse onto `high`;
+ *   - strict structured output forbids optional properties, hence the `strict`
+ *     schema dialect;
+ *   - `json_schema.name` is capped at 64 characters;
+ *   - long planning and build calls need a request timeout well above the
+ *     SDK default.
  */
 export class OpenAiProvider implements Provider {
   readonly name = 'openai' as const;
