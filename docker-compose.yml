@@ -1,0 +1,34 @@
+# Local development Mongo.
+#
+# Runs as a single-node REPLICA SET, not a standalone. This is mandatory:
+# multi-document transactions are unavailable on a standalone mongod, and the
+# platform's budget enforcement depends on them (claim + decrement + transition
+# must commit or roll back together).
+#
+# mongod listens on 27018 *inside* the container as well as outside, so the
+# replica set's advertised member address (localhost:27018) is both
+# self-resolvable by the node and reachable from the host.
+
+services:
+  mongo:
+    image: mongo:8
+    container_name: statxai-mongo
+    command: ['--replSet', 'rs0', '--port', '27018', '--bind_ip_all']
+    ports:
+      - '27018:27018'
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      # Idempotently initiates the replica set once mongod accepts connections.
+      test: >
+        mongosh --port 27018 --quiet --eval "
+          try { rs.status().ok }
+          catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27018'}]}).ok }
+        "
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+
+volumes:
+  mongo-data:

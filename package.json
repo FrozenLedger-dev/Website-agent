@@ -1,0 +1,55 @@
+{
+  "name": "statxai",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=20.18.0"
+  },
+  "scripts": {
+    "db:up": "docker compose up -d mongo",
+    "db:down": "docker compose down",
+    "db:shell": "mongosh --port 27018",
+    "db:check": "node --env-file=.env.local --import tsx scripts/db-check.ts",
+    "model:check": "node --env-file=.env.local --import tsx scripts/model-check.ts",
+    "agent:run": "node --env-file=.env.local --import tsx scripts/run-agent.ts",
+    "preview": "node --env-file=.env.local --import tsx scripts/preview.ts",
+    "gate:check": "node --env-file=.env.local --import tsx scripts/gate-check.ts",
+    "console": "cd apps/console && node --env-file=../../.env.local ./node_modules/next/dist/bin/next dev --port 3100",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rm -rf packages/*/dist coverage **/*.tsbuildinfo"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.18.0",
+    "@types/node": "^22.10.0",
+    "eslint": "^9.18.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.20.0",
+    "vitest": "^3.0.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.116.0",
+    "@statxai/agents": "workspace:*",
+    "@statxai/contracts": "workspace:*",
+    "@statxai/gates": "workspace:*",
+    "@statxai/job-engine": "workspace:*",
+    "@statxai/orchestrator": "workspace:*",
+    "@statxai/state": "workspace:*",
+    "@statxai/workspace": "workspace:*",
+    "mongodb": "^6.12.0",
+    "node-html-parser": "^9.0.1",
+    "zod": "^3.24.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp"
+    ]
+  }
+}

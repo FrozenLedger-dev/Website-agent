@@ -1,0 +1,43 @@
+{
+  "businessName": "Harrowgate Joinery",
+  "industry": "Bespoke joinery and carpentry",
+  "location": "Harrogate, North Yorkshire",
+  "serviceArea": "Harrogate, Leeds, York and surrounding villages",
+  "audience": "Homeowners renovating period properties, and interior designers specifying built-in furniture for clients",
+  "services": [
+    {
+      "name": "Fitted wardrobes and storage",
+      "description": "Built-in wardrobes, alcove units and boot rooms designed around the room and finished on site."
+    },
+    {
+      "name": "Kitchens in solid timber",
+      "description": "Hand-built kitchen cabinetry in oak, ash and painted tulipwood, including islands and pantry units."
+    },
+    {
+      "name": "Sash window restoration",
+      "description": "Repair and draught-proofing of original box sash windows, including cord replacement and re-glazing."
+    },
+    {
+      "name": "Staircases and balustrades",
+      "description": "New staircases and replacement handrails, spindles and newel posts matched to the existing property."
+    }
+  ],
+  "differentiators": [
+    "Every commission is drawn, made and fitted by the same two joiners",
+    "Workshop in Starbeck, so clients can see pieces before installation",
+    "Specialists in listed and conservation-area properties",
+    "Timber sourced from FSC-certified UK merchants"
+  ],
+  "yearsInBusiness": 18,
+  "contact": {
+    "email": "workshop@harrowgatejoinery.co.uk",
+    "phone": "01423 887 214",
+    "address": "Unit 4, Starbeck Works, Harrogate HG2 7EE"
+  },
+  "tone": "Warm and plainspoken, confident about craft without being showy. Written for people spending real money on their home.",
+  "goals": [
+    "Get homeowners to request a workshop visit or a home measure",
+    "Show the range of work so enquiries arrive better qualified",
+    "Make the conservation-property specialism obvious to interior designers"
+  ]
+}

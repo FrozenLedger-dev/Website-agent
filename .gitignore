@@ -1,0 +1,19 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# per-project generated website workspaces (Git-managed separately)
+/workspaces/
+
+.DS_Store
+*.log
+
+# Next.js build output
+.next/
+next-env.d.ts
