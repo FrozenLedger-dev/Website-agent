@@ -10,6 +10,7 @@
  */
 import {
   BusinessProfile,
+  HOME_PAGE_PATH,
   intakeGaps,
   isReleaseBlocked,
   legalTerminalOutcomes,
@@ -115,27 +116,36 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   await workspace.materialiseArtifact('client/business-profile.json', profile);
 
   // -- Phase 2: Plan --------------------------------------------------------
-  say({ phase: 'plan', detail: 'Sol is producing the specification' });
-  const planned = await planSite(model, profile);
-  track(planned);
-  const plan: SitePlan = planned.value;
+  async function producePlan(attempt: number): Promise<SitePlan> {
+    say({
+      phase: 'plan',
+      detail: attempt === 0 ? 'Sol is producing the specification' : 'Sol is revising the specification',
+    });
+    const planned = await planSite(model, profile);
+    track(planned);
+    const produced = planned.value;
 
-  say({
-    phase: 'plan',
-    detail: `${plan.sitemap.pages.length} pages, ${plan.acceptanceCriteria.length} acceptance criteria (${planned.model}, ${(planned.ms / 1000).toFixed(1)}s)`,
-    level: 'ok',
-  });
+    say({
+      phase: 'plan',
+      detail: `${produced.sitemap.pages.length} pages, ${produced.acceptanceCriteria.length} acceptance criteria (${planned.model}, ${(planned.ms / 1000).toFixed(1)}s)`,
+      level: 'ok',
+    });
 
-  const planRef = await registry.put(projectId, 'site-plan', plan);
-  await registry.accept(projectId, planRef);
-  await workspace.materialiseArtifact('design/brand-system.json', plan.brandSystem);
-  await workspace.materialiseArtifact('specs/sitemap.json', plan.sitemap);
-  for (const page of plan.sitemap.pages) {
-    await workspace.materialiseArtifact(`specs/pages/${page.path.replace(/\//g, '_')}.json`, page);
+    const ref = await registry.put(projectId, 'site-plan', produced);
+    await registry.accept(projectId, ref);
+    await workspace.materialiseArtifact('design/brand-system.json', produced.brandSystem);
+    await workspace.materialiseArtifact('specs/sitemap.json', produced.sitemap);
+    for (const page of produced.sitemap.pages) {
+      await workspace.materialiseArtifact(`specs/pages/${page.path.replace(/\//g, '_')}.json`, page);
+    }
+    return produced;
   }
 
+  let plan = await producePlan(0);
+
   // -- Phase 3: Build (one-shot first) --------------------------------------
-  await store.projects.updateOne({ _id: projectId }, { $set: { state: 'building', updatedAt: new Date() } });
+  async function buildFromPlan(current: SitePlan): Promise<void> {
+    await store.projects.updateOne({ _id: projectId }, { $set: { state: 'building', updatedAt: new Date() } });
 
   /**
    * §3 mandates one-shot first, so `auto` is the default. `decompose` skips
@@ -150,7 +160,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     if (strategy === 'decompose') throw new MalformedModelOutput('', new Error('forced: output truncated'));
 
     say({ phase: 'build', detail: 'Terra is attempting the complete site in one pass' });
-    const built = await buildSite(model, profile, plan);
+    const built = await buildSite(model, profile, current);
     track(built);
     await workspace.writeSiteFiles(built.value.files);
     say({
@@ -177,20 +187,23 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       level: 'warn',
     });
 
-    const anchor = await buildAnchor(model, profile, plan);
+    const anchor = await buildAnchor(model, profile, current);
     track(anchor);
     await workspace.writeSiteFiles(anchor.value.files);
 
-    const anchorPage = plan.sitemap.pages[0]!;
+    // The homepage anchors the design system. Selecting by array order once put
+    // a nested FAQ page in this role.
+    const anchorPage =
+      current.sitemap.pages.find((p) => p.path === HOME_PAGE_PATH) ?? current.sitemap.pages[0]!;
     const stylesheet = anchor.value.files.find((f) => f.path.endsWith('.css'))?.contents ?? '';
     const anchorHtml = anchor.value.files.find((f) => f.path === anchorPage.path)?.contents ?? '';
     say({ phase: 'build', detail: `Anchor: ${anchorPage.path} + styles.css`, level: 'ok' });
 
     // Pages are independent given the anchor, and each writes a distinct file,
     // so there is no output conflict to serialise — they can run concurrently.
-    const rest = plan.sitemap.pages.slice(1);
+    const rest = current.sitemap.pages.filter((p) => p.path !== anchorPage.path);
     const pages = await Promise.all(
-      rest.map((page) => buildPage(model, profile, plan, page, anchorPage.path, anchorHtml, stylesheet)),
+      rest.map((page) => buildPage(model, profile, current, page, anchorPage.path, anchorHtml, stylesheet)),
     );
     for (const page of pages) {
       track(page);
@@ -199,7 +212,10 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     say({ phase: 'build', detail: `${rest.length} further pages built in parallel`, level: 'ok' });
   }
 
-  await workspace.commit('Terra: build');
+    await workspace.commit('Terra: build');
+  }
+
+  await buildFromPlan(plan);
 
   // -- Phases 4/5: Evaluate, repair, escalate -------------------------------
   let reviewCycle = 0;
@@ -289,6 +305,44 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     if (mustFix.length === 0) {
       say({ phase: 'evaluate', detail: 'No blocking criteria outstanding — Sol approves', level: 'ok' });
       break;
+    }
+
+    /**
+     * §7's escalation ladder is repair → specialist → specification revision,
+     * and this is the third rung. When the blocking work exceeds what the
+     * repair budget could ever clear, repairing is not convergent: the plan is
+     * the defect, not the pages. One run planned every page nested under
+     * "about/faq/" with no homepage, produced ninety blocking findings against
+     * a budget of eight, and ground through repairs that could never finish.
+     */
+    const currentBudget = (await store.budgets.findOne({ _id: projectId }))!;
+    const repairsLeft = currentBudget.limits.totalRepairJobs - currentBudget.used.totalRepairJobs;
+
+    if (mustFix.length > repairsLeft) {
+      try {
+        await spend(store, projectId, 'replans');
+      } catch (error) {
+        if (!(error instanceof BudgetExhausted)) throw error;
+        terminalDecision = decideTerminal(defects, autonomyMode);
+        say({
+          phase: 'escalate',
+          detail: `Re-plan budget exhausted with ${mustFix.length} blocking defects → ${terminalDecision}`,
+          level: 'fail',
+        });
+        break;
+      }
+
+      say({
+        phase: 'escalate',
+        detail: `${mustFix.length} blocking defects exceed the ${repairsLeft} repair jobs remaining — revising the specification`,
+        level: 'warn',
+      });
+
+      await workspace.clearSite();
+      plan = await producePlan(reviewCycle + 1);
+      await buildFromPlan(plan);
+      repairedSinceReview = [];
+      continue;
     }
 
     // A rejection cycle is spent whenever blocking work remains.

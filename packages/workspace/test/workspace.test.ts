@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -37,10 +38,30 @@ describe('path safety', () => {
     ).rejects.toBeInstanceOf(PathEscapesWorkspace);
   });
 
-  it('refuses an absolute path', async () => {
-    const ws = await ProjectWorkspace.open(PROJECT, root);
+  it('contains an absolute-looking path inside the site rather than obeying it', async () => {
+    // The invariant is containment, not rejection: a leading slash means "site
+    // root" to a model, so it is normalised and written *inside* the workspace.
+    // What must never happen is a write to the real /etc.
+    const ws = await ProjectWorkspace.open(`${PROJECT}_abs`, root);
+    await ws.writeSiteFiles([{ path: '/etc/evil.html', contents: 'x' }]);
+
+    expect(await ws.readSiteFile('etc/evil.html')).toBe('x');
+    expect(existsSync('/etc/evil.html')).toBe(false);
+  });
+
+  it('treats a leading slash as site-root, not filesystem-root', async () => {
+    // Regression: some models emit "/services.html" meaning site-relative. That
+    // resolved to an absolute path and was refused mid-build, failing a run
+    // whose anchor page had already been written.
+    const ws = await ProjectWorkspace.open(`${PROJECT}_slash`, root);
+    await ws.writeSiteFiles([{ path: '/services.html', contents: '<h1>ok</h1>' }]);
+    expect(await ws.readSiteFile('services.html')).toBe('<h1>ok</h1>');
+  });
+
+  it('still refuses traversal that only looks site-relative', async () => {
+    const ws = await ProjectWorkspace.open(`${PROJECT}_slash2`, root);
     await expect(
-      ws.writeSiteFiles([{ path: '/etc/evil.html', contents: 'x' }]),
+      ws.writeSiteFiles([{ path: '/../../etc/evil.html', contents: 'x' }]),
     ).rejects.toBeInstanceOf(PathEscapesWorkspace);
   });
 

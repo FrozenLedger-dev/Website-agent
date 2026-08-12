@@ -544,14 +544,28 @@ const responsive: Gate = (ctx) => {
   const css = ctx.files.filter((f) => f.path.endsWith('.css'));
 
   for (const file of css) {
-    // Fixed widths above a phone viewport are the usual cause of horizontal
-    // overflow at 320px. max-width is fine, so the negative lookbehind matters.
-    const fixed = /(?<!max-|min-)width:\s*(\d{3,})px/g;
-    let match: RegExpExecArray | null;
+    /**
+     * Only a bare `width` set to a literal pixel value can overflow.
+     *
+     * The property name is parsed rather than pattern-matched, because a
+     * text-level match flags things that are correct: `--page-width: 1200px`
+     * is a custom property, not a width, and `width: min(var(--page-width),
+     * 100%)` is the fluid pattern this gate exists to encourage. Both were
+     * reported on a site that had no overflow at all.
+     */
+    const declaration = /(?:^|[;{])\s*(--[\w-]+|[a-z-]+)\s*:\s*([^;}]+)/gi;
     const offenders = new Set<string>();
-    while ((match = fixed.exec(file.contents)) !== null) {
-      if (Number(match[1]) > 480) offenders.add(match[0]);
+
+    let match: RegExpExecArray | null;
+    while ((match = declaration.exec(file.contents)) !== null) {
+      const property = match[1]!.toLowerCase();
+      const value = match[2]!.trim();
+      if (property !== 'width') continue;
+
+      const literal = /^(\d{3,})px$/.exec(value);
+      if (literal && Number(literal[1]) > 480) offenders.add(`width: ${value}`);
     }
+
     for (const offender of offenders) {
       findings.push({
         gate: 'responsive',

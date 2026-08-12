@@ -197,6 +197,24 @@ describe('responsive gate', () => {
     );
     expect(run(fine).findings.filter((f) => f.gate === 'responsive')).toEqual([]);
   });
+
+  it('does not flag a custom property that merely names a width', () => {
+    // False positive on a released site: "--page-width: 1200px" is a token, not
+    // a width, and the text-level match saw "page-" where it looked for "max-".
+    const fine = CLEAN.map((f) =>
+      f.path === 'styles.css' ? { ...f, contents: `:root{--page-width:1200px}${f.contents}` } : f,
+    );
+    expect(run(fine).findings.filter((f) => f.gate === 'responsive')).toEqual([]);
+  });
+
+  it('does not flag a width clamped with min(), which cannot overflow', () => {
+    const fine = CLEAN.map((f) =>
+      f.path === 'styles.css'
+        ? { ...f, contents: `${f.contents} .wrap{width:min(1200px, calc(100% - 2rem))}` }
+        : f,
+    );
+    expect(run(fine).findings.filter((f) => f.gate === 'responsive')).toEqual([]);
+  });
 });
 
 describe('severity semantics', () => {

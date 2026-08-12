@@ -21,6 +21,10 @@ Rules that govern everything you produce:
   guarantees. If the profile does not support a claim, the site does not make it.
 - Plan 4 to 6 pages. A standard business site is home, services, about, contact, and at
   most one more if the profile clearly justifies it.
+- The homepage MUST be at "index.html". Page paths are site-root-relative filenames with
+  no leading slash and no invented directory nesting — "services.html", not
+  "/services.html" and not "about/faq/services.html". A site whose pages all sit under a
+  subdirectory has no entry point and does not load.
 - Every page needs one clear goal and one primary action.
 - Content bindings name the business-profile fields a section draws from. They are how
   the platform later verifies the site reflects the client's actual business.

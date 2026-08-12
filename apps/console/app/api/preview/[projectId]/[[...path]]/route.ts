@@ -36,7 +36,30 @@ export async function GET(
   const body = await readFile(filePath).catch(() => null);
   if (!body) return new Response('Not found', { status: 404 });
 
-  return new Response(new Uint8Array(body), {
-    headers: { 'content-type': TYPES[extname(filePath)] ?? 'application/octet-stream' },
-  });
+  const contentType = TYPES[extname(filePath)] ?? 'application/octet-stream';
+
+  // Generated sites use site-root-relative links ("styles.css", "about.html"),
+  // but they are served from a nested route. Without a <base>, the browser
+  // resolves those against "/api/preview/" — so the stylesheet 404s and the
+  // page renders as unstyled text, which is exactly how this shipped before.
+  if (contentType.startsWith('text/html')) {
+    return new Response(withBaseHref(body.toString('utf8'), `/api/preview/${projectId}/`), {
+      headers: { 'content-type': contentType },
+    });
+  }
+
+  return new Response(new Uint8Array(body), { headers: { 'content-type': contentType } });
+}
+
+/** Insert a <base> so site-relative URLs resolve under the preview prefix. */
+export function withBaseHref(html: string, base: string): string {
+  if (/<base\b/i.test(html)) return html;
+
+  const head = /<head\b[^>]*>/i.exec(html);
+  if (head) {
+    const at = head.index + head[0].length;
+    return `${html.slice(0, at)}<base href="${base}">${html.slice(at)}`;
+  }
+  // No <head> to anchor to; prepend so it still precedes any resource request.
+  return `<base href="${base}">${html}`;
 }

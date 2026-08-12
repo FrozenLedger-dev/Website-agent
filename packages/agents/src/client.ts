@@ -2,26 +2,41 @@
  * Model adapter.
  *
  * The document is explicit that Sol/Terra/Luna are orchestration tiers, not
- * model names (§1), so the tier → model mapping lives in configuration and
- * nothing downstream references a model id.
+ * model names (§1), so both the vendor and the tier → model mapping live in
+ * configuration. Nothing above this file references a vendor or a model id.
  */
-import Anthropic from '@anthropic-ai/sdk';
 import type * as z from 'zod/v4';
-import { toModelSchema, type AgentTier } from '@statxai/contracts';
+import { stripNulls, toModelSchema, toStrictModelSchema, type AgentTier } from '@statxai/contracts';
+import { AnthropicProvider } from './providers/anthropic.js';
+import { OpenAiProvider } from './providers/openai.js';
+import type { Effort, Provider } from './providers/types.js';
+
+export type { Effort, Provider, ProviderRequest, ProviderResponse } from './providers/types.js';
+export { AnthropicProvider } from './providers/anthropic.js';
+export { OpenAiProvider, schemaName, toReasoningEffort } from './providers/openai.js';
+
+export type ProviderName = 'anthropic' | 'openai';
 
 /**
- * Default mapping.
+ * Per-provider tier defaults.
  *
- * All three tiers default to the flagship model. §2 argues for reserving
- * high-reasoning models for planning and giving bounded repairs to smaller
- * ones — that is a cost/quality decision for the operator, so it is exposed as
- * configuration (MODEL_SOL / MODEL_TERRA / MODEL_LUNA) rather than assumed
- * here. Setting MODEL_LUNA=claude-haiku-4-5 implements §2's cost-control
- * principle without a code change.
+ * The OpenAI account exposes a model per tier, which maps onto §1's labels
+ * exactly. Anthropic defaults every tier to the flagship: §2 argues for smaller
+ * models on bounded repairs, but that is an operator's cost decision, so it is
+ * configuration (MODEL_LUNA=…) rather than an assumption made here.
  */
-const DEFAULT_MODEL = 'claude-opus-5';
-
-export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+const DEFAULT_MODELS: Record<ProviderName, Record<AgentTier, string>> = {
+  anthropic: {
+    sol: 'claude-opus-5',
+    terra: 'claude-opus-5',
+    luna: 'claude-opus-5',
+  },
+  openai: {
+    sol: 'gpt-5.6-sol',
+    terra: 'gpt-5.6-terra',
+    luna: 'gpt-5.6-luna',
+  },
+};
 
 /** Model output ceiling. Retries never ask for more than the model can emit. */
 const MAX_OUTPUT_TOKENS = 128_000;
@@ -37,15 +52,22 @@ export function stepDownEffort(effort: Effort): Effort {
   return index <= 0 ? 'low' : EFFORT_LADDER[index - 1]!;
 }
 
-export function modelFor(tier: AgentTier): string {
-  switch (tier) {
-    case 'sol':
-      return process.env.MODEL_SOL ?? DEFAULT_MODEL;
-    case 'terra':
-      return process.env.MODEL_TERRA ?? DEFAULT_MODEL;
-    case 'luna':
-      return process.env.MODEL_LUNA ?? DEFAULT_MODEL;
-  }
+export function providerName(): ProviderName {
+  const configured = process.env.PROVIDER?.toLowerCase();
+  if (configured === 'openai' || configured === 'anthropic') return configured;
+  // Infer from whichever credential is present, so swapping keys is enough.
+  if (process.env.OPENAI_API_KEY && !process.env.ANTHROPIC_API_KEY) return 'openai';
+  return 'anthropic';
+}
+
+export function modelFor(tier: AgentTier, provider: ProviderName = providerName()): string {
+  const override =
+    tier === 'sol' ? process.env.MODEL_SOL : tier === 'terra' ? process.env.MODEL_TERRA : process.env.MODEL_LUNA;
+  return override ?? DEFAULT_MODELS[provider][tier];
+}
+
+export function createProvider(name: ProviderName = providerName()): Provider {
+  return name === 'openai' ? new OpenAiProvider() : new AnthropicProvider();
 }
 
 export class ModelRefusal extends Error {
@@ -72,7 +94,7 @@ export interface CallOptions<T> {
   schema: z.ZodType<T>;
   maxTokens?: number;
   effort?: Effort;
-  /** Label used in usage reporting. */
+  /** Label used in usage reporting and as the provider-side schema name. */
   label: string;
 }
 
@@ -85,21 +107,20 @@ export interface CallResult<T> {
 }
 
 export class ModelClient {
-  private readonly client: Anthropic;
+  private readonly provider: Provider;
 
-  constructor(client?: Anthropic) {
-    this.client = client ?? new Anthropic();
+  constructor(provider?: Provider) {
+    this.provider = provider ?? createProvider();
   }
 
   /**
    * One structured call, retrying once if the response is cut off.
    *
-   * `max_tokens` bounds thinking *and* output together, so how much headroom a
-   * call needs depends on how much the model chooses to reason — which varies
-   * run to run for identical inputs. Three different call sites were each
-   * truncated at a different ceiling before this existed, and every one killed
-   * a delivery outright. Retrying with more headroom and less effort is far
-   * cheaper than losing the work already done.
+   * The output cap bounds reasoning and answer together on both providers, so
+   * how much headroom a call needs depends on how much the model chooses to
+   * think — which varies run to run for identical inputs. Three separate call
+   * sites were each truncated at a different ceiling before this existed, and
+   * every one killed a delivery outright.
    */
   async call<T>(options: CallOptions<T>): Promise<CallResult<T>> {
     try {
@@ -107,58 +128,49 @@ export class ModelClient {
     } catch (error) {
       if (!(error instanceof MalformedModelOutput) || !/truncated/.test(error.message)) throw error;
 
-      const retry: CallOptions<T> = {
+      return this.attempt({
         ...options,
         maxTokens: Math.min(MAX_OUTPUT_TOKENS, (options.maxTokens ?? 32_000) * 2),
         effort: stepDownEffort(options.effort ?? 'high'),
-      };
-      return this.attempt(retry);
+      });
     }
   }
 
   private async attempt<T>(options: CallOptions<T>): Promise<CallResult<T>> {
-    const model = modelFor(options.tier);
     const started = Date.now();
+    const strict = this.provider.schemaDialect === 'strict';
 
-    const stream = this.client.messages.stream({
-      model,
-      max_tokens: options.maxTokens ?? 32_000,
-      thinking: { type: 'adaptive' },
-      output_config: {
-        effort: options.effort ?? 'high',
-        format: { type: 'json_schema', schema: toModelSchema(options.schema) },
-      },
+    const response = await this.provider.complete({
+      model: modelFor(options.tier, this.provider.name),
       system: options.system,
-      messages: [{ role: 'user', content: options.prompt }],
+      prompt: options.prompt,
+      schema: strict ? toStrictModelSchema(options.schema) : toModelSchema(options.schema),
+      schemaName: options.label.replace(/[^a-zA-Z0-9_-]/g, '_'),
+      maxTokens: options.maxTokens ?? 32_000,
+      effort: options.effort ?? 'high',
     });
 
-    const message = await stream.finalMessage();
-
-    if (message.stop_reason === 'refusal') {
-      throw new ModelRefusal(message.stop_details?.category);
-    }
-
-    const text = message.content
-      .filter((block): block is Anthropic.TextBlock => block.type === 'text')
-      .map((block) => block.text)
-      .join('');
-
-    if (message.stop_reason === 'max_tokens') {
-      throw new MalformedModelOutput(text, new Error('output truncated at max_tokens'));
+    if (response.stopReason === 'refusal') throw new ModelRefusal(response.refusalCategory);
+    if (response.stopReason === 'truncated') {
+      throw new MalformedModelOutput(response.text, new Error('output truncated at max_tokens'));
     }
 
     let value: T;
     try {
-      value = options.schema.parse(JSON.parse(text));
+      const parsed: unknown = JSON.parse(response.text);
+      // Strict dialects express "absent" as null, because every property must
+      // be required. Convert back before the Zod schema — which is what
+      // actually enforces the contract — sees it.
+      value = options.schema.parse(strict ? stripNulls(parsed) : parsed);
     } catch (error) {
-      throw new MalformedModelOutput(text, error);
+      throw new MalformedModelOutput(response.text, error);
     }
 
     return {
       value,
-      model,
-      inputTokens: message.usage.input_tokens,
-      outputTokens: message.usage.output_tokens,
+      model: response.model,
+      inputTokens: response.inputTokens,
+      outputTokens: response.outputTokens,
       ms: Date.now() - started,
     };
   }

@@ -90,8 +90,20 @@ export const PageSection = z.object({
 });
 
 export const PageSpec = z.object({
-  /** Site-root-relative output path, e.g. "index.html" or "services.html". */
-  path: z.string().regex(/^[a-z0-9\-/]+\.html$/, 'expected a lowercase .html path'),
+  /**
+   * Site-root-relative output path, e.g. "index.html" or "services.html".
+   *
+   * A leading slash is normalised away rather than rejected. Models differ on
+   * this — some emit "index.html", others "/index.html" — and both plainly mean
+   * the same thing, but the second resolves to a filesystem-absolute path and
+   * was refused by the workspace guard mid-build. Normalising here keeps the
+   * plan and the files on disk agreeing, which the spec-coverage gate depends
+   * on.
+   */
+  path: z
+    .string()
+    .transform((value) => value.replace(/^\/+/, ''))
+    .pipe(z.string().regex(/^[a-z0-9][a-z0-9\-/]*\.html$/, 'expected a lowercase, site-relative .html path')),
   title: z.string().min(1),
   metaDescription: z.string().min(1),
   goal: z.string().min(1),
@@ -100,9 +112,29 @@ export const PageSpec = z.object({
 });
 export type PageSpec = z.infer<typeof PageSpec>;
 
-export const Sitemap = z.object({
-  pages: z.array(PageSpec).min(1),
-});
+/** The site's entry point. Everything else is reachable from it. */
+export const HOME_PAGE_PATH = 'index.html';
+
+export const Sitemap = z
+  .object({
+    pages: z.array(PageSpec).min(1),
+  })
+  /**
+   * A site must have a homepage at the root.
+   *
+   * Without this a planner produced five pages all nested under "about/faq/",
+   * with the homepage at "about/faq/faq.html" — a site with no entry point,
+   * which 404s at "/". The build succeeded and the gates then raised ninety
+   * blocking findings, so nothing shipped, but a full build had already been
+   * paid for. The cheapest place to catch an unbuildable plan is the schema.
+   */
+  .refine((sitemap) => sitemap.pages.some((page) => page.path === HOME_PAGE_PATH), {
+    message: `The sitemap must include a homepage at "${HOME_PAGE_PATH}".`,
+  })
+  .refine(
+    (sitemap) => new Set(sitemap.pages.map((p) => p.path)).size === sitemap.pages.length,
+    { message: 'Two pages share the same path.' },
+  );
 export type Sitemap = z.infer<typeof Sitemap>;
 
 // ---------------------------------------------------------------------------

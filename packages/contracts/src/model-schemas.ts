@@ -66,6 +66,76 @@ export function toModelSchema(schema: z.ZodType): Record<string, unknown> {
   return sanitize(z.toJSONSchema(schema)) as Record<string, unknown>;
 }
 
+/**
+ * Strict-mode projection.
+ *
+ * Some providers enforce a stricter subset: every property of every object must
+ * appear in `required`, and `additionalProperties` must be false. Optional
+ * fields are therefore expressed as nullable-and-required rather than omitted —
+ * the model returns `null` where it has nothing to say, and {@link stripNulls}
+ * turns those back into absent keys so the Zod schema's `.optional()` still
+ * validates them.
+ */
+export function toStrictModelSchema(schema: z.ZodType): Record<string, unknown> {
+  return strictify(toModelSchema(schema)) as Record<string, unknown>;
+}
+
+function strictify(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(strictify);
+  if (node === null || typeof node !== 'object') return node;
+
+  const source = node as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source)) out[key] = strictify(value);
+
+  const properties = out['properties'] as Record<string, unknown> | undefined;
+  if (out['type'] === 'object' && properties) {
+    const names = Object.keys(properties);
+    const previouslyRequired = new Set((source['required'] as string[] | undefined) ?? []);
+
+    for (const name of names) {
+      if (previouslyRequired.has(name)) continue;
+      properties[name] = nullable(properties[name]);
+    }
+
+    out['required'] = names;
+    out['additionalProperties'] = false;
+  }
+
+  return out;
+}
+
+/** Widen a schema to accept null, however its type is expressed. */
+function nullable(schema: unknown): unknown {
+  if (schema === null || typeof schema !== 'object') return schema;
+  const node = schema as Record<string, unknown>;
+
+  if (typeof node['type'] === 'string') {
+    return { ...node, type: [node['type'], 'null'] };
+  }
+  if (Array.isArray(node['type'])) {
+    return node['type'].includes('null') ? node : { ...node, type: [...node['type'], 'null'] };
+  }
+  // $ref, anyOf and friends cannot take a type keyword alongside them.
+  return { anyOf: [node, { type: 'null' }] };
+}
+
+/**
+ * Drop null-valued keys so a nullable-required response validates against a
+ * schema that declares those fields optional.
+ */
+export function stripNulls<T>(value: T): T {
+  if (Array.isArray(value)) return value.map(stripNulls) as unknown as T;
+  if (value === null || typeof value !== 'object') return value;
+
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (item === null) continue;
+    out[key] = stripNulls(item);
+  }
+  return out as T;
+}
+
 /** Contract a Terra reviewer must satisfy when returning a verdict (§7). */
 export function reviewOutcomeJsonSchema(): Record<string, unknown> {
   return toModelSchema(ReviewOutcomeInputBase);

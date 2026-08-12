@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  PageSpec,
   JobSpec,
   assertTransition,
   canTransition,
@@ -97,5 +98,21 @@ describe('output conflict detection', () => {
 
   it('allows disjoint jobs to run in parallel', () => {
     expect(outputsConflict({ output: ['src/app/about/page.tsx'] }, { output: ['src/app/contact/page.tsx'] })).toBe(false);
+  });
+});
+
+const PageSpecPath = PageSpec.shape.path;
+
+describe('page paths', () => {
+  it('normalises a leading slash to site-relative', () => {
+    // Models differ: some emit "index.html", others "/index.html". Both mean
+    // the same thing, and the second previously failed a build mid-flight.
+    expect(PageSpecPath.parse('/services.html')).toBe('services.html');
+    expect(PageSpecPath.parse('index.html')).toBe('index.html');
+  });
+
+  it('still rejects a path that is not a lowercase .html file', () => {
+    expect(PageSpecPath.safeParse('/Services.HTML').success).toBe(false);
+    expect(PageSpecPath.safeParse('../evil.html').success).toBe(false);
   });
 });

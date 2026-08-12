@@ -5,7 +5,7 @@
  * validation fails, so this prompt carries every constraint the deterministic
  * gates will later check — a builder that cannot see the bar cannot clear it.
  */
-import { BuildOutput, type BusinessProfile, type SitePlan } from '@statxai/contracts';
+import { BuildOutput, HOME_PAGE_PATH, type BusinessProfile, type SitePlan } from '@statxai/contracts';
 import type { ModelClient } from '../client.js';
 
 const SYSTEM = `You are Terra, a senior frontend engineer building a complete small-business website.
@@ -78,7 +78,9 @@ export async function buildAnchor(
   profile: BusinessProfile,
   plan: SitePlan,
 ) {
-  const anchor = plan.sitemap.pages[0]!;
+  // The homepage anchors the design system, so select it explicitly. Relying on
+  // array order put a nested FAQ page in this role on one run.
+  const anchor = plan.sitemap.pages.find((page) => page.path === HOME_PAGE_PATH) ?? plan.sitemap.pages[0]!;
   return client.call({
     tier: 'terra',
     label: 'terra:build:anchor',

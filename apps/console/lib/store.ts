@@ -1,3 +1,4 @@
+import { isAbsolute, resolve } from 'node:path';
 import { StateStore } from '@statxai/state';
 
 /**
@@ -17,4 +18,13 @@ export function getStore(): Promise<StateStore> {
   return globalForStore.statxaiStore;
 }
 
-export const WORKSPACES_ROOT = process.env.WORKSPACES_ROOT ?? './workspaces';
+/**
+ * Project workspaces live at the monorepo root, but Next runs with its own
+ * package directory as cwd — so a relative WORKSPACES_ROOT resolved to
+ * `apps/console/workspaces`, which does not exist, and every preview 404'd.
+ * Relative values are anchored to the repo root; absolute ones are respected.
+ */
+export const WORKSPACES_ROOT = (() => {
+  const configured = process.env.WORKSPACES_ROOT ?? './workspaces';
+  return isAbsolute(configured) ? configured : resolve(process.cwd(), '../..', configured);
+})();

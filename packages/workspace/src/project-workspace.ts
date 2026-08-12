@@ -73,7 +73,11 @@ export class ProjectWorkspace {
    * are live inputs, not hypotheticals.
    */
   private safeSitePath(path: string): string {
-    const target = resolve(this.siteRoot, path);
+    // A leading slash means "site root" to a model, not "filesystem root".
+    // Strip it before resolving, or `resolve()` discards the base entirely and
+    // an obviously-intended "/about.html" is refused as an escape attempt.
+    // Traversal is still caught by the containment check below.
+    const target = resolve(this.siteRoot, path.replace(/^\/+/, ''));
     const rel = relative(this.siteRoot, target);
     if (rel.startsWith('..') || rel.startsWith(sep) || resolve(rel) === rel) {
       throw new PathEscapesWorkspace(path);
