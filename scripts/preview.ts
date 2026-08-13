@@ -13,7 +13,7 @@ if (!projectId) {
   process.exit(1);
 }
 
-const siteRoot = resolve(process.env.WORKSPACES_ROOT ?? './workspaces', projectId, 'app');
+const siteRoot = resolve(process.env.WORKSPACES_ROOT ?? './workspaces', projectId, 'app', 'out');
 const port = Number(process.env.PREVIEW_PORT ?? 4173);
 
 const TYPES: Record<string, string> = {

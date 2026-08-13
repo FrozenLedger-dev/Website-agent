@@ -32,6 +32,7 @@ interface Snapshot {
     reviewCycles: number;
     repairsApplied: number;
     commit: string | null;
+    liveUrl: string | null;
     error: string | null;
     usage: { inputTokens: number; outputTokens: number; calls: number };
     startedAt: string;
@@ -258,12 +259,24 @@ export function RunView({ runId, initial }: { runId: string; initial: Snapshot }
 
       {run.status !== 'running' && run.status !== 'intake_insufficient' ? (
         <div className="card">
-          <h2>Preview</h2>
+          <h2>{run.liveUrl ? 'Published' : 'Preview'}</h2>
           <p className="hint">
-            Served from the project workspace.{' '}
-            <Link href={`/api/preview/${run.projectId}`} target="_blank">
-              Open in a new tab
-            </Link>
+            {run.liveUrl ? (
+              <>
+                Live at{' '}
+                <Link href={run.liveUrl} target="_blank">
+                  {run.liveUrl.replace(/^https:\/\//, '')}
+                </Link>
+                . The frame below is the local build it was published from.
+              </>
+            ) : (
+              <>
+                Served from the project workspace.{' '}
+                <Link href={`/api/preview/${run.projectId}`} target="_blank">
+                  Open in a new tab
+                </Link>
+              </>
+            )}
             {run.commit ? <span className="mono"> · {run.commit.slice(0, 8)}</span> : null}
           </p>
           <iframe className="preview" src={`/api/preview/${run.projectId}`} title="Generated site preview" />

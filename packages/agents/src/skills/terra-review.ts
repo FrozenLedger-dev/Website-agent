@@ -28,7 +28,10 @@ HOW TO REPORT
 You cannot return an unbounded "not good enough". Every issue must name what failed, where
 it is, and the test that will prove the repair worked.
 
-- "location" is a structural locator: "index.html#hero", "services.html", "styles.css".
+- "location" is a structural locator naming the page you saw the problem on:
+  "index.html#hero", "services.html". For something present on every page — the
+  header, the navigation, the footer — say "app/layout.tsx" instead, because that
+  is the one file a repair has to change.
 - "acceptanceTest" must be objectively checkable by re-reading the file after a fix.
 - "id" is sequential: QA-001, QA-002, ...
 

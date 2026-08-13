@@ -74,6 +74,7 @@ export async function launchRun(options: LaunchOptions): Promise<LaunchHandle> {
         reviewCycles: result.reviewCycles,
         repairsApplied: result.repairsApplied,
         commit: result.commit,
+        liveUrl: result.manifest?.url ?? null,
         usage: result.usage,
       });
       return result;

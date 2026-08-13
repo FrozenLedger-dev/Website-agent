@@ -6,11 +6,11 @@
  * Useful for two things: checking a released site after adding a new gate, and
  * reproducing a gate finding without paying for a full delivery run.
  */
-import { readdir, readFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { BusinessProfile, type SitePlan } from '@statxai/contracts';
 import { StateStore } from '@statxai/state';
-import { runGates, type SiteFile } from '@statxai/gates';
+import { runGates } from '@statxai/gates';
+import { readBuiltFiles, readExportFiles } from '@statxai/workspace';
 
 const projectId = process.argv[2];
 if (!projectId) {
@@ -20,20 +20,12 @@ if (!projectId) {
 
 const siteRoot = resolve(process.env.WORKSPACES_ROOT ?? './workspaces', projectId, 'app');
 
-async function walk(dir: string, base = dir): Promise<SiteFile[]> {
-  const entries = await readdir(dir, { withFileTypes: true });
-  const out: SiteFile[] = [];
-  for (const entry of entries) {
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...(await walk(full, base)));
-    else out.push({ path: full.slice(base.length + 1), contents: await readFile(full, 'utf8') });
-  }
-  return out;
-}
-
 const store = await StateStore.connect();
 try {
-  const files = await walk(siteRoot);
+  // The gates run against the static export, which is what a visitor receives.
+  const files = await readBuiltFiles(siteRoot);
+  // Existence checks need the whole export, not only what a gate parses.
+  const assets = (await readExportFiles(siteRoot)).map((f) => f.path);
   const profileDoc = await store.artifacts.findOne(
     { projectId, name: 'business-profile' },
     { sort: { version: -1 } },
@@ -47,6 +39,7 @@ try {
 
   const result = runGates({
     files,
+    assets,
     profile: BusinessProfile.parse(profileDoc.data),
     plan: planDoc.data as SitePlan,
   });

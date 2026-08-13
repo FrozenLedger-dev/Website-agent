@@ -15,7 +15,7 @@ const profile: BusinessProfile = {
 };
 
 const plan = {
-  sitemap: { pages: [{ path: 'index.html' }, { path: 'contact.html' }] },
+  sitemap: { pages: [{ route: '/' }, { route: '/contact' }] },
   acceptanceCriteria: ['a', 'b', 'c'],
 } as unknown as SitePlan;
 
@@ -23,8 +23,8 @@ const page = (body: string, title = 'Harrowgate Joinery') => `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${title}</title><meta name="description" content="Fitted wardrobes in Harrogate.">
-<link rel="stylesheet" href="styles.css"></head>
-<body><header><nav><a href="index.html">Home</a> <a href="contact.html">Contact</a></nav></header>
+<link rel="stylesheet" href="/_next/static/chunks/site.css"></head>
+<body><header><nav><a href="/">Home</a> <a href="/contact">Contact</a></nav></header>
 <main>${body}</main>
 <footer>Harrowgate Joinery — workshop@harrowgatejoinery.co.uk — 01423 887 214</footer></body></html>`;
 
@@ -36,7 +36,7 @@ const CLEAN: SiteFile[] = [
       '<h1>Contact Harrowgate Joinery</h1><form action="/api/enquiry" method="post"><label for="n">Name</label><input id="n" name="n"></form>',
     ),
   },
-  { path: 'styles.css', contents: 'body{margin:0;max-width:70rem}@media(min-width:48rem){body{padding:2rem}}' },
+  { path: '_next/static/chunks/site.css', contents: 'body{margin:0;max-width:70rem}@media(min-width:48rem){body{padding:2rem}}' },
 ];
 
 const run = (files: SiteFile[]) => runGates({ files, profile, plan });
@@ -72,12 +72,12 @@ describe('structure gate', () => {
 describe('links gate', () => {
   it('catches an internal link to a page that was never generated', () => {
     const broken = [
-      { ...CLEAN[0]!, contents: CLEAN[0]!.contents.replace('contact.html', 'about.html') },
+      { ...CLEAN[0]!, contents: CLEAN[0]!.contents.replace('href="/contact"', 'href="/about"') },
       ...CLEAN.slice(1),
     ];
     const finding = run(broken).findings.find((f) => f.gate === 'links');
     expect(finding?.severity).toBe('P1');
-    expect(finding?.message).toContain('about.html');
+    expect(finding?.message).toContain('/about');
   });
 
   it('catches a remote asset that would 404 without an asset pipeline', () => {
@@ -179,21 +179,21 @@ describe('spec-coverage gate', () => {
     const broken = CLEAN.filter((f) => f.path !== 'contact.html');
     const finding = run(broken).findings.find((f) => f.gate === 'spec-coverage');
     expect(finding?.severity).toBe('P0');
-    expect(finding?.message).toContain('contact.html');
+    expect(finding?.message).toContain('/contact');
   });
 });
 
 describe('responsive gate', () => {
   it('catches a fixed width that overflows a phone viewport', () => {
     const broken = CLEAN.map((f) =>
-      f.path === 'styles.css' ? { ...f, contents: `${f.contents} .wrap{width:960px}` } : f,
+      f.path === '_next/static/chunks/site.css' ? { ...f, contents: `${f.contents} .wrap{width:960px}` } : f,
     );
     expect(run(broken).findings.some((f) => f.gate === 'responsive')).toBe(true);
   });
 
   it('does not flag max-width, which is the correct fluid pattern', () => {
     const fine = CLEAN.map((f) =>
-      f.path === 'styles.css' ? { ...f, contents: `${f.contents} .wrap{max-width:960px}` } : f,
+      f.path === '_next/static/chunks/site.css' ? { ...f, contents: `${f.contents} .wrap{max-width:960px}` } : f,
     );
     expect(run(fine).findings.filter((f) => f.gate === 'responsive')).toEqual([]);
   });
@@ -202,14 +202,14 @@ describe('responsive gate', () => {
     // False positive on a released site: "--page-width: 1200px" is a token, not
     // a width, and the text-level match saw "page-" where it looked for "max-".
     const fine = CLEAN.map((f) =>
-      f.path === 'styles.css' ? { ...f, contents: `:root{--page-width:1200px}${f.contents}` } : f,
+      f.path === '_next/static/chunks/site.css' ? { ...f, contents: `:root{--page-width:1200px}${f.contents}` } : f,
     );
     expect(run(fine).findings.filter((f) => f.gate === 'responsive')).toEqual([]);
   });
 
   it('does not flag a width clamped with min(), which cannot overflow', () => {
     const fine = CLEAN.map((f) =>
-      f.path === 'styles.css'
+      f.path === '_next/static/chunks/site.css'
         ? { ...f, contents: `${f.contents} .wrap{width:min(1200px, calc(100% - 2rem))}` }
         : f,
     );
@@ -228,5 +228,106 @@ describe('severity semantics', () => {
     expect(result.findings.length).toBeGreaterThan(0);
     expect(result.findings.every((f) => f.severity === 'P2' || f.severity === 'P3')).toBe(true);
     expect(result.passed).toBe(true);
+  });
+});
+
+/**
+ * A real static export, not a hand-written page.
+ *
+ * Every case below is a finding a live run actually produced. Together they
+ * accounted for 62 of 64 blocking findings on a site that was fine, which
+ * exhausted the repair budget and forced a re-plan.
+ */
+describe('a Next.js static export', () => {
+  // The chunk graph an export emits: scripts and CSS under a hashed path, none
+  // of which any gate parses, plus the framework's own error pages.
+  const EXPORT_ASSETS = [
+    '_next/static/chunks/09dqlr4_tv3sz.js',
+    '_next/static/chunks/turbopack-338y5zywv8pju.js',
+    '_next/static/chunks/site.css',
+    '_next/static/media/favicon.2vob68tjqpejf.ico',
+    'favicon.ico',
+    'index.html',
+    'contact.html',
+  ];
+
+  const withChunks = (body: string, title?: string) =>
+    page(body, title).replace(
+      '</body>',
+      '<script src="/_next/static/chunks/09dqlr4_tv3sz.js" async></script>' +
+        '<script src="/_next/static/chunks/turbopack-338y5zywv8pju.js" async></script></body>',
+    );
+
+  const EXPORTED: SiteFile[] = [
+    { path: 'index.html', contents: withChunks('<h1>Harrowgate Joinery</h1><p>Fitted wardrobes.</p>') },
+    { path: 'contact.html', contents: CLEAN[1]!.contents },
+    { path: '_next/static/chunks/site.css', contents: CLEAN[2]!.contents },
+  ];
+
+  it('does not report the framework chunk graph as missing assets', () => {
+    const findings = runGates({ files: EXPORTED, profile, plan, assets: EXPORT_ASSETS }).findings;
+    expect(findings.filter((f) => f.gate === 'links')).toEqual([]);
+  });
+
+  it('still reports an asset the site itself invented', () => {
+    // The point of the exclusion is the framework's own graph, not blanket
+    // silence — a model referencing an image it never created must still fail.
+    const files: SiteFile[] = [
+      { path: 'index.html', contents: withChunks('<h1>Harrowgate Joinery</h1><img src="/images/hero.jpg" alt="Workshop">') },
+      ...EXPORTED.slice(1),
+    ];
+    const findings = runGates({ files, profile, plan, assets: EXPORT_ASSETS }).findings;
+    expect(findings.some((f) => f.gate === 'links' && f.location.includes('/images/hero.jpg'))).toBe(true);
+  });
+
+  it('does not read React’s inlined flight payload as page copy', () => {
+    // The payload uses "$1", "$L2" as reference markers. Stripping tags without
+    // removing script bodies left those in the text, and the price pattern read
+    // "$1" as an unsupported price — on every page of a site quoting none.
+    const flight =
+      '<script>self.__next_f.push([1,"3:[\\"$\\",\\"$L1\\",null,{\\"children\\":\\"$2\\"}]"])</script>';
+    const files: SiteFile[] = [
+      { path: 'index.html', contents: withChunks('<h1>Harrowgate Joinery</h1><p>Fitted wardrobes.</p>').replace('</body>', `${flight}</body>`) },
+      ...EXPORTED.slice(1),
+    ];
+
+    const findings = runGates({ files, profile, plan, assets: EXPORT_ASSETS }).findings;
+    expect(findings.filter((f) => f.gate === 'claims')).toEqual([]);
+  });
+
+  it('still reads a price the visible copy actually states', () => {
+    const files: SiteFile[] = [
+      { path: 'index.html', contents: withChunks('<h1>Harrowgate Joinery</h1><p>Fitted wardrobes from £2,400.</p>') },
+      ...EXPORTED.slice(1),
+    ];
+    const findings = runGates({ files, profile, plan, assets: EXPORT_ASSETS }).findings;
+    expect(findings.some((f) => f.gate === 'claims')).toBe(true);
+  });
+
+  it('does not judge the framework’s own error pages as the business’s copy', () => {
+    // 404.html and _not-found.html are Next's, not Terra's. They have no <main>
+    // and no business content, and a repair cannot change them.
+    const files: SiteFile[] = [
+      ...EXPORTED,
+      { path: '404.html', contents: '<!doctype html><html lang="en"><head><title>404</title></head><body><h1>404</h1></body></html>' },
+      { path: '_not-found.html', contents: '<!doctype html><html lang="en"><head><title>404</title></head><body><h1>404</h1></body></html>' },
+    ];
+
+    const findings = runGates({ files, profile, plan, assets: EXPORT_ASSETS }).findings;
+    expect(findings.filter((f) => f.location.startsWith('404') || f.location.startsWith('_not-found'))).toEqual([]);
+  });
+
+  it('reports a build that emitted no stylesheet at all', () => {
+    // A true positive worth keeping: a layout that drops
+    // `import './globals.css'` compiles, exports, and renders as black text on
+    // white. This is exactly how the site shipped once.
+    const findings = runGates({
+      files: EXPORTED.filter((f) => !f.path.endsWith('.css')),
+      profile,
+      plan,
+      assets: EXPORT_ASSETS.filter((p) => !p.endsWith('.css')),
+    }).findings;
+
+    expect(findings.some((f) => f.gate === 'spec-coverage' && f.severity === 'P0')).toBe(true);
   });
 });

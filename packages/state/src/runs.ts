@@ -21,6 +21,8 @@ export interface RunDocument {
   reviewCycles: number;
   repairsApplied: number;
   commit: string | null;
+  /** The public URL of the released site. Null until a release is deployed. */
+  liveUrl: string | null;
   error: string | null;
   usage: { inputTokens: number; outputTokens: number; calls: number };
   startedAt: Date;
@@ -59,6 +61,7 @@ export class RunRecorder {
       reviewCycles: 0,
       repairsApplied: 0,
       commit: null,
+      liveUrl: null,
       error: null,
       usage: { inputTokens: 0, outputTokens: 0, calls: 0 },
       startedAt: new Date(),

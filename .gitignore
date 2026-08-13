@@ -17,3 +17,8 @@ coverage/
 # Next.js build output
 .next/
 next-env.d.ts
+
+# scaffold template build artefacts (the template itself IS committed)
+templates/site/node_modules/
+templates/site/.next/
+templates/site/out/

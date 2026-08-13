@@ -15,7 +15,7 @@ const profile: BusinessProfile = {
 };
 
 const plan = {
-  sitemap: { pages: [{ path: 'index.html' }] },
+  sitemap: { pages: [{ route: '/' }] },
   acceptanceCriteria: ['a', 'b', 'c'],
 } as unknown as SitePlan;
 
@@ -23,13 +23,13 @@ const page = (head: string, body: string) => `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Harrowgate Joinery</title><meta name="description" content="Joinery.">
-<link rel="stylesheet" href="styles.css">${head}</head>
+<link rel="stylesheet" href="/_next/static/chunks/site.css">${head}</head>
 <body><main><h1>Harrowgate Joinery</h1>${body}</main>
 <footer>workshop@harrowgatejoinery.co.uk 01423 887 214</footer></body></html>`;
 
 const site = (head: string, body: string, css: string): SiteFile[] => [
   { path: 'index.html', contents: page(head, body) },
-  { path: 'styles.css', contents: `${css}@media(min-width:40rem){body{padding:1rem}}` },
+  { path: '_next/static/chunks/site.css', contents: `${css}@media(min-width:40rem){body{padding:1rem}}` },
 ];
 
 const findings = (files: SiteFile[], gate: string) =>
@@ -119,5 +119,159 @@ describe('forms gate', () => {
       'body{font-family:Georgia,serif}',
     );
     expect(findings(files, 'forms')).toEqual([]);
+  });
+});
+
+/**
+ * Tailwind's own preflight, verbatim.
+ *
+ * Both cases fired on a real export. The first crashed `runGates` outright,
+ * which would have taken the whole delivery with it — and could only happen on
+ * a site that had *correctly* shipped a stylesheet.
+ */
+describe('typography against a real Tailwind build', () => {
+  const PREFLIGHT =
+    ':root{--default-font-family:ui-sans-serif,system-ui,sans-serif,"Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol","Noto Color Emoji";' +
+    '--default-mono-font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}' +
+    'body{font-family:var(--default-font-family);margin:0;max-width:70rem}@media(min-width:48rem){body{padding:2rem}}';
+
+  const site = (css: string): SiteFile[] => [
+    {
+      path: 'index.html',
+      contents:
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
+        '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+        '<title>Harrowgate Joinery</title><meta name="description" content="Fitted wardrobes.">' +
+        '<link rel="stylesheet" href="/_next/static/chunks/site.css"></head>' +
+        '<body><main><h1>Harrowgate Joinery</h1><p>Fitted wardrobes in Harrogate.</p></main></body></html>',
+    },
+    { path: '_next/static/chunks/site.css', contents: css },
+  ];
+
+  it('does not crash on a family name carrying a stray bracket', () => {
+    // `"Noto Color Emoji")` — the closing paren of the var() fallback list rides
+    // along when the stack is split on commas. Interpolated into a RegExp it
+    // throws `Invalid regular expression: Unmatched ')'`.
+    expect(() => runGates({ files: site(PREFLIGHT), profile, plan })).not.toThrow();
+  });
+
+  it('does not report the framework’s fallback fonts as unloaded', () => {
+    // Only the first family in a stack has to load; the rest are fallbacks, and
+    // reporting them flagged Tailwind's defaults on every build forever.
+    const found = runGates({ files: site(PREFLIGHT), profile, plan }).findings.filter(
+      (f) => f.gate === 'typography',
+    );
+    expect(found).toEqual([]);
+  });
+
+  it('still reports a brand face that never loads', () => {
+    const css = `${PREFLIGHT}h1{font-family:"Cormorant Garamond",Georgia,serif}`;
+    const found = runGates({ files: site(css), profile, plan }).findings.filter(
+      (f) => f.gate === 'typography',
+    );
+    expect(found).toHaveLength(1);
+    expect(found[0]!.message).toContain('Cormorant Garamond');
+  });
+
+  it('accepts a brand face the site actually loads', () => {
+    const css =
+      `${PREFLIGHT}@font-face{font-family:"Cormorant Garamond";src:url(/fonts/cg.woff2) format("woff2")}` +
+      'h1{font-family:"Cormorant Garamond",Georgia,serif}';
+    const found = runGates({ files: site(css), profile, plan }).findings.filter(
+      (f) => f.gate === 'typography',
+    );
+    expect(found).toEqual([]);
+  });
+});
+
+describe('a gate that throws', () => {
+  it('blocks the release instead of ending the run', () => {
+    // A crash means the check did not run, so the site cannot be certified —
+    // but one broken gate must not take down a delivery already paid for.
+    const result = runGates({
+      files: [{ path: 'index.html', contents: '<html><body><main><h1>x</h1></main></body></html>' }],
+      profile,
+      plan: {} as unknown as SitePlan,
+    });
+
+    expect(result.passed).toBe(false);
+    expect(result.findings.some((f) => f.location === 'platform' && f.severity === 'P0')).toBe(true);
+  });
+});
+
+/**
+ * Tailwind's own preflight, verbatim.
+ *
+ * Both cases fired on a real export. The first crashed `runGates` outright,
+ * which would have taken the whole delivery with it — and could only happen on a
+ * site that had *correctly* shipped a stylesheet.
+ */
+describe('typography against a real Tailwind build', () => {
+  const PREFLIGHT =
+    ':root{--default-font-family:ui-sans-serif,system-ui,sans-serif,"Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol","Noto Color Emoji";' +
+    '--default-mono-font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}' +
+    'body{font-family:var(--default-font-family);margin:0;max-width:70rem}@media(min-width:48rem){body{padding:2rem}}';
+
+  const site = (css: string): SiteFile[] => [
+    {
+      path: 'index.html',
+      contents:
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
+        '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+        '<title>Harrowgate Joinery</title><meta name="description" content="Fitted wardrobes.">' +
+        '<link rel="stylesheet" href="/_next/static/chunks/site.css"></head>' +
+        '<body><main><h1>Harrowgate Joinery</h1><p>Fitted wardrobes in Harrogate.</p></main></body></html>',
+    },
+    { path: '_next/static/chunks/site.css', contents: css },
+  ];
+
+  it('does not crash on a family name carrying a stray bracket', () => {
+    // Splitting the stack on commas leaves the var() list's closing paren
+    // attached to the last family: `Noto Color Emoji")`. Interpolated into a
+    // RegExp that throws `Invalid regular expression: Unmatched ')'`.
+    expect(() => runGates({ files: site(PREFLIGHT), profile, plan })).not.toThrow();
+  });
+
+  it('does not report the framework’s fallback fonts as unloaded', () => {
+    const found = runGates({ files: site(PREFLIGHT), profile, plan }).findings.filter(
+      (f) => f.gate === 'typography',
+    );
+    expect(found).toEqual([]);
+  });
+
+  it('still reports a brand face that never loads', () => {
+    // First in the stack, so it is what a visitor is meant to see.
+    const css = `${PREFLIGHT}h1{font-family:"Cormorant Garamond",Georgia,serif}`;
+    const found = runGates({ files: site(css), profile, plan }).findings.filter(
+      (f) => f.gate === 'typography',
+    );
+    expect(found).toHaveLength(1);
+    expect(found[0]!.message).toContain('Cormorant Garamond');
+  });
+
+  it('accepts a brand face the site actually loads', () => {
+    const css =
+      `${PREFLIGHT}@font-face{font-family:"Cormorant Garamond";src:url(/fonts/cg.woff2) format("woff2")}` +
+      'h1{font-family:"Cormorant Garamond",Georgia,serif}';
+    const found = runGates({ files: site(css), profile, plan }).findings.filter(
+      (f) => f.gate === 'typography',
+    );
+    expect(found).toEqual([]);
+  });
+});
+
+describe('a gate that throws', () => {
+  it('blocks the release instead of ending the run', () => {
+    // A crash means the check did not run, so the site cannot be certified —
+    // but one broken gate must not take down a delivery already paid for.
+    const result = runGates({
+      files: [{ path: 'index.html', contents: '<html><body><main><h1>x</h1></main></body></html>' }],
+      profile,
+      // No sitemap: spec-coverage dereferences it and throws.
+      plan: {} as unknown as SitePlan,
+    });
+
+    expect(result.passed).toBe(false);
+    expect(result.findings.some((f) => f.location === 'platform' && f.severity === 'P0')).toBe(true);
   });
 });

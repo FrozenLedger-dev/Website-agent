@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   PageSpec,
   JobSpec,
+  routeToOutputPath,
+  routeToSourcePath,
   assertTransition,
   canTransition,
   formatArtifactUri,
@@ -101,18 +103,30 @@ describe('output conflict detection', () => {
   });
 });
 
-const PageSpecPath = PageSpec.shape.path;
+const PageRoute = PageSpec.shape.route;
 
-describe('page paths', () => {
-  it('normalises a leading slash to site-relative', () => {
-    // Models differ: some emit "index.html", others "/index.html". Both mean
-    // the same thing, and the second previously failed a build mid-flight.
-    expect(PageSpecPath.parse('/services.html')).toBe('services.html');
-    expect(PageSpecPath.parse('index.html')).toBe('index.html');
+describe('page routes', () => {
+  it('normalises the forms a model actually emits', () => {
+    // Models differ on leading slashes, trailing slashes and case; all three
+    // plainly mean the same route, and rejecting them wasted planning calls.
+    expect(PageRoute.parse('services')).toBe('/services');
+    expect(PageRoute.parse('/services/')).toBe('/services');
+    expect(PageRoute.parse('/Services')).toBe('/services');
+    expect(PageRoute.parse('/')).toBe('/');
+    expect(PageRoute.parse('')).toBe('/');
   });
 
-  it('still rejects a path that is not a lowercase .html file', () => {
-    expect(PageSpecPath.safeParse('/Services.HTML').success).toBe(false);
-    expect(PageSpecPath.safeParse('../evil.html').success).toBe(false);
+  it('rejects anything that is not a route', () => {
+    expect(PageRoute.safeParse('../evil').success).toBe(false);
+    expect(PageRoute.safeParse('/services.html').success).toBe(false);
+    expect(PageRoute.safeParse('/has spaces').success).toBe(false);
+  });
+
+  it('derives source and output paths from the route', () => {
+    expect(routeToSourcePath('/')).toBe('app/page.tsx');
+    expect(routeToSourcePath('/services')).toBe('app/services/page.tsx');
+    // Next exports "/services" to "services.html", not "services/index.html".
+    expect(routeToOutputPath('/')).toBe('index.html');
+    expect(routeToOutputPath('/services')).toBe('services.html');
   });
 });

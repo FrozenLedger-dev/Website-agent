@@ -15,7 +15,7 @@ const base: BusinessProfile = {
 };
 
 const plan = {
-  sitemap: { pages: [{ path: 'index.html' }] },
+  sitemap: { pages: [{ route: '/' }] },
   acceptanceCriteria: ['a', 'b', 'c'],
 } as unknown as SitePlan;
 
@@ -23,13 +23,13 @@ const page = (body: string) => `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Harrowgate Joinery</title><meta name="description" content="Joinery.">
-<link rel="stylesheet" href="styles.css"></head>
+<link rel="stylesheet" href="/_next/static/chunks/site.css"></head>
 <body><main><h1>Harrowgate Joinery</h1>${body}</main>
 <footer>workshop@harrowgatejoinery.co.uk 01423 887 214</footer></body></html>`;
 
 const site = (body: string): SiteFile[] => [
   { path: 'index.html', contents: page(body) },
-  { path: 'styles.css', contents: 'body{font-family:Georgia,serif}@media(min-width:40rem){body{padding:1rem}}' },
+  { path: '_next/static/chunks/site.css', contents: 'body{font-family:Georgia,serif}@media(min-width:40rem){body{padding:1rem}}' },
 ];
 
 const claims = (body: string, profile: BusinessProfile = base) =>

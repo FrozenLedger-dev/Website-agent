@@ -91,19 +91,24 @@ export const PageSection = z.object({
 
 export const PageSpec = z.object({
   /**
-   * Site-root-relative output path, e.g. "index.html" or "services.html".
+   * The page's route, e.g. "/" or "/services".
    *
-   * A leading slash is normalised away rather than rejected. Models differ on
-   * this — some emit "index.html", others "/index.html" — and both plainly mean
-   * the same thing, but the second resolves to a filesystem-absolute path and
-   * was refused by the workspace guard mid-build. Normalising here keeps the
-   * plan and the files on disk agreeing, which the spec-coverage gate depends
-   * on.
+   * A route rather than a filename: the source path (`app/services/page.tsx`)
+   * and the exported path (`services.html`) are both derived from it, so the
+   * model never has to know the framework's file conventions and cannot put a
+   * page somewhere the build will not find it.
+   *
+   * Normalised rather than rejected — trailing slashes, missing leading slash
+   * and uppercase all mean the obvious thing.
    */
-  path: z
+  route: z
     .string()
-    .transform((value) => value.replace(/^\/+/, ''))
-    .pipe(z.string().regex(/^[a-z0-9][a-z0-9\-/]*\.html$/, 'expected a lowercase, site-relative .html path')),
+    .transform((value) => {
+      const trimmed = value.trim().toLowerCase().replace(/\/+$/, '');
+      if (trimmed === '' || trimmed === '/') return '/';
+      return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+    })
+    .pipe(z.string().regex(/^\/([a-z0-9]+(-[a-z0-9]+)*(\/[a-z0-9]+(-[a-z0-9]+)*)*)?$/, 'expected a route like "/services"')),
   title: z.string().min(1),
   metaDescription: z.string().min(1),
   goal: z.string().min(1),
@@ -113,7 +118,22 @@ export const PageSpec = z.object({
 export type PageSpec = z.infer<typeof PageSpec>;
 
 /** The site's entry point. Everything else is reachable from it. */
-export const HOME_PAGE_PATH = 'index.html';
+export const HOME_ROUTE = '/';
+
+/** Where a route's source lives in the App Router. */
+export function routeToSourcePath(route: string): string {
+  return route === HOME_ROUTE ? 'app/page.tsx' : `app${route}/page.tsx`;
+}
+
+/**
+ * Where a route lands in the static export.
+ *
+ * Next writes "/services" to "services.html", not "services/index.html", so the
+ * gates and the preview server both resolve routes this way.
+ */
+export function routeToOutputPath(route: string): string {
+  return route === HOME_ROUTE ? 'index.html' : `${route.replace(/^\//, '')}.html`;
+}
 
 export const Sitemap = z
   .object({
@@ -123,18 +143,17 @@ export const Sitemap = z
    * A site must have a homepage at the root.
    *
    * Without this a planner produced five pages all nested under "about/faq/",
-   * with the homepage at "about/faq/faq.html" — a site with no entry point,
-   * which 404s at "/". The build succeeded and the gates then raised ninety
-   * blocking findings, so nothing shipped, but a full build had already been
-   * paid for. The cheapest place to catch an unbuildable plan is the schema.
+   * leaving the site with no entry point. The build succeeded and the gates
+   * then raised ninety blocking findings, so nothing shipped — but a full build
+   * had already been paid for. The cheapest place to catch an unbuildable plan
+   * is the schema.
    */
-  .refine((sitemap) => sitemap.pages.some((page) => page.path === HOME_PAGE_PATH), {
-    message: `The sitemap must include a homepage at "${HOME_PAGE_PATH}".`,
+  .refine((sitemap) => sitemap.pages.some((page) => page.route === HOME_ROUTE), {
+    message: `The sitemap must include a homepage at "${HOME_ROUTE}".`,
   })
-  .refine(
-    (sitemap) => new Set(sitemap.pages.map((p) => p.path)).size === sitemap.pages.length,
-    { message: 'Two pages share the same path.' },
-  );
+  .refine((sitemap) => new Set(sitemap.pages.map((p) => p.route)).size === sitemap.pages.length, {
+    message: 'Two pages share the same route.',
+  });
 export type Sitemap = z.infer<typeof Sitemap>;
 
 // ---------------------------------------------------------------------------
@@ -203,6 +222,10 @@ export const DeploymentManifest = z.object({
   approvedBy: z.string().min(1),
   qualityScore: z.number().int().min(0).max(100),
   checks: z.array(z.string()),
+  /** Where the release is live. Null when nothing left the machine. */
+  url: z.string().nullable(),
+  deploymentId: z.string().nullable(),
+  /** The deployment this one superseded — §9's documented rollback target. */
   rollbackRef: z.string().nullable(),
   releasedAt: z.date(),
 });

@@ -11,7 +11,13 @@
  * accessible or compliant.
  */
 import { parse, type HTMLElement } from 'node-html-parser';
-import type { BusinessProfile, GateFinding, SitePlan } from '@statxai/contracts';
+import {
+  routeToOutputPath,
+  routeToSourcePath,
+  type BusinessProfile,
+  type GateFinding,
+  type SitePlan,
+} from '@statxai/contracts';
 
 export interface SiteFile {
   path: string;
@@ -19,14 +25,57 @@ export interface SiteFile {
 }
 
 export interface GateContext {
+  /** The HTML and CSS of the export — everything a gate parses. */
   files: readonly SiteFile[];
   profile: BusinessProfile;
   plan: SitePlan;
+  /**
+   * Every path in the export, including the assets no gate parses.
+   *
+   * Without it, existence checks run against the parsed subset and every
+   * `<script src="/_next/…">` the framework emits is reported as a missing
+   * asset — 54 blocking findings on a site that was perfectly fine, which
+   * exhausted the repair budget and forced a re-plan.
+   */
+  assets?: readonly string[];
 }
 
 type Gate = (ctx: GateContext) => GateFinding[];
 
-const htmlFiles = (ctx: GateContext) => ctx.files.filter((f) => f.path.endsWith('.html'));
+/**
+ * Pages the framework generates for itself.
+ *
+ * They are part of a correct export and must ship, but the business never wrote
+ * them: judging their content against the business profile reports Next's own
+ * boilerplate as an invented claim, on every single run.
+ */
+const FRAMEWORK_PAGES = new Set(['404.html', '_not-found.html', '_global-error.html']);
+
+/** The pages the site is accountable for — what every gate judges. */
+const htmlFiles = (ctx: GateContext) =>
+  ctx.files.filter((f) => f.path.endsWith('.html') && !FRAMEWORK_PAGES.has(f.path));
+
+/** What the export actually contains, for existence checks. */
+const exportPaths = (ctx: GateContext) =>
+  new Set<string>([...ctx.files.map((f) => f.path), ...(ctx.assets ?? [])]);
+
+/**
+ * Map an internal href onto the file the static export produced for it.
+ *
+ * Links are routes ("/services"), the export is files ("services.html"), and
+ * assets are absolute ("/_next/static/…/x.css"). Returns null for hrefs that
+ * are not the site's to resolve.
+ */
+export function resolveInternalHref(href: string): string | null {
+  const path = href.split('#')[0]!.split('?')[0]!.replace(/^\.\//, '');
+  if (path === '') return null;
+
+  // Already a file — an asset, or a link written as one.
+  if (/\.[a-z0-9]+$/i.test(path)) return path.replace(/^\//, '');
+
+  if (path === '/') return 'index.html';
+  return `${path.replace(/^\//, '').replace(/\/$/, '')}.html`;
+}
 
 /** True when any ancestor marks the subtree hidden from assistive technology. */
 function hiddenByAncestor(element: HTMLElement): boolean {
@@ -137,7 +186,7 @@ const headings: Gate = (ctx) => {
 
 const links: Gate = (ctx) => {
   const findings: GateFinding[] = [];
-  const existing = new Set(ctx.files.map((f) => f.path));
+  const existing = exportPaths(ctx);
 
   for (const file of htmlFiles(ctx)) {
     const root = parse(file.contents, { comment: false });
@@ -156,15 +205,15 @@ const links: Gate = (ctx) => {
       }
       if (/^(https?:|mailto:|tel:|#)/i.test(href)) continue;
 
-      const target = href.split('#')[0]!.split('?')[0]!.replace(/^\.\//, '');
-      if (target === '' || existing.has(target)) continue;
+      const target = resolveInternalHref(href);
+      if (target === null || existing.has(target)) continue;
 
       findings.push({
         gate: 'links',
         severity: 'P1',
         location: `${file.path} -> ${href}`,
-        message: `Internal link points at "${target}", which does not exist in the site.`,
-        acceptanceTest: `A file named "${target}" exists, or the link is corrected to an existing page.`,
+        message: `Internal link points at "${href}", which exported no page.`,
+        acceptanceTest: `The route "${href}" exists in the sitemap and exports to ${target}.`,
       });
     }
 
@@ -179,6 +228,9 @@ const links: Gate = (ctx) => {
       for (const element of elements) {
         const value = element.getAttribute(attribute)?.trim();
         if (!value || value.startsWith('data:')) continue;
+        // The framework's own chunk graph is the build's to guarantee, and a
+        // repair cannot change it — the model does not write these references.
+        if (value.startsWith('/_next/')) continue;
         if (/^https?:\/\//i.test(value)) {
           findings.push({
             gate: 'links',
@@ -189,7 +241,7 @@ const links: Gate = (ctx) => {
           });
           continue;
         }
-        const target = value.replace(/^\.\//, '').split('?')[0]!;
+        const target = value.replace(/^\.\//, '').replace(/^\//, '').split('?')[0]!;
         if (!existing.has(target)) {
           findings.push({
             gate: 'links',
@@ -482,6 +534,16 @@ const claims: Gate = (ctx) => {
     // then fails. That failure is silent: the gate reports nothing and looks
     // like it passed.
     const body = parse(file.contents, { comment: false }).querySelector('body');
+
+    // Script and style bodies are removed, not just their tags. Stripping tags
+    // alone leaves the contents behind, and a static export inlines React's
+    // flight payload into <body> — which is full of "$1", "$2" markers that the
+    // price pattern reads as a price the profile does not support. That fired
+    // on every page of a site whose visible copy quoted no prices at all.
+    for (const element of body?.querySelectorAll('script, style, template, noscript') ?? []) {
+      element.remove();
+    }
+
     const text = (body?.innerHTML ?? '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
 
     for (const claim of CLAIM_PATTERNS) {
@@ -510,25 +572,31 @@ const specCoverage: Gate = (ctx) => {
   const findings: GateFinding[] = [];
   const existing = new Set(ctx.files.map((f) => f.path));
 
+  // Every planned route must have prerendered to a real HTML file. A route that
+  // compiles but exports nothing is the failure this catches: the build passes,
+  // and the page simply does not exist.
   for (const page of ctx.plan.sitemap.pages) {
-    if (!existing.has(page.path)) {
+    const output = routeToOutputPath(page.route);
+    if (!existing.has(output)) {
       findings.push({
         gate: 'spec-coverage',
         severity: 'P0',
-        location: page.path,
-        message: `Specified page "${page.path}" (${page.title}) was not generated.`,
-        acceptanceTest: `${page.path} exists in the built site.`,
+        location: routeToSourcePath(page.route),
+        message: `Route "${page.route}" (${page.title}) did not export to ${output}.`,
+        acceptanceTest: `${output} exists in the static export.`,
       });
     }
   }
 
-  if (!existing.has('styles.css')) {
+  // Tailwind emits a hashed stylesheet under _next/static. No CSS at all means
+  // the styling never reached the browser, which is invisible in the source.
+  if (!ctx.files.some((f) => f.path.endsWith('.css'))) {
     findings.push({
       gate: 'spec-coverage',
       severity: 'P0',
-      location: 'styles.css',
-      message: 'The shared stylesheet was not generated.',
-      acceptanceTest: 'styles.css exists in the built site.',
+      location: 'app/globals.css',
+      message: 'The build produced no stylesheet, so the site renders unstyled.',
+      acceptanceTest: 'The static export contains a CSS file.',
     });
   }
 
@@ -576,15 +644,24 @@ const responsive: Gate = (ctx) => {
       });
     }
 
-    if (!/@media/.test(file.contents)) {
-      findings.push({
-        gate: 'responsive',
-        severity: 'P2',
-        location: file.path,
-        message: 'Stylesheet contains no media queries.',
-        acceptanceTest: 'The stylesheet adapts layout across viewport sizes.',
-      });
-    }
+  }
+
+  /**
+   * Asked once of the whole site, not once per file.
+   *
+   * A production build splits CSS across hashed chunks, and a chunk carrying
+   * only base rules legitimately has no media query in it. Per-file this
+   * reported a real site as non-responsive by naming a bundler artefact the
+   * model does not write and a repair cannot change.
+   */
+  if (css.length > 0 && !css.some((file) => /@media/.test(file.contents))) {
+    findings.push({
+      gate: 'responsive',
+      severity: 'P2',
+      location: 'app/globals.css',
+      message: 'The site ships no media queries at all, so the layout cannot adapt to viewport size.',
+      acceptanceTest: 'The delivered CSS adapts layout across viewport sizes.',
+    });
   }
 
   return findings;
@@ -603,6 +680,10 @@ const SYSTEM_FAMILIES = new Set(
     'helvetica neue', 'arial', 'georgia', 'times', 'times new roman', 'cambria',
     'menlo', 'monaco', 'consolas', 'courier', 'courier new', 'tahoma', 'verdana',
     'liberation sans', 'apple color emoji', 'segoe ui emoji', 'noto sans', 'emoji',
+    // Emitted by Tailwind's preflight in every build; none of them is the
+    // site's to load.
+    'segoe ui symbol', 'noto color emoji', 'noto sans symbols', 'apple symbols',
+    'ui-system', 'inherit', 'initial', 'unset', 'revert',
   ].map((f) => f.toLowerCase()),
 );
 
@@ -621,8 +702,29 @@ const typography: Gate = (ctx) => {
   for (const file of css) {
     const declarations = file.contents.matchAll(/(?:font-family|--[\w-]*font[\w-]*)\s*:\s*([^;}]+)/gi);
     for (const declaration of declarations) {
-      for (const raw of declaration[1]!.split(',')) {
-        const family = raw.trim().replace(/^["']|["']$/g, '').trim();
+      /**
+       * Only the first family in a stack has to load.
+       *
+       * Everything after it is a fallback the browser resolves on its own — that
+       * is what a fallback is for. Checking the whole stack reported Tailwind's
+       * own preflight defaults ("SFMono-Regular", "Liberation Mono") as fonts
+       * the site had failed to load, on every build, forever. The gate exists to
+       * catch a brand face that never arrives, and a brand face is written
+       * first.
+       */
+      for (const raw of declaration[1]!.split(',').slice(0, 1)) {
+        // Tailwind's preflight nests the stack inside a var() fallback:
+        //   font-family: var(--default-font-family, …, "Noto Color Emoji");
+        // Splitting on commas leaves the closing paren attached, so quotes are
+        // stripped after it rather than before — otherwise the family reads as
+        // `Noto Color Emoji")`, which is not a font and is not a valid pattern.
+        const family = raw
+          .trim()
+          .replace(/^var\([^,]*$/, '')
+          .replace(/\)+$/, '')
+          .trim()
+          .replace(/^["']|["']$/g, '')
+          .trim();
         if (!family || family.startsWith('var(')) continue;
         if (SYSTEM_FAMILIES.has(family.toLowerCase())) continue;
         if (/^\d/.test(family)) continue;
@@ -639,7 +741,11 @@ const typography: Gate = (ctx) => {
 
   for (const family of declared) {
     const inFontFace = new RegExp(`@font-face[^}]*${escapeRegExp(family)}`, 'is').test(allCss);
-    const slug = family.replace(/\s+/g, '[+_\\s-]*');
+    // Escaped first: a family name is data. An unescaped one containing a
+    // bracket throws `Invalid regular expression` out of runGates and takes the
+    // whole delivery with it — which is what a stray ")" from Tailwind's
+    // preflight did, on every correctly-styled site.
+    const slug = escapeRegExp(family).replace(/\s+/g, '[+_\\s-]*');
     const linked = new RegExp(`<link[^>]+href=["'][^"']*${slug}`, 'i').test(html);
     const imported = new RegExp(`@import[^;]*${slug}`, 'i').test(allCss);
     if (inFontFace || linked || imported) continue;
@@ -649,7 +755,10 @@ const typography: Gate = (ctx) => {
     findings.push({
       gate: 'typography',
       severity: mandated ? 'P1' : 'P2',
-      location: 'styles.css',
+      // Where the fix goes, not where the symptom shows: fonts are declared in
+      // the brand tokens. A location no source file matches would scope the
+      // repair to the whole site.
+      location: 'app/globals.css',
       message:
         `Font family "${family}" is specified but never loaded — no @font-face, @import or stylesheet link. ` +
         (mandated
@@ -735,7 +844,28 @@ export interface GateRun {
 
 /** Run every gate. `passed` means no blocking (P0/P1) finding remains. */
 export function runGates(ctx: GateContext): GateRun {
-  const findings = Object.values(GATES).flatMap((gate) => gate(ctx));
+  const findings = Object.entries(GATES).flatMap(([name, gate]) => {
+    try {
+      return gate(ctx);
+    } catch (error) {
+      /**
+       * A gate crash is a platform fault, not a site defect — but it means this
+       * check did not run, so the release cannot be certified. Reported as a
+       * blocking finding rather than thrown: one broken gate must not take down
+       * a delivery that has already been paid for, and it must not be mistaken
+       * for a gate that passed.
+       */
+      return [
+        {
+          gate: name,
+          severity: 'P0' as const,
+          location: 'platform',
+          message: `The ${name} gate failed to run: ${error instanceof Error ? error.message : String(error)}`,
+          acceptanceTest: `The ${name} gate completes against this site.`,
+        },
+      ];
+    }
+  });
   return {
     passed: !findings.some((f) => f.severity === 'P0' || f.severity === 'P1'),
     findings,

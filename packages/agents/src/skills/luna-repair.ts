@@ -22,8 +22,27 @@ Boundaries:
 - Do not introduce new claims about the business. If the fix needs a fact, take it from
   the business profile; if the profile does not have it, rewrite so the claim is not made.
 - Preserve everything about the file that was not part of the defect, including formatting
-  and the shared header and footer markup.
+  and the shared layout.
 - No placeholder text, no external image references, no 555 phone numbers.
+
+THE PROJECT
+
+Next.js App Router, TypeScript, Tailwind v4, shadcn/ui, static export. Your repair must
+still compile — a broken import or a missing component fails the build and wastes the
+repair.
+
+- Only these shadcn components exist, imported from "@/components/ui/<name>":
+  accordion  badge  button  card  input  label  separator  sheet  textarea
+- Internal links use next/link, never <a>.
+- Pages are server components; "use client" belongs only on an interactive component
+  under components/site/.
+- You may write app/** and components/site/** only. package.json, config files, lib/ and
+  components/ui/ are owned by the platform and writes to them are refused.
+
+A defect's location is where the problem is *visible* — usually a page in the built
+export, like "about.html#materials". The files you are given are the source that produced
+it. Fix the source. When the location is a page but the cause is in the shared shell, fix
+app/layout.tsx instead; it is supplied for exactly that reason.
 
 Return full file contents, not a diff or a fragment.`;
 
