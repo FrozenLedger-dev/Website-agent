@@ -336,3 +336,47 @@ iframe.preview {
   font-family: var(--mono);
   font-size: 12px;
 }
+
+/* Usage, cost and phase breakdown ------------------------------------------ */
+
+.usage th.num,
+.usage td.num {
+  text-align: right;
+  padding-right: 0;
+}
+.usage td:first-child {
+  text-transform: capitalize;
+}
+
+h3.sub {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--muted);
+  margin: 24px 0 2px;
+}
+
+.phases {
+  display: grid;
+  gap: 10px;
+}
+.phase-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12.5px;
+  margin-bottom: 4px;
+}
+.phase-head .mono {
+  color: var(--muted);
+}
+.bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--border);
+  overflow: hidden;
+}
+.bar .fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+}

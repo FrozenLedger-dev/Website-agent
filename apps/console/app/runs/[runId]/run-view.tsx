@@ -3,6 +3,27 @@
 import Link from 'next/link';
 import { useEffect, useRef, useState } from 'react';
 
+type Tier = 'sol' | 'terra' | 'luna';
+
+interface TierUsage {
+  inputTokens: number;
+  outputTokens: number;
+  calls: number;
+  ms: number;
+}
+
+/** What each tier is for, so the breakdown reads without the architecture doc. */
+const TIER_ROLE: Record<Tier, string> = {
+  sol: 'plan · adjudicate',
+  terra: 'build · review',
+  luna: 'repair',
+};
+
+const usd = (value: number) =>
+  value < 0.01 ? `$${value.toFixed(4)}` : `$${value.toFixed(2)}`;
+
+const secs = (ms: number) => (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`);
+
 interface RunEvent {
   seq: number;
   phase: string;
@@ -35,9 +56,16 @@ interface Snapshot {
     liveUrl: string | null;
     error: string | null;
     usage: { inputTokens: number; outputTokens: number; calls: number };
+    usageByTier?: Partial<Record<Tier, TierUsage>>;
+    phaseMs?: Record<string, number>;
     startedAt: string;
     finishedAt: string | null;
   };
+  cost: {
+    total: number | null;
+    byTier: Partial<Record<Tier, number>>;
+    unpriced: Tier[];
+  } | null;
   events: RunEvent[];
   budgets: Record<string, number> | null;
   projectState: string | null;
@@ -124,6 +152,10 @@ export function RunView({ runId, initial }: { runId: string; initial: Snapshot }
             <div className="v">{run.repairsApplied}</div>
           </div>
           <div className="stat">
+            <div className="k">Tokens in</div>
+            <div className="v">{run.usage.inputTokens.toLocaleString()}</div>
+          </div>
+          <div className="stat">
             <div className="k">Tokens out</div>
             <div className="v">{run.usage.outputTokens.toLocaleString()}</div>
           </div>
@@ -135,9 +167,88 @@ export function RunView({ runId, initial }: { runId: string; initial: Snapshot }
             <div className="k">Elapsed</div>
             <div className="v">{elapsed}s</div>
           </div>
+          <div className="stat">
+            <div className="k">Cost</div>
+            <div className="v">{snap.cost?.total != null ? usd(snap.cost.total) : '—'}</div>
+          </div>
         </div>
 
         {run.error ? <p className="error">{run.error}</p> : null}
+      </div>
+
+      <div className="card">
+        <h2>Where the time and money went</h2>
+        <p className="hint">
+          {snap.cost?.total != null
+            ? 'Costed from the rates configured for each tier.'
+            : 'Set PRICE_SOL_INPUT / PRICE_SOL_OUTPUT (and the TERRA and LUNA equivalents, in USD per million tokens) to see cost.'}
+        </p>
+
+        <table className="usage">
+          <thead>
+            <tr>
+              <th>Tier</th>
+              <th className="num">Calls</th>
+              <th className="num">Tokens in</th>
+              <th className="num">Tokens out</th>
+              <th className="num">Model time</th>
+              <th className="num">Cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(['sol', 'terra', 'luna'] as Tier[]).map((tier) => {
+              const used = run.usageByTier?.[tier];
+              if (!used || used.calls === 0) return null;
+              const tierCost = snap.cost?.byTier?.[tier];
+              return (
+                <tr key={tier}>
+                  <td>
+                    {tier}
+                    <span className="loc"> {TIER_ROLE[tier]}</span>
+                  </td>
+                  <td className="num mono">{used.calls}</td>
+                  <td className="num mono">{used.inputTokens.toLocaleString()}</td>
+                  <td className="num mono">{used.outputTokens.toLocaleString()}</td>
+                  <td className="num mono">{secs(used.ms)}</td>
+                  <td className="num mono">{tierCost != null ? usd(tierCost) : 'unpriced'}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+
+        {run.usageByTier == null || Object.keys(run.usageByTier).length === 0 ? (
+          <p className="empty">This run predates per-tier accounting.</p>
+        ) : null}
+
+        <h3 className="sub">Phases</h3>
+        <p className="hint">
+          Wall-clock, so a phase includes the builds and installs inside it — not just model time.
+        </p>
+        {run.phaseMs && Object.keys(run.phaseMs).length > 0 ? (
+          <div className="phases">
+            {Object.entries(run.phaseMs)
+              .sort((a, b) => b[1] - a[1])
+              .map(([phase, ms]) => {
+                const share = Math.round((ms / Math.max(1, elapsed * 1000)) * 100);
+                return (
+                  <div className="phase" key={phase}>
+                    <div className="phase-head">
+                      <span>{phase}</span>
+                      <span className="mono">
+                        {secs(ms)} · {share}%
+                      </span>
+                    </div>
+                    <div className="bar">
+                      <div className="fill" style={{ width: `${Math.min(100, share)}%` }} />
+                    </div>
+                  </div>
+                );
+              })}
+          </div>
+        ) : (
+          <p className="empty">This run predates phase timing.</p>
+        )}
       </div>
 
       <div className="grid split">

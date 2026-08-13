@@ -1,4 +1,5 @@
 import { notFound } from 'next/navigation';
+import { costOf } from '@statxai/agents';
 import { remaining } from '@statxai/state';
 import { getStore } from '@/lib/store';
 import { RunView } from './run-view';
@@ -25,6 +26,7 @@ export default async function RunPage({ params }: { params: Promise<{ runId: str
   const initial = JSON.parse(
     JSON.stringify({
       run,
+      cost: costOf(run.usageByTier ?? {}),
       events,
       budgets,
       projectState: project?.state ?? null,

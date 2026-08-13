@@ -76,6 +76,8 @@ export async function launchRun(options: LaunchOptions): Promise<LaunchHandle> {
         commit: result.commit,
         liveUrl: result.manifest?.url ?? null,
         usage: result.usage,
+        usageByTier: result.usageByTier,
+        phaseMs: result.phaseMs,
       });
       return result;
     } catch (error) {

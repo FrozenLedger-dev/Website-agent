@@ -25,8 +25,26 @@ export interface RunDocument {
   liveUrl: string | null;
   error: string | null;
   usage: { inputTokens: number; outputTokens: number; calls: number };
+  /**
+   * The same usage split by orchestration tier.
+   *
+   * Kept alongside the flat total rather than replacing it: tiers map to
+   * different models and therefore different rates, so a single aggregate
+   * cannot be costed at all.
+   */
+  usageByTier: Partial<Record<'sol' | 'terra' | 'luna', TierUsage>>;
+  /** Wall-clock milliseconds attributed to each phase of the delivery. */
+  phaseMs: Record<string, number>;
   startedAt: Date;
   finishedAt: Date | null;
+}
+
+export interface TierUsage {
+  inputTokens: number;
+  outputTokens: number;
+  calls: number;
+  /** Time spent inside model calls, which is not the same as phase wall-clock. */
+  ms: number;
 }
 
 export interface RunEventDocument {
@@ -64,6 +82,8 @@ export class RunRecorder {
       liveUrl: null,
       error: null,
       usage: { inputTokens: 0, outputTokens: 0, calls: 0 },
+      usageByTier: {},
+      phaseMs: {},
       startedAt: new Date(),
       finishedAt: null,
     });

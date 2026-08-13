@@ -36,6 +36,20 @@ live, and shows what the platform decided and why:
   side, each with the acceptance test that will prove the repair worked.
 - **Artifacts** — every version, and which are accepted.
 - **Preview** — the generated site, served from the project workspace.
+- **Usage and cost** — tokens in and out per tier, model time, and where the
+  wall-clock actually went. Cost appears once rates are configured:
+
+  ```bash
+  PRICE_SOL_INPUT=…   PRICE_SOL_OUTPUT=…     # USD per 1M tokens
+  PRICE_TERRA_INPUT=… PRICE_TERRA_OUTPUT=…
+  PRICE_LUNA_INPUT=…  PRICE_LUNA_OUTPUT=…
+  ```
+
+  There are no default rates. Tiers map to models through configuration, so the
+  platform cannot know what one costs, and a guessed rate would put a confident
+  wrong number on an invoice-shaped screen. A tier with no rate is reported as
+  `unpriced` rather than counted as free, so a partial configuration cannot
+  quietly understate a total.
 
 ## Running a delivery
 

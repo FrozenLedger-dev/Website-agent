@@ -16,6 +16,7 @@ import {
   intakeGaps,
   isReleaseBlocked,
   legalTerminalOutcomes,
+  type AgentTier,
   type DeploymentManifest,
   type SitePlan,
   type TerminalOutcome,
@@ -29,6 +30,7 @@ import {
   planSite,
   repairDefect,
   reviewSite,
+  type UsageByTier,
 } from '@statxai/agents';
 import { runGates } from '@statxai/gates';
 import { BudgetExhausted, createBudget, spend, spendRepairAttempt, type StateStore } from '@statxai/state';
@@ -83,20 +85,56 @@ export interface RunResult {
   siteRoot: string;
   manifest?: DeploymentManifest;
   usage: { inputTokens: number; outputTokens: number; calls: number };
+  usageByTier: UsageByTier;
+  phaseMs: Record<string, number>;
 }
 
 export async function runProject(options: RunOptions): Promise<RunResult> {
   const { projectId, store, workspacesRoot } = options;
   const autonomyMode = options.autonomyMode ?? 'full_autonomous';
-  const say: Progress = options.onProgress ?? (() => {});
+  const report: Progress = options.onProgress ?? (() => {});
+  const say: Progress = (event) => {
+    chargePhase(event.phase);
+    report(event);
+  };
 
   const model = new ModelClient();
   const registry = new ArtifactRegistry(store);
   const usage = { inputTokens: 0, outputTokens: 0, calls: 0 };
-  const track = (r: { inputTokens: number; outputTokens: number }) => {
+
+  /**
+   * Usage split by tier, because that is the only split that can be priced:
+   * Sol, Terra and Luna map to different models and therefore different rates.
+   */
+  const usageByTier: UsageByTier = {};
+  const track = (tier: AgentTier, r: { inputTokens: number; outputTokens: number; ms: number }) => {
     usage.inputTokens += r.inputTokens;
     usage.outputTokens += r.outputTokens;
     usage.calls += 1;
+
+    const bucket = (usageByTier[tier] ??= { inputTokens: 0, outputTokens: 0, calls: 0, ms: 0 });
+    bucket.inputTokens += r.inputTokens;
+    bucket.outputTokens += r.outputTokens;
+    bucket.calls += 1;
+    bucket.ms += r.ms;
+  };
+
+  /**
+   * Wall-clock per phase, charged by the progress events themselves.
+   *
+   * Derived here rather than in the console: the timeline records when a phase
+   * *reported*, and the gap before the first event of a phase belongs to the
+   * phase that was still running. Attributing it after the fact from timestamps
+   * alone gets the boundaries wrong.
+   */
+  const phaseMs: Record<string, number> = {};
+  let phaseStarted = Date.now();
+  let currentPhase: string | null = null;
+  const chargePhase = (next: string) => {
+    const now = Date.now();
+    if (currentPhase) phaseMs[currentPhase] = (phaseMs[currentPhase] ?? 0) + (now - phaseStarted);
+    currentPhase = next;
+    phaseStarted = now;
   };
 
   // -- Phase 1: Discover ----------------------------------------------------
@@ -144,7 +182,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       detail: attempt === 0 ? 'Sol is producing the specification' : 'Sol is revising the specification',
     });
     const planned = await planSite(model, profile);
-    track(planned);
+    track('sol', planned);
     const produced = planned.value;
 
     say({
@@ -189,7 +227,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
     say({ phase: 'build', detail: 'Terra is attempting the complete site in one pass' });
     const built = await buildSite(model, profile, current);
-    track(built);
+    track('terra', built);
     await workspace.writeSiteFiles(built.value.files);
     say({
       phase: 'build',
@@ -216,7 +254,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     });
 
     const anchor = await buildAnchor(model, profile, current);
-    track(anchor);
+    track('terra', anchor);
     await workspace.writeSiteFiles(anchor.value.files);
 
     // The homepage anchors the design system. Selecting by array order once put
@@ -234,7 +272,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       rest.map((page) => buildPage(model, profile, current, page, anchorSource, layoutSource)),
     );
     for (const page of pages) {
-      track(page);
+      track('terra', page);
       await workspace.writeSiteFiles(page.value.files);
     }
     say({ phase: 'build', detail: `${rest.length} further pages built in parallel`, level: 'ok' });
@@ -375,7 +413,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         break;
       }
       repairedSinceReview = [];
-      track(reviewed);
+      track('terra', reviewed);
       qualityScore = reviewed.value.qualityScore;
 
       const reviewDefects = reviewed.value.issues.map(fromReviewIssue);
@@ -507,7 +545,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         ];
         try {
           const repaired = await repairDefect(model, profile, defect, context);
-          track(repaired);
+          track('luna', repaired);
 
           // Luna may only rewrite files it was given. Enforced here rather than
           // trusted to the prompt.
@@ -576,6 +614,8 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       commit,
       siteRoot: workspace.siteRoot,
       usage,
+      usageByTier,
+      phaseMs: { ...phaseMs },
     };
   }
 
@@ -684,6 +724,8 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     siteRoot: workspace.siteRoot,
     manifest,
     usage,
+    usageByTier,
+    phaseMs: { ...phaseMs },
   };
 
   function terminal(outcome: RunResult['outcome']): RunResult {
@@ -697,6 +739,8 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       commit: null,
       siteRoot: '',
       usage,
+      usageByTier,
+      phaseMs: { ...phaseMs },
     };
   }
 }

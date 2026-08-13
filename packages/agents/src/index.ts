@@ -3,3 +3,4 @@ export * from './skills/sol-plan.js';
 export * from './skills/terra-build.js';
 export * from './skills/terra-review.js';
 export * from './skills/luna-repair.js';
+export * from './pricing.js';

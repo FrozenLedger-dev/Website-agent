@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { costOf } from '@statxai/agents';
 import { remaining } from '@statxai/state';
 import { getStore } from '@/lib/store';
 
@@ -28,8 +29,13 @@ export async function GET(
     store.artifacts.find({ projectId: run.projectId }).sort({ name: 1, version: 1 }).toArray(),
   ]);
 
+  // Costed here, not in the browser: rates are server configuration, and
+  // shipping them to the client would put pricing in every page's payload.
+  const cost = costOf(run.usageByTier ?? {});
+
   return NextResponse.json({
     run,
+    cost,
     events,
     budgets,
     projectState: project?.state ?? null,
