@@ -73,6 +73,16 @@ export const BrandSystem = z.object({
     baseSize: z.string().min(1),
     scale: z.string().min(1),
   }),
+  /**
+   * How this specific business should be composed, in a sentence or three.
+   *
+   * Palette and type alone do not stop every delivery converging on the same
+   * page with different words in it — a joinery workshop, a pizzeria and a law
+   * firm were all returning a hero, three equal cards and a closing band. This
+   * field carries the compositional character: what the first screen does, what
+   * structure the page takes, what to lean on when there is no photography.
+   */
+  artDirection: z.string().min(1),
   rationale: z.string().min(1),
 });
 export type BrandSystem = z.infer<typeof BrandSystem>;

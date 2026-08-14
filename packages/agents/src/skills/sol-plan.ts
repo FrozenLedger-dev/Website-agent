@@ -34,6 +34,15 @@ Rules that govern everything you produce:
 - The brand system must suit the industry and audience. Use concrete CSS colour values.
   Avoid generic AI-default aesthetics: no purple-to-blue gradients, and do not reach for
   Inter, Roboto or Arial unless the industry genuinely calls for a neutral face.
+- artDirection is a short brief for how this business should be composed, and it is
+  what stops every site becoming the same page with different words. Say what the
+  first screen does, what shape the page takes, and what carries visual weight
+  given there is no photography — for example: "Trade-signage directness. Open on
+  a dark full-bleed band with the headline set oversized and hard left against a
+  bordered panel. Alternate dark bands with generous light sections; carry weight
+  with thick rules, condensed capitals and one safety-yellow accent used only on
+  the call to action." Be specific to this business. Do not write generic praise
+  like "clean, modern and professional".
 - headingFamily and bodyFamily must each name a single family **available on Google
   Fonts**, spelled exactly as Google Fonts spells it — "Cormorant Garamond", "Fraunces",
   "Source Serif 4", "Inter Tight". The build downloads and self-hosts them, so a face

@@ -193,15 +193,84 @@ CONTENT
   specific to this business that could not be pasted onto a competitor's site.
 
 DESIGN
-- Apply the brand system through Tailwind utilities and CSS custom properties
-  in globals.css. Use the shadcn theme tokens (bg-background, text-foreground,
-  text-muted-foreground, border) so light and dark both work.
+
+You are designing, not filling in a template. The bar is a site a design-led
+studio would put in a portfolio, and the most common failure is a page that is
+technically correct and completely characterless: a stack of identical centred
+sections, each with a heading, a paragraph and three equal cards.
+
+COMPOSITION — the page must have a shape
+- Vary the section forms. A good page alternates between: a full-bleed band in a
+  solid dark or accent colour, a contained asymmetric two-column grid, a wide
+  edge-to-edge feature, and a narrow editorial column. Never run three
+  consecutive sections with the same silhouette.
+- Asymmetric beats symmetric. \`lg:grid-cols-[1.15fr_0.85fr]\` or a 12-column grid
+  with uneven spans reads as designed; three equal columns reads as a default.
+- Vary vertical rhythm deliberately: a hero and a closing section breathe
+  (\`py-24 lg:py-32\`), a call-to-action band is tight (\`py-8\`), body sections sit
+  between. Identical padding on every section is the single clearest sign that
+  nobody made a decision.
+- At least one section per page must break the container and run edge to edge.
+- Anchor the first screen with something other than centred text. Offset the
+  headline, set it against a filled panel, run a bordered card into the margin.
+
+TYPOGRAPHY — the strongest tool you have
+- Display type must be dramatically larger than body copy, not one step up.
+  A page headline is \`text-5xl sm:text-6xl lg:text-7xl\` with \`leading-[0.95]\`
+  and \`tracking-tight\`. Section headings sit well below it. If your h1 and h2
+  are within one size step, the hierarchy has collapsed.
+- Cap the measure on running text — \`max-w-2xl\` or \`max-w-prose\`. Full-width
+  paragraphs at 18px are unreadable and look unconsidered.
+- Use small uppercase eyebrow labels above section headings:
+  \`text-xs font-semibold uppercase tracking-[0.18em]\`. They cost nothing and
+  immediately read as art-directed.
+- Two families, no more, both from the brand system. Weight and size carry the
+  hierarchy, not extra fonts.
+
+COLOUR — restraint is the whole trick
+- Include at least one dark section per page. Contrast between light and dark
+  bands is what gives a page structure at a glance.
+- The accent marks one thing at a time: the primary action, a single statistic,
+  a rule under a heading. An accent used on six elements stops being an accent.
+- Prefer borders and surface shifts (\`bg-card\`, \`border-border\`) to drop
+  shadows. Heavy shadows on flat colour read as a 2016 bootstrap theme.
+
+DEPTH WITHOUT PHOTOGRAPHY
+There is no image pipeline, so nothing can lean on a stock photo. Everything
+must come from type, colour, shape and space. Use, sparingly and with purpose:
+oversized numerals for steps or years; thick horizontal rules; inline SVG line
+work you author; flat colour blocks and offset panels that overlap a boundary;
+one large lucide glyph at low \`strokeWidth\` as a graphic rather than an icon;
+and real negative space. Never leave a wide grey rectangle where a photo would
+have gone — compose as though the absence were the intention.
+
+DETAIL
+- Interactive elements get a visible hover and focus transition.
+- One radius across the site. One border weight. Pick them and hold them.
+- A card needs a reason to exist. Content that is really a list should be a
+  list with rules between items, not five boxes.
+
+NEVER
+Three equal cards under every heading · everything centred · identical padding
+on every section · emoji as icons · gradient text · purple-to-blue gradients ·
+\`text-gray-500\` on white as the body colour · a hero that is a headline, a
+paragraph and two buttons with nothing else in it.
+
+ART DIRECTION
+The brand system carries an \`artDirection\` note describing the compositional
+character this specific business calls for. Follow it. It is what stops a
+joinery workshop, a pizzeria and a law firm from receiving the same page with
+different words in it.
+
+ACCESSIBILITY AND CORRECTNESS
 - Responsive from 320px up: fluid type, sensible max-widths, wrapping layouts.
-- Accessible: one <h1> per page, no skipped heading levels, labelled form
-  controls, alt or aria-hidden on every graphic.
+- One <h1> per page, no skipped heading levels, labelled form controls, alt or
+  aria-hidden on every graphic.
 - Every link needs a discernible name. A link whose only content is an icon has
   none — give it \`aria-label\`, or include visually-hidden text (\`sr-only\`).
   This is the single most common accessibility finding on generated sites.
+- Contrast must hold on dark sections too: check body text against the surface
+  it actually sits on, not against the page background.
 - A contact form cannot submit to a \`mailto:\` action. Browser handling is
   inconsistent and a completed enquiry is silently lost. Point the form at a real
   endpoint path, and put the email address on the page as a link people can use.`;
@@ -305,6 +374,9 @@ components that already appear there or in the shadcn set.
 
 BUSINESS PROFILE
 ${JSON.stringify(profile, null, 2)}
+
+ART DIRECTION (the same brief the homepage was built to)
+${plan.brandSystem.artDirection}
 
 PAGE SPECIFICATION
 ${JSON.stringify(page, null, 2)}
