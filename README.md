@@ -150,9 +150,12 @@ Verified rather than assumed; the behaviour is pinned by the guard tests in
 
 Decisions taken where `v1.2.pdf` is silent, each marked in the code:
 
-1. **Defect fingerprint** = `(category, location)`. Free text is deliberately
-   excluded: a reviewer paraphrasing the same defect between cycles would
-   otherwise mint a fresh fingerprint and silently reset the repair budget.
+1. **Defect fingerprint** = `(category, first file named in location)`. Free
+   text is deliberately excluded: a reviewer paraphrasing the same defect
+   between cycles would otherwise mint a fresh fingerprint and silently reset
+   the repair budget. `location` counts as free text — the reviewer writes
+   `index.html#hero` one cycle and `index.html#hero, contact.html` the next for
+   the same defect — so it is reduced to the file it names first.
 2. **Repair job granularity** = one job per defect fingerprint, so the 8-job
    release-cycle budget is a meaningful counter.
 3. **Artifact source of truth** = MongoDB. The per-project Git repository holds

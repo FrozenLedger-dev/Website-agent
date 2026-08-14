@@ -58,8 +58,34 @@ function normalise(value: string): string {
  * erring the other way is the cost blowout budgets exist to prevent.
  */
 export function defectFingerprint(issue: { category: string; location: string }): string {
-  const canonical = `${normalise(issue.category)}|${normalise(issue.location)}`;
+  const canonical = `${normalise(issue.category)}|${normalise(primaryLocation(issue.location))}`;
   return createHash('sha256').update(canonical).digest('hex').slice(0, 16);
+}
+
+/**
+ * The one file a location names, whatever else it says.
+ *
+ * `location` was treated as structured while `reason` was treated as free text,
+ * and it is not: a reviewer writes "index.html#hero" one cycle and
+ * "index.html#hero, index.html#coverage-contact, contact.html" the next for the
+ * same defect. Both hashed differently, so the per-defect budget reset every
+ * time and Sol could not see that a defect had recurred at all.
+ *
+ * Observed on a real delivery: seven blocking issues over four review cycles
+ * produced seven distinct fingerprints and no repeats, while the reviewer's own
+ * prose said "the previously reported binding defect remains". Nothing bounded
+ * the loop except the rejection counter, so the run burned every cycle and
+ * blocked with the site undeployed.
+ *
+ * Reducing to the first file named restores the property the fingerprint was
+ * built for: stable identity across paraphrase. It is coarse — every defect of
+ * one category on one page shares a budget — but that is the direction the
+ * fingerprint was always meant to err, and merged defects are repaired together
+ * in a single call anyway.
+ */
+export function primaryLocation(location: string): string {
+  const first = location.split(/[,;]/)[0] ?? location;
+  return first.split('#')[0]!.split(' -> ')[0]!.trim() || location.trim();
 }
 
 /**

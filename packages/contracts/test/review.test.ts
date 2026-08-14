@@ -5,6 +5,7 @@ import {
   defectFingerprint,
   isReleaseBlocked,
   legalTerminalOutcomes,
+  primaryLocation,
   reviewOutcomeJsonSchema,
 } from '../src/index.js';
 
@@ -140,5 +141,50 @@ describe('model output contract', () => {
     expect(schema['additionalProperties']).toBe(false);
     const properties = schema['properties'] as Record<string, unknown>;
     expect(Object.keys(properties).sort()).toEqual(['blocking', 'decision', 'issues', 'qualityScore']);
+  });
+});
+
+describe('fingerprint stability across a reviewer’s paraphrase', () => {
+  /**
+   * Observed on a real delivery. Seven blocking issues over four review cycles
+   * produced seven distinct fingerprints and no repeats, while the reviewer's
+   * own prose said "the previously reported binding defect remains". The budget
+   * reset every cycle, Sol could not see the recurrence, and the run burned
+   * every rejection and blocked with the site undeployed.
+   */
+  const cycle2 = 'index.html#hero; index.html#experience; services.html#services-intro';
+  const cycle3a = 'index.html#experience';
+  const cycle3b = 'index.html#coverage-contact';
+
+  const fp = (location: string) => defectFingerprint({ category: 'content_accuracy', location });
+
+  it('gives one defect one fingerprint however the reviewer words its location', () => {
+    expect(fp(cycle3a)).toBe(fp(cycle2));
+    expect(fp(cycle3b)).toBe(fp(cycle2));
+  });
+
+  it('keeps genuinely different pages apart', () => {
+    expect(fp('landlords.html#landlord-contact')).not.toBe(fp(cycle2));
+    expect(fp('contact.html#post-coverage')).not.toBe(fp(cycle2));
+  });
+
+  it('keeps different categories apart on the same page', () => {
+    expect(defectFingerprint({ category: 'content_accuracy', location: 'index.html' })).not.toBe(
+      defectFingerprint({ category: 'responsive', location: 'index.html' }),
+    );
+  });
+
+  it('normalises anchors, lists and link arrows to the file named first', () => {
+    expect(primaryLocation('index.html#hero')).toBe('index.html');
+    expect(primaryLocation('index.html#hero, contact.html')).toBe('index.html');
+    expect(primaryLocation('index.html; services.html')).toBe('index.html');
+    expect(primaryLocation('services.html -> /missing.html')).toBe('services.html');
+    expect(primaryLocation('  about.html  ')).toBe('about.html');
+  });
+
+  it('leaves a location naming no file usable rather than empty', () => {
+    // "site" is a legitimate whole-site locator and must still fingerprint.
+    expect(primaryLocation('site')).toBe('site');
+    expect(fp('site')).toBe(fp('site'));
   });
 });
