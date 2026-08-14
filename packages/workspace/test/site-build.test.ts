@@ -169,6 +169,10 @@ describe('ensureStylesheetPrelude', () => {
     // is put back.
     expect(restored).toContain('--accent: #f2b705');
     expect(restored).toContain('Halden Electrical brand tokens');
+    // The base layer is platform-owned too, and applies the theme to <body>.
+    // A verification run restored the head and left this missing; the page
+    // survived only because the builder had also set the classes by hand.
+    expect(restored).toContain('@layer base');
   });
 
   it('leaves a correctly appended stylesheet untouched', async () => {

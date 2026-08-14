@@ -111,9 +111,20 @@ export async function ensureStylesheetPrelude(
   const boundary = template.search(/^:root\b/m);
   const prelude = boundary === -1 ? template : template.slice(0, boundary);
 
-  await writeFile(target, `${prelude.trimEnd()}
+  /**
+   * The base layer is platform-owned too, and belongs at the end because its
+   * `@apply` rules depend on the tokens above it.
+   *
+   * Found by verifying rather than assuming: a run with the head restored still
+   * had this missing, and the page survived only because the builder had also
+   * written `bg-background text-foreground` on `<body>` by hand. That is the
+   * same luck that made the original baseline look healthy for weeks.
+   */
+  const base = /@layer\s+base\s*\{[\s\S]*?\n\}/.exec(template)?.[0] ?? '';
+  const restoreBase = base !== '' && !/@layer\s+base\b/.test(current);
 
-${current.trimStart()}`, 'utf8');
+  const rebuilt = [prelude.trimEnd(), '', current.trim(), ...(restoreBase ? ['', base] : [])];
+  await writeFile(target, `${rebuilt.join('\n')}\n`, 'utf8');
   return true;
 }
 
