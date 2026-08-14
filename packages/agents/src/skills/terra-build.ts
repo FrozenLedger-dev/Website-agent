@@ -219,7 +219,8 @@ TYPOGRAPHY — the strongest tool you have
   A page headline is \`text-5xl sm:text-6xl lg:text-7xl\` with \`leading-[0.95]\`
   and \`tracking-tight\`. Section headings sit well below it. If your h1 and h2
   are within one size step, the hierarchy has collapsed.
-- Cap the measure on running text — \`max-w-2xl\` or \`max-w-prose\`. Full-width
+- Cap the measure on EVERY paragraph of running text — \`max-w-2xl\` or
+  \`max-w-prose\`. A page with no measure cap anywhere is wrong. Full-width
   paragraphs at 18px are unreadable and look unconsidered.
 - Use small uppercase eyebrow labels above section headings:
   \`text-xs font-semibold uppercase tracking-[0.18em]\`. They cost nothing and
@@ -246,7 +247,9 @@ have gone — compose as though the absence were the intention.
 
 DETAIL
 - Interactive elements get a visible hover and focus transition.
-- One radius across the site. One border weight. Pick them and hold them.
+- The brand system's \`radius\` is the site's only radius: \`square\` means
+  \`rounded-none\`, \`subtle\` means \`rounded-md\`, \`rounded\` means \`rounded-2xl\`.
+  Apply it consistently to cards, buttons, inputs and panels. One border weight.
 - A card needs a reason to exist. Content that is really a list should be a
   list with rules between items, not five boxes.
 
@@ -255,6 +258,39 @@ Three equal cards under every heading · everything centred · identical padding
 on every section · emoji as icons · gradient text · purple-to-blue gradients ·
 \`text-gray-500\` on white as the body colour · a hero that is a headline, a
 paragraph and two buttons with nothing else in it.
+
+SECTION LAYOUTS
+Every section in the specification names a \`layout\`. Build that form. It is the
+plan's compositional decision, not a suggestion, and it is what gives the page a
+shape rather than a stack.
+
+  split-hero        Asymmetric grid, e.g. \`lg:grid-cols-[1.15fr_0.85fr]\`. Headline
+                    oversized and hard left, never centred. The right cell is a
+                    bordered or filled panel carrying the primary action and one
+                    supporting fact. Give the panel a graphic anchor: a flat colour
+                    block breaking a corner, or one large icon at low strokeWidth.
+  accent-band       Full-bleed accent colour, tight vertical padding (\`py-8\`), one
+                    line of copy and one button, laid out \`md:grid-cols-[1fr_auto]\`.
+  stat-strip        Full-bleed dark. Two to four figures at \`text-5xl\` or larger in
+                    the heading face, each with a small uppercase caption beneath.
+                    Separated by borders, not gaps.
+  feature-grid      \`md:grid-cols-2 lg:grid-cols-3\` with the first card inverted
+                    (filled with the primary colour) so the grid has a focal point.
+  rule-list         Full-width rows, \`divide-y divide-border\`, no cards. Each row is
+                    a title, a line of copy and optionally a small right-aligned
+                    detail. This is the correct form for most lists.
+  numbered-steps    Ordinals at \`text-6xl\` or larger in the heading face, set in a
+                    narrow left column with the copy beside them.
+  editorial-split   \`lg:grid-cols-[0.35fr_0.65fr]\`. Hanging labels or metadata left,
+                    prose right at \`max-w-prose\`. Never full-bleed running text.
+  detail-table      Key/value rows with a hairline between. Labels small and
+                    uppercase, values in the body face.
+  faq-accordion     The Accordion primitive. Genuine questions only.
+  contact-panel     Two columns: the form one side, real address, phone and email the
+                    other. Both reachable at 320px.
+  closing-cta       Full-bleed dark, generous padding, one heading and one action.
+
+Two adjacent sections never share a layout, and the plan will not ask you to.
 
 ART DIRECTION
 The brand system carries an \`artDirection\` note describing the compositional

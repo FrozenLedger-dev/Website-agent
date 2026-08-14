@@ -66,6 +66,8 @@ export const BrandSystem = z.object({
     muted: z.string().min(1),
     accent: z.string().min(1),
     accentText: z.string().min(1),
+    /** Hairlines and dividers. Left unspecified, every builder guessed. */
+    border: z.string().min(1),
   }),
   typography: z.object({
     headingFamily: z.string().min(1),
@@ -83,6 +85,8 @@ export const BrandSystem = z.object({
    * structure the page takes, what to lean on when there is no photography.
    */
   artDirection: z.string().min(1),
+  /** One radius across the whole site, so the detailing reads as deliberate. */
+  radius: z.enum(['square', 'subtle', 'rounded']),
   rationale: z.string().min(1),
 });
 export type BrandSystem = z.infer<typeof BrandSystem>;
@@ -91,10 +95,54 @@ export type BrandSystem = z.infer<typeof BrandSystem>;
 // sitemap.json + page-spec/*.json
 // ---------------------------------------------------------------------------
 
+/**
+ * The compositional forms a section can take.
+ *
+ * The plan used to describe only what a section *said* — heading, purpose,
+ * which profile fields it drew from — and left the form to the builder, which
+ * had to invent a layout six times a page and defaulted to the cheapest one.
+ * Pages came back as a uniform stack of centred text with three equal cards
+ * under every heading.
+ *
+ * Naming the form makes composition a planning decision rather than an
+ * improvisation, and makes "no two adjacent sections share a silhouette"
+ * something the specification can state and a reader can check.
+ *
+ * Every archetype is buildable from the scaffold's primitives with no
+ * photography, because there is no asset pipeline.
+ */
+export const SectionLayout = z.enum([
+  /** Asymmetric opener: oversized headline hard left, panel carrying the action. */
+  'split-hero',
+  /** Tight full-bleed accent strip: one line, one action. */
+  'accent-band',
+  /** Full-bleed dark strip of two to four oversized numerals with small captions. */
+  'stat-strip',
+  /** Asymmetric card grid with the first card inverted for emphasis. */
+  'feature-grid',
+  /** Full-width rows divided by thin rules — for lists that are not really cards. */
+  'rule-list',
+  /** Oversized ordinals down one column, copy beside them. */
+  'numbered-steps',
+  /** Narrow measure prose against a column of hanging labels and details. */
+  'editorial-split',
+  /** Key/value rows: hours, coverage, certifications, turnaround. */
+  'detail-table',
+  /** The accordion primitive, for genuine questions. */
+  'faq-accordion',
+  /** Form one side, real contact details and address the other. */
+  'contact-panel',
+  /** Full-bleed dark close with a single action. */
+  'closing-cta',
+]);
+export type SectionLayout = z.infer<typeof SectionLayout>;
+
 export const PageSection = z.object({
   id: z.string().min(1),
   heading: z.string().min(1),
   purpose: z.string().min(1),
+  /** The form this section takes. See {@link SectionLayout}. */
+  layout: SectionLayout,
   /** Which business-profile fields this section must draw from. */
   contentBindings: z.array(z.string().min(1)),
 });

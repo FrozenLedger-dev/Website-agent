@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { HOME_ROUTE, Sitemap } from '../src/index.js';
+import { HOME_ROUTE, SectionLayout, Sitemap } from '../src/index.js';
 
 const page = (route: string) => ({
   route,
@@ -7,7 +7,7 @@ const page = (route: string) => ({
   metaDescription: 'A description.',
   goal: 'A goal.',
   primaryAction: 'Enquire',
-  sections: [{ id: 's', heading: 'H', purpose: 'p', contentBindings: ['services'] }],
+  sections: [{ id: 's', heading: 'H', purpose: 'p', layout: 'split-hero', contentBindings: ['services'] }],
 });
 
 describe('sitemap', () => {
@@ -44,5 +44,42 @@ describe('sitemap', () => {
     // still 404 at "/". Normalisation must not paper over that.
     const result = Sitemap.safeParse({ pages: [page('index')] });
     expect(result.success).toBe(false);
+  });
+});
+
+describe('section layout', () => {
+  const section = (layout: string) => ({
+    id: 's',
+    heading: 'H',
+    purpose: 'p',
+    layout,
+    contentBindings: ['services'],
+  });
+
+  it('requires a form, not just content', () => {
+    // A specification that says only what a section says leaves the builder to
+    // invent a layout for every one, which it does badly and identically.
+    const { layout, ...withoutLayout } = section('split-hero');
+    void layout;
+    const parsed = Sitemap.safeParse({
+      pages: [{ route: '/', title: 'T', metaDescription: 'd', goal: 'g', primaryAction: 'a', sections: [withoutLayout] }],
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it('rejects a form the builder has no pattern for', () => {
+    const parsed = Sitemap.safeParse({
+      pages: [{ route: '/', title: 'T', metaDescription: 'd', goal: 'g', primaryAction: 'a', sections: [section('parallax-video')] }],
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it('accepts every documented archetype', () => {
+    for (const layout of SectionLayout.options) {
+      const parsed = Sitemap.safeParse({
+        pages: [{ route: '/', title: 'T', metaDescription: 'd', goal: 'g', primaryAction: 'a', sections: [section(layout)] }],
+      });
+      expect(parsed.success, layout).toBe(true);
+    }
   });
 });
