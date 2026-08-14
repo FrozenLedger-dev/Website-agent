@@ -1,0 +1,47 @@
+{
+  "businessName": "Halden Electrical",
+  "industry": "Domestic and commercial electrical contracting",
+  "location": "Ashford, Kent",
+  "serviceArea": "Ashford, Canterbury, Folkestone and the surrounding villages",
+  "audience": "Homeowners with a fault or a rewire, and letting agents who need certificates turned around quickly",
+  "services": [
+    {
+      "name": "Emergency callout",
+      "description": "Faults, loss of power and tripping circuits. We aim to be on site within two hours for calls placed before 4pm on a weekday."
+    },
+    {
+      "name": "Full and partial rewires",
+      "description": "Rewiring of houses and flats, including consumer unit replacement and certification on completion."
+    },
+    {
+      "name": "EICR reports for landlords",
+      "description": "Electrical Installation Condition Reports for rented property, with the certificate issued within three working days."
+    },
+    {
+      "name": "EV charger installation",
+      "description": "Home charge point installation, including the notification to the district network operator."
+    },
+    {
+      "name": "Lighting and additional sockets",
+      "description": "New circuits, outdoor lighting and additional sockets, chased in and made good."
+    }
+  ],
+  "differentiators": [
+    "NICEIC approved contractor, so certificates are accepted by letting agents and insurers",
+    "We return free of charge if a fault we repaired recurs within twelve months",
+    "Two-hour target response on weekday emergency calls placed before 4pm",
+    "Every job is quoted in writing before work starts, and the price does not move"
+  ],
+  "yearsInBusiness": 14,
+  "contact": {
+    "email": "office@haldenelectrical.co.uk",
+    "phone": "01233 664 902",
+    "address": "Unit 9, Brunswick Yard, Ashford TN23 1PD"
+  },
+  "tone": "Straightforward and practical. Sounds like a tradesperson who turns up when they say they will.",
+  "goals": [
+    "Get emergency callouts phoned through rather than emailed",
+    "Win recurring EICR work from letting agents",
+    "Make the twelve-month return promise and the fixed quote obvious"
+  ]
+}

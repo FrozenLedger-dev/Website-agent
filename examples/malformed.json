@@ -1,0 +1,14 @@
+{
+  "businessName": "Marsh & Co",
+  "industry": "Consulting",
+  "location": "London",
+  "audience": "Businesses",
+  "services": [],
+  "differentiators": ["Experienced team"],
+  "contact": {
+    "email": "info@marshandco.com",
+    "phone": "020 7946 0101"
+  },
+  "tone": "Professional",
+  "goals": []
+}

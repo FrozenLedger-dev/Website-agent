@@ -1,0 +1,42 @@
+{
+  "businessName": "Forno Vecchio",
+  "industry": "Neapolitan pizzeria and small-plates restaurant",
+  "location": "Stokes Croft, Bristol",
+  "audience": "Local couples and groups eating out midweek, plus a lunch trade from the surrounding studios and offices",
+  "services": [
+    {
+      "name": "Neapolitan pizza",
+      "description": "Twelve-inch pizzas proved for 48 hours and fired for 70 seconds in a wood oven. Margherita £9.50, Diavola £12, Marinara £8."
+    },
+    {
+      "name": "Small plates",
+      "description": "Cicchetti-style plates to share before pizza — nduja arancini, burrata with grilled peach, marinated anchovies. £5 to £8 each."
+    },
+    {
+      "name": "Set lunch",
+      "description": "One small plate and one pizza for £14, served Tuesday to Friday between noon and 3pm."
+    },
+    {
+      "name": "Private hire",
+      "description": "The back room seats 24 and can be booked for an evening with a set menu agreed in advance."
+    }
+  ],
+  "differentiators": [
+    "Dough made daily with a starter kept going since the restaurant opened",
+    "Wood oven built on site by a bricklayer from Naples",
+    "Wine list is entirely Italian and entirely under £40 a bottle",
+    "Kitchen closes at 10pm because the whole team eats together afterwards"
+  ],
+  "yearsInBusiness": 6,
+  "contact": {
+    "email": "eat@fornovecchio.co.uk",
+    "phone": "0117 923 4418",
+    "address": "84 Stokes Croft, Bristol BS1 3QY"
+  },
+  "tone": "Direct and a little wry. Confident about the food without describing it as a journey. Short sentences.",
+  "goals": [
+    "Get people to book a table for midweek evenings, which are quieter than weekends",
+    "Make the set lunch obvious to people working nearby",
+    "Take private-hire enquiries for the back room"
+  ]
+}

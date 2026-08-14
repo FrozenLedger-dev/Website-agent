@@ -1,0 +1,47 @@
+{
+  "businessName": "Ravensworth Dental Care",
+  "industry": "General and cosmetic dentistry",
+  "location": "Jesmond, Newcastle upon Tyne",
+  "serviceArea": "Newcastle upon Tyne and North Tyneside",
+  "audience": "Adults registering with a new practice, and nervous patients who have avoided the dentist for years",
+  "services": [
+    {
+      "name": "Routine examinations and hygiene",
+      "description": "Check-up, small x-rays where clinically indicated, and an appointment with the hygienist."
+    },
+    {
+      "name": "White fillings",
+      "description": "Composite fillings colour-matched to the tooth, used to repair decay and replace older amalgam."
+    },
+    {
+      "name": "Crowns, bridges and dentures",
+      "description": "Restorative work made by a laboratory in Gateshead, fitted over two or three appointments."
+    },
+    {
+      "name": "Teeth straightening with clear aligners",
+      "description": "Aligner treatment for adults with mild to moderate crowding, planned from an intra-oral scan."
+    },
+    {
+      "name": "Anxious patient appointments",
+      "description": "Longer first appointments with no treatment carried out, so patients can meet the clinician and agree what happens next."
+    }
+  ],
+  "differentiators": [
+    "Two dentists, both registered with the General Dental Council, and the same hygienist since 2014",
+    "First appointment for anxious patients is a conversation, not an examination",
+    "Ground-floor surgery with step-free access from the street",
+    "Treatment plans are written down and costed before anything is booked"
+  ],
+  "yearsInBusiness": 21,
+  "contact": {
+    "email": "reception@ravensworthdental.co.uk",
+    "phone": "0191 281 7730",
+    "address": "112 Osborne Road, Jesmond, Newcastle upon Tyne NE2 2DR"
+  },
+  "tone": "Calm and unhurried. Plain English, no clinical jargon left unexplained, nothing that sounds like a sales pitch.",
+  "goals": [
+    "Get new patients to register with the practice",
+    "Reassure anxious patients enough to make a first appointment",
+    "Explain what clear aligner treatment involves before someone enquires"
+  ]
+}

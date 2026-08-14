@@ -1,0 +1,56 @@
+{
+  "businessName": "Tidebank Yoga",
+  "industry": "Yoga and movement studio",
+  "location": "Leith, Edinburgh",
+  "audience": "Beginners who find studio culture intimidating, and regular practitioners looking for a second studio near work",
+  "services": [
+    {
+      "name": "Vinyasa",
+      "description": "Flowing sequences set to breath, at a steady pace. 60 minutes, £14 drop-in."
+    },
+    {
+      "name": "Hatha",
+      "description": "Slower held postures with detailed alignment. 75 minutes, £14 drop-in."
+    },
+    {
+      "name": "Yin",
+      "description": "Long floor-based holds with bolsters and blocks provided. 60 minutes, £14 drop-in."
+    },
+    {
+      "name": "Beginners' course",
+      "description": "A six-week course covering the postures that appear in every other class. £75 for the course."
+    },
+    {
+      "name": "Pregnancy yoga",
+      "description": "For the second and third trimesters, taught by an instructor with a pregnancy-specific qualification. 60 minutes, £16 drop-in."
+    },
+    {
+      "name": "Mobility and strength",
+      "description": "Loaded stretching and joint work, closer to a gym class than a yoga class. 45 minutes, £14 drop-in."
+    },
+    {
+      "name": "Sunrise practice",
+      "description": "A short unheated class at 6.45am on weekdays. 45 minutes, £10 drop-in."
+    },
+    {
+      "name": "Studio hire",
+      "description": "The larger room hires out for workshops and rehearsals at £30 an hour outside class times."
+    }
+  ],
+  "differentiators": [
+    "Every class is capped at fourteen mats, so teachers can adjust individually",
+    "Mats, blocks, bolsters and straps are provided and included in the price",
+    "No membership and no contract — classes are booked one at a time or as a ten-class pass",
+    "Two studios in one building, so a beginners' class is never sharing a room with an advanced one"
+  ],
+  "contact": {
+    "email": "hello@tidebankyoga.co.uk",
+    "phone": "0131 555 0142"
+  },
+  "tone": "Unpretentious and welcoming. No sanskrit without a translation, no talk of journeys or energy.",
+  "goals": [
+    "Get first-time visitors to book the beginners' course rather than dropping into a general class",
+    "Sell ten-class passes to people who already practise",
+    "Fill the 6.45am slot, which is the emptiest on the timetable"
+  ]
+}

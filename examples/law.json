@@ -1,0 +1,43 @@
+{
+  "businessName": "Okonkwo & Fry Solicitors",
+  "industry": "Employment law for individuals",
+  "location": "Sheffield city centre",
+  "serviceArea": "England and Wales, with most clients in South Yorkshire",
+  "audience": "Employees facing dismissal, discrimination or a settlement agreement, who have never instructed a solicitor before",
+  "services": [
+    {
+      "name": "Unfair and constructive dismissal",
+      "description": "Advice on whether a dismissal was lawful, and representation at employment tribunal where a claim is brought."
+    },
+    {
+      "name": "Discrimination and harassment claims",
+      "description": "Claims under the Equality Act 2010 covering all nine protected characteristics, from grievance stage to tribunal."
+    },
+    {
+      "name": "Settlement agreements",
+      "description": "Review and negotiation of settlement agreements, including the independent advice the agreement requires."
+    },
+    {
+      "name": "Grievances and disciplinary hearings",
+      "description": "Preparing written grievances and briefing employees before internal hearings."
+    }
+  ],
+  "differentiators": [
+    "We act for employees only, never for employers",
+    "Discrimination and dismissal claims are taken on a no win, no fee basis where the case meets our criteria",
+    "The solicitor who assesses your case is the one who runs it",
+    "Regulated by the Solicitors Regulation Authority, number 624183"
+  ],
+  "yearsInBusiness": 11,
+  "contact": {
+    "email": "enquiries@okonkwofry.co.uk",
+    "phone": "0114 272 9066",
+    "address": "Second Floor, 34 Campo Lane, Sheffield S1 2EG"
+  },
+  "tone": "Precise and steady. Explains the law without condescension, and never promises an outcome.",
+  "goals": [
+    "Get employees to make contact early, before a tribunal deadline passes",
+    "Explain the three-month-less-one-day time limit clearly enough that people act on it",
+    "Set out how no win, no fee works so the first call is better informed"
+  ]
+}

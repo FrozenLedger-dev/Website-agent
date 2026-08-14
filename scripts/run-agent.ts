@@ -46,18 +46,29 @@ try {
 
   // Tail persisted progress so the terminal mirrors what the console shows.
   let seq = 0;
-  const tail = setInterval(() => {
-    void (async () => {
-      const events = await store.runEvents.find({ runId: handle.runId, seq: { $gt: seq } }).sort({ seq: 1 }).toArray();
-      for (const e of events) {
-        seq = e.seq;
-        console.log(`  ${COLOURS[e.level]}${e.phase.padEnd(9)}${RESET}${DIM}│${RESET} ${e.detail}`);
-      }
-    })();
-  }, 500);
+  const drain = async () => {
+    const events = await store.runEvents.find({ runId: handle.runId, seq: { $gt: seq } }).sort({ seq: 1 }).toArray();
+    for (const e of events) {
+      seq = e.seq;
+      console.log(`  ${COLOURS[e.level]}${e.phase.padEnd(9)}${RESET}${DIM}│${RESET} ${e.detail}`);
+    }
+  };
+
+  const tail = setInterval(() => void drain(), 500);
 
   const result = await handle.completed;
   clearInterval(tail);
+
+  /**
+   * One last read after the run resolves.
+   *
+   * The interval polls every 500ms, and the events a phase writes just before
+   * finishing land after the final tick — so the terminal simply lost them. The
+   * casualty was always the same line, `Live at …`, which made a successful
+   * deployment look like a silent one and sent me to the database to find out
+   * whether a site had published at all.
+   */
+  await drain();
   if (!result) {
     const run = await store.runs.findOne({ _id: handle.runId });
     console.error(`\n  ${COLOURS.fail}run failed${RESET}: ${run?.error ?? 'unknown error'}\n`);

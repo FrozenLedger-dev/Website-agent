@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   WriteOutsideModelScope,
   assertModelWritable,
+  ensureStylesheetPrelude,
   isModelWritable,
   readSourceFiles,
   scaffoldSite,
@@ -135,5 +136,66 @@ describe('readSourceFiles', () => {
 
     const files = await readSourceFiles(site);
     expect(files.find((f) => f.path === 'app/page.tsx')?.contents).toContain('function P()');
+  });
+});
+
+describe('ensureStylesheetPrelude', () => {
+  /**
+   * The builder is told to append brand tokens to `app/globals.css` and never
+   * replace it. It replaced it in four of five deliveries across different
+   * industries — in one case writing a comment claiming it had appended.
+   */
+  const REPLACED = [
+    '/* Halden Electrical brand tokens — appended to the existing global stylesheet */',
+    ':root {',
+    '  --background: #f5f2ea;',
+    '  --accent: #f2b705;',
+    '}',
+  ].join('\n');
+
+  it('puts the Tailwind import back when the builder dropped it', async () => {
+    const site = join(root, 'prelude-restore');
+    await scaffoldSite(site);
+    await writeFile(join(site, 'app/globals.css'), REPLACED);
+
+    expect(await ensureStylesheetPrelude(site)).toBe(true);
+
+    const restored = await readFile(join(site, 'app/globals.css'), 'utf8');
+    expect(restored).toContain('@import "tailwindcss"');
+    // Without @theme inline the brand variables never reach bg-background, so
+    // restoring only the import would still leave the site unstyled.
+    expect(restored).toContain('@theme inline');
+    // The model's own tokens survive: only what it was not entitled to remove
+    // is put back.
+    expect(restored).toContain('--accent: #f2b705');
+    expect(restored).toContain('Halden Electrical brand tokens');
+  });
+
+  it('leaves a correctly appended stylesheet untouched', async () => {
+    const site = join(root, 'prelude-ok');
+    await scaffoldSite(site);
+    const before = await readFile(join(site, 'app/globals.css'), 'utf8');
+    const appended = `${before}\n:root { --accent: #f2b705; }\n`;
+    await writeFile(join(site, 'app/globals.css'), appended);
+
+    expect(await ensureStylesheetPrelude(site)).toBe(false);
+    expect(await readFile(join(site, 'app/globals.css'), 'utf8')).toBe(appended);
+  });
+
+  it('is idempotent, so repeated builds cannot stack preludes', async () => {
+    const site = join(root, 'prelude-twice');
+    await scaffoldSite(site);
+    await writeFile(join(site, 'app/globals.css'), REPLACED);
+
+    await ensureStylesheetPrelude(site);
+    const once = await readFile(join(site, 'app/globals.css'), 'utf8');
+    expect(await ensureStylesheetPrelude(site)).toBe(false);
+    expect(await readFile(join(site, 'app/globals.css'), 'utf8')).toBe(once);
+  });
+
+  it('does nothing when there is no stylesheet to repair', async () => {
+    const site = join(root, 'prelude-missing');
+    await mkdir(site, { recursive: true });
+    expect(await ensureStylesheetPrelude(site)).toBe(false);
   });
 });

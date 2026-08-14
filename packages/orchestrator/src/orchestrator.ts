@@ -32,7 +32,7 @@ import {
   reviewSite,
   type UsageByTier,
 } from '@statxai/agents';
-import { runGates } from '@statxai/gates';
+import { isFrameworkPage, runGates } from '@statxai/gates';
 import { BudgetExhausted, createBudget, spend, spendRepairAttempt, type StateStore } from '@statxai/state';
 import {
   ArtifactRegistry,
@@ -399,7 +399,10 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       });
       let reviewed;
       try {
-        reviewed = await reviewSite(model, profile, plan, files, reviewCycle, repairedSinceReview);
+        // The reviewer judges the same pages the gates judge. Handing it the
+        // framework's own error pages invites a rejection nothing can repair.
+        const reviewable = files.filter((f) => !isFrameworkPage(f.path));
+        reviewed = await reviewSite(model, profile, plan, reviewable, reviewCycle, repairedSinceReview);
       } catch (error) {
         // A review that cannot run is not an accepted review. Repairs already
         // degrade gracefully; this did not, so an API outage mid-review took

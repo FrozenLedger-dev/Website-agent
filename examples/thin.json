@@ -1,0 +1,19 @@
+{
+  "businessName": "Marsh & Co",
+  "industry": "Consulting",
+  "location": "London",
+  "audience": "Businesses",
+  "services": [
+    {
+      "name": "Consulting",
+      "description": "We provide consulting services."
+    }
+  ],
+  "differentiators": [],
+  "contact": {
+    "email": "info@marshandco.com",
+    "phone": "555-01"
+  },
+  "tone": "Professional",
+  "goals": ["Generate leads"]
+}

@@ -182,6 +182,35 @@ sanitised on the way out (`toModelSchema`) while the full Zod schema still
 validates the response. The model is constrained on shape; the platform enforces
 everything else.
 
+**One fixture proves nothing.** Every run for weeks used the same intake — a
+joinery company in Harrogate — and the pipeline looked finished: released,
+deployed, scored 96. Running five other industries through it, one of the five
+produced a correct site. Four defects surfaced immediately, none of them visible
+on the tuned fixture:
+
+- The builder replaced `app/globals.css` instead of appending to it, dropping
+  `@import "tailwindcss"`, in **four of five** deliveries. The export still
+  contained a stylesheet — a few kilobytes of custom properties and not one
+  utility — so the markup's `lg:flex-row` resolved to nothing and the site
+  rendered as unstyled text. Three were released at 98–99 and deployed to
+  production. The prompt already said "append, never replace"; one of the
+  destroyed files opened with a comment claiming it had appended. The head of
+  that stylesheet is now platform-owned and re-asserted before every build,
+  like `components/ui/**`.
+- `business-facts` matched the business name against raw markup, so
+  `Okonkwo &amp; Fry Solicitors` never matched `Okonkwo & Fry Solicitors`. Five
+  P1s a cycle exhausted the repair budget, forced two re-plans, and blocked a
+  site that named the firm in its header on every page. It rules out every
+  business with an ampersand in its name.
+- The reviewer was handed the framework's own 404 pages, which the gates had
+  been taught to skip and it had not. It rejected three cycles running over
+  Next's built-in error page while every gate was clean.
+- No gate asked whether the delivered CSS defined the classes the pages use.
+  `spec-coverage` asked only whether a stylesheet existed.
+
+`examples/` now holds eight fixtures, each aimed at a different mechanism rather
+than a different industry, and `examples/README.md` says what each is for.
+
 **A gate that reads the wrong artifact is worse than no gate.** Moving the
 generated stack to Next.js silently repointed several checks at things the model
 does not write. One run produced 64 blocking findings on a site that was
@@ -268,14 +297,14 @@ scripts/
 ## Deterministic gates
 
 §7's first gate is the build itself: `next build` must produce a static export,
-and a project that does not compile never reaches a reviewer. Twelve content
+and a project that does not compile never reaches a reviewer. Thirteen content
 gates then run against that export — against the HTML a visitor actually
 receives, not the TSX source, because a page can look right in source and export
 as an empty shell:
 
-`claims` · `structure` · `headings` · `links` · `placeholders` · `secrets` ·
-`accessibility` · `business-facts` · `spec-coverage` · `responsive` ·
-`typography` · `forms`
+`claims` · `stylesheet` · `structure` · `headings` · `links` · `placeholders` ·
+`secrets` · `accessibility` · `business-facts` · `spec-coverage` ·
+`responsive` · `typography` · `forms`
 
 Anything a gate can own should not be left to the reviewer. On a real run the
 reviewer reported two unloaded webfonts; `pnpm gate:check` on the same site

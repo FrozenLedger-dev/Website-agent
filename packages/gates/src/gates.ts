@@ -51,6 +51,19 @@ type Gate = (ctx: GateContext) => GateFinding[];
  */
 const FRAMEWORK_PAGES = new Set(['404.html', '_not-found.html', '_global-error.html']);
 
+/**
+ * True for a page the framework generated for itself.
+ *
+ * Exported because the reviewer needs the same exclusion the gates apply. It
+ * did not have it, and rejected a release three cycles running over the
+ * typography of Next's own 404 page — a file the builder never wrote and a
+ * repair cannot meaningfully change. The gates were clean on every one of those
+ * cycles; the site was blocked and the repair budget spent regardless.
+ */
+export function isFrameworkPage(path: string): boolean {
+  return FRAMEWORK_PAGES.has(path);
+}
+
 /** The pages the site is accountable for — what every gate judges. */
 const htmlFiles = (ctx: GateContext) =>
   ctx.files.filter((f) => f.path.endsWith('.html') && !FRAMEWORK_PAGES.has(f.path));
@@ -58,6 +71,41 @@ const htmlFiles = (ctx: GateContext) =>
 /** What the export actually contains, for existence checks. */
 const exportPaths = (ctx: GateContext) =>
   new Set<string>([...ctx.files.map((f) => f.path), ...(ctx.assets ?? [])]);
+
+/**
+ * The text a visitor actually reads, entities decoded.
+ *
+ * Three things have to be true at once, and each was learned from a finding
+ * that should not have existed:
+ *
+ * - Entities are decoded. React writes an ampersand as `&amp;`, so matching raw
+ *   markup for "Okonkwo & Fry Solicitors" never succeeds. That produced a P1 on
+ *   every page of a site that named the firm in its header, exhausted the repair
+ *   budget, forced two re-plans and blocked the release.
+ * - Script and style bodies are removed, not just their tags. A static export
+ *   inlines React's flight payload, which contains the page's strings verbatim
+ *   *and unescaped* — so raw matching can be satisfied by text no visitor sees,
+ *   and the price patterns read its "$1" markers as prices.
+ * - Tags become spaces rather than being deleted. `.text` concatenates adjacent
+ *   elements, turning "<h1>Joinery</h1><p>We can…" into "JoineryWe can…", and
+ *   the word boundary at the start of every claim pattern then silently fails.
+ *
+ * The title is included because naming the business there still names it.
+ */
+function renderedText(html: string): string {
+  const root = parse(html, { comment: false });
+  const title = root.querySelector('title')?.text ?? '';
+
+  const body = root.querySelector('body');
+  for (const element of body?.querySelectorAll('script, style, template, noscript') ?? []) {
+    element.remove();
+  }
+
+  // Tags to spaces first, then parsed again so the entities in what remains
+  // decode. Doing it in the other order would decode markup back into tags.
+  const spaced = (body?.innerHTML ?? '').replace(/<[^>]+>/g, ' ');
+  return `${title} ${parse(spaced, { comment: false }).text}`.replace(/\s+/g, ' ').trim();
+}
 
 /**
  * Map an internal href onto the file the static export produced for it.
@@ -413,7 +461,7 @@ const businessFacts: Gate = (ctx) => {
   const { profile } = ctx;
 
   for (const file of htmlFiles(ctx)) {
-    if (!file.contents.toLowerCase().includes(profile.businessName.toLowerCase())) {
+    if (!renderedText(file.contents).toLowerCase().includes(profile.businessName.toLowerCase())) {
       findings.push({
         gate: 'business-facts',
         severity: 'P1',
@@ -424,7 +472,11 @@ const businessFacts: Gate = (ctx) => {
     }
   }
 
-  const all = htmlFiles(ctx).map((f) => f.contents).join('\n');
+  // The email is matched against markup as well as text, because a mailto link
+  // is a legitimate way to publish it and lives in an attribute.
+  const all = htmlFiles(ctx)
+    .map((f) => `${f.contents}\n${renderedText(f.contents)}`)
+    .join('\n');
   const digits = (s: string) => s.replace(/\D/g, '');
 
   if (!all.includes(profile.contact.email)) {
@@ -527,24 +579,12 @@ const claims: Gate = (ctx) => {
   for (const file of htmlFiles(ctx)) {
     // Compare against rendered text, not markup: class names and URLs would
     // otherwise trip the price and free-of-charge patterns constantly.
-    //
     // Tags are replaced with a space rather than using `.text`, which
     // concatenates adjacent elements — "<h1>Joinery</h1><p>We can…" becomes
     // "JoineryWe can…", and the word boundary at the start of every pattern
     // then fails. That failure is silent: the gate reports nothing and looks
     // like it passed.
-    const body = parse(file.contents, { comment: false }).querySelector('body');
-
-    // Script and style bodies are removed, not just their tags. Stripping tags
-    // alone leaves the contents behind, and a static export inlines React's
-    // flight payload into <body> — which is full of "$1", "$2" markers that the
-    // price pattern reads as a price the profile does not support. That fired
-    // on every page of a site whose visible copy quoted no prices at all.
-    for (const element of body?.querySelectorAll('script, style, template, noscript') ?? []) {
-      element.remove();
-    }
-
-    const text = (body?.innerHTML ?? '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+    const text = renderedText(file.contents);
 
     for (const claim of CLAIM_PATTERNS) {
       const match = claim.pattern.exec(text);
@@ -601,6 +641,80 @@ const specCoverage: Gate = (ctx) => {
   }
 
   return findings;
+};
+
+// ---------------------------------------------------------------------------
+// The stylesheet actually styles the pages
+// ---------------------------------------------------------------------------
+
+/**
+ * Do the classes the pages use exist in the delivered CSS?
+ *
+ * `spec-coverage` asked only whether a stylesheet existed. One did — 4.8KB of
+ * custom properties and not a single utility, because the builder had replaced
+ * `globals.css` and dropped the Tailwind import. The markup was full of
+ * `lg:flex-row` and `md:grid-cols-3` that resolved to nothing, the site rendered
+ * as unstyled text, and it was released at 99 and deployed.
+ *
+ * Asked this way the check is cause-agnostic: a missing import, a content-scan
+ * misconfiguration and an over-aggressive purge all present identically, as
+ * markup referring to rules that were never generated.
+ */
+const stylesheet: Gate = (ctx) => {
+  const pages = htmlFiles(ctx);
+  const css = ctx.files.filter((f) => f.path.endsWith('.css'));
+  if (pages.length === 0) return [];
+
+  if (css.length === 0) {
+    return [
+      {
+        gate: 'stylesheet',
+        severity: 'P0',
+        location: 'app/globals.css',
+        message: 'The build produced no stylesheet, so the site renders unstyled.',
+        acceptanceTest: 'The static export contains a CSS file.',
+      },
+    ];
+  }
+
+  // Tailwind escapes the characters that are not selector-safe, so `md:flex`
+  // is emitted as `.md\:flex`. Dropping every backslash lets a plain substring
+  // match find it without reimplementing the escaping rules.
+  const selectors = css.map((f) => f.contents).join('\n').replace(/\\/g, '');
+
+  const used = new Set<string>();
+  for (const page of pages) {
+    for (const attribute of page.contents.matchAll(/\sclass(?:Name)?=["']([^"']+)["']/gi)) {
+      for (const token of attribute[1]!.split(/\s+/)) {
+        // Arbitrary values carry brackets and quotes that make substring
+        // matching unreliable; there are always plainer classes to judge by.
+        if (token && !token.includes('[')) used.add(token);
+      }
+    }
+  }
+  if (used.size === 0) return [];
+
+  const defined = [...used].filter((token) => selectors.includes(`.${token}`));
+  const ratio = defined.length / used.size;
+
+  // A healthy build defines nearly everything it uses. The threshold is low
+  // because the failure this catches is total — zero of several hundred — while
+  // a handful of classes composed at runtime are normal and harmless.
+  if (ratio >= 0.25) return [];
+
+  return [
+    {
+      gate: 'stylesheet',
+      severity: 'P0',
+      location: 'app/globals.css',
+      message:
+        `The delivered CSS defines ${defined.length} of the ${used.size} classes the pages use ` +
+        `(${Math.round(ratio * 100)}%), so the site renders essentially unstyled. ` +
+        'The usual cause is app/globals.css losing its `@import "tailwindcss"` line.',
+      acceptanceTest:
+        'app/globals.css imports Tailwind, and the exported CSS defines the utility classes the pages reference.',
+    },
+  ];
 };
 
 // ---------------------------------------------------------------------------
@@ -823,6 +937,7 @@ const forms: Gate = (ctx) => {
 
 export const GATES: Record<string, Gate> = {
   claims,
+  stylesheet,
   typography,
   forms,
   structure,

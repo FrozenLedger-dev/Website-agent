@@ -331,3 +331,104 @@ describe('a Next.js static export', () => {
     expect(findings.some((f) => f.gate === 'spec-coverage' && f.severity === 'P0')).toBe(true);
   });
 });
+
+/**
+ * Defects found by running industries other than the one the platform was
+ * tuned on. Five deliveries across five industries produced four of these;
+ * none was visible on the fixture every earlier run had used.
+ */
+describe('what a second industry exposed', () => {
+  const shell = (body: string, title = 'Harrowgate Joinery') =>
+    `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
+    `<meta name="viewport" content="width=device-width, initial-scale=1">` +
+    `<title>${title}</title><meta name="description" content="Fitted wardrobes in Harrogate.">` +
+    `<link rel="stylesheet" href="/_next/static/chunks/site.css"></head>` +
+    `<body>${body}</body></html>`;
+
+  describe('a stylesheet that defines nothing the pages use', () => {
+    // The builder replaced app/globals.css and dropped `@import "tailwindcss"`.
+    // The export still had a CSS file — 4.8KB of custom properties and no
+    // utilities — so spec-coverage's "does a stylesheet exist" passed, the site
+    // rendered as unstyled text, and it was released at 99 and deployed.
+    const page = shell(
+      '<main class="mx-auto max-w-3xl px-4 py-16"><h1 class="text-5xl font-semibold">Harrowgate Joinery</h1>' +
+        '<div class="grid gap-8 md:grid-cols-2 lg:flex-row"><p class="text-muted-foreground">Fitted wardrobes. ' +
+        'Call 01423 887 214 or email workshop@harrowgatejoinery.co.uk.</p></div></main>',
+    );
+
+    it('is a P0, not a passing build', () => {
+      const tokensOnly = ':root{--background:#f5f2ea;--accent:#f2b705}.dark{--background:#17232d}';
+      const findings = runGates({
+        files: [
+          { path: 'index.html', contents: page },
+          { path: '_next/static/chunks/site.css', contents: tokensOnly },
+        ],
+        profile,
+        plan,
+      }).findings.filter((f) => f.gate === 'stylesheet');
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]!.severity).toBe('P0');
+    });
+
+    it('passes when the utilities are actually generated', () => {
+      // Tailwind escapes the colon, so `md:grid-cols-2` ships as `.md\:grid-cols-2`.
+      const real =
+        '.mx-auto{margin-inline:auto}.max-w-3xl{max-width:48rem}.px-4{padding-inline:1rem}' +
+        '.py-16{padding-block:4rem}.text-5xl{font-size:3rem}.font-semibold{font-weight:600}' +
+        '.grid{display:grid}.gap-8{gap:2rem}.text-muted-foreground{color:var(--muted-foreground)}' +
+        '@media(min-width:48rem){.md\\:grid-cols-2{grid-template-columns:repeat(2,1fr)}}' +
+        '@media(min-width:64rem){.lg\\:flex-row{flex-direction:row}}';
+
+      const findings = runGates({
+        files: [
+          { path: 'index.html', contents: page },
+          { path: '_next/static/chunks/site.css', contents: real },
+        ],
+        profile,
+        plan,
+      }).findings.filter((f) => f.gate === 'stylesheet');
+
+      expect(findings).toEqual([]);
+    });
+  });
+
+  describe('a business name containing an ampersand', () => {
+    // React writes "&" as "&amp;", so matching raw markup for "Okonkwo & Fry
+    // Solicitors" never succeeded. Five P1s per cycle exhausted the repair
+    // budget, forced two re-plans and blocked a site that named the firm in its
+    // header on every page.
+    const firm = { ...profile, businessName: 'Okonkwo & Fry Solicitors' };
+
+    it('matches the name as a visitor reads it', () => {
+      const page = shell(
+        '<main><h1>Okonkwo &amp; Fry Solicitors</h1><p>Employment law in Sheffield. ' +
+          'Call 01423 887 214 or email workshop@harrowgatejoinery.co.uk.</p></main>',
+        'Okonkwo &amp; Fry Solicitors',
+      );
+      const findings = runGates({ files: [{ path: 'index.html', contents: page }], profile: firm, plan }).findings;
+      expect(findings.filter((f) => f.gate === 'business-facts')).toEqual([]);
+    });
+
+    it('still reports a page that genuinely never names the business', () => {
+      const page = shell(
+        '<main><h1>Employment law</h1><p>Call 01423 887 214 or email workshop@harrowgatejoinery.co.uk.</p></main>',
+        'Employment law',
+      );
+      const findings = runGates({ files: [{ path: 'index.html', contents: page }], profile: firm, plan }).findings;
+      expect(findings.some((f) => f.gate === 'business-facts' && f.location === 'index.html')).toBe(true);
+    });
+
+    it('is not satisfied by the name appearing only in the inlined router payload', () => {
+      // The flight payload carries the page's strings verbatim and unescaped,
+      // so raw matching could pass on text no visitor ever sees.
+      const page = shell(
+        '<main><h1>Employment law</h1><p>Call 01423 887 214 or email workshop@harrowgatejoinery.co.uk.</p></main>' +
+          '<script>self.__next_f.push([1,"Okonkwo & Fry Solicitors"])</script>',
+        'Employment law',
+      );
+      const findings = runGates({ files: [{ path: 'index.html', contents: page }], profile: firm, plan }).findings;
+      expect(findings.some((f) => f.gate === 'business-facts' && f.location === 'index.html')).toBe(true);
+    });
+  });
+});

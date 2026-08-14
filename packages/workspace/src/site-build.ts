@@ -7,7 +7,7 @@
  * model is asked to review it.
  */
 import { execFile } from 'node:child_process';
-import { cp, readFile, readdir, rm, stat } from 'node:fs/promises';
+import { cp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -71,6 +71,52 @@ export async function scaffoldSite(siteRoot: string, templateRoot = defaultTempl
   });
 }
 
+/** The line without which the stylesheet contains no Tailwind at all. */
+const TAILWIND_IMPORT = '@import "tailwindcss"';
+
+/**
+ * Restore the platform-owned head of `app/globals.css`.
+ *
+ * The builder is told to append brand tokens and never replace the file, and it
+ * replaces the file anyway — in four of five deliveries across different
+ * industries, in one case writing a comment claiming it had appended. What is
+ * lost is the `@import "tailwindcss"` line and the `@theme inline` block that
+ * binds the brand variables to Tailwind's tokens, so the build emits a few
+ * kilobytes of custom properties and no utilities whatsoever.
+ *
+ * The failure is invisible in source and near-invisible in the export: the page
+ * markup is full of `lg:flex-row`, a stylesheet does exist, and the site simply
+ * renders as unstyled text. Three such sites were released at scores of 98 and
+ * 99 and deployed to production.
+ *
+ * So this is not left to the prompt. The head of the stylesheet is platform
+ * infrastructure exactly as `components/ui/**` and `package.json` are, and it is
+ * re-asserted before every build. The brand tokens the model wrote are kept —
+ * only the part it was never entitled to remove is put back.
+ */
+export async function ensureStylesheetPrelude(
+  siteRoot: string,
+  templateRoot = defaultTemplateRoot(),
+): Promise<boolean> {
+  const target = join(siteRoot, 'app/globals.css');
+  const current = await readFile(target, 'utf8').catch(() => null);
+  if (current === null) return false;
+  if (current.includes(TAILWIND_IMPORT)) return false;
+
+  const template = await readFile(join(templateRoot, 'app/globals.css'), 'utf8');
+
+  // Everything above the first `:root` is the platform's: the imports, the dark
+  // variant and the @theme mapping. `:root` onwards is where brand tokens live,
+  // and those are the model's to write.
+  const boundary = template.search(/^:root\b/m);
+  const prelude = boundary === -1 ? template : template.slice(0, boundary);
+
+  await writeFile(target, `${prelude.trimEnd()}
+
+${current.trimStart()}`, 'utf8');
+  return true;
+}
+
 /**
  * Install dependencies and produce the static export.
  *
@@ -105,6 +151,10 @@ export async function buildSite(siteRoot: string, timeoutMs = 10 * 60 * 1000): P
     // A stale export would otherwise be gated and deployed if the build failed
     // partway, which is the one outcome worse than failing outright.
     await rm(outDir, { recursive: true, force: true });
+
+    // Every build goes through here — the first one and every rebuild after a
+    // repair — so a stylesheet cannot lose its Tailwind import by any route.
+    await ensureStylesheetPrelude(siteRoot);
 
     // --frozen-lockfile is the point of shipping a lockfile: the scaffold's
     // dependency graph is the one that was proven to build. Without it, `^`
