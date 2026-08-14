@@ -3,3 +3,4 @@ export * from './job.js';
 export * from './review.js';
 export * from './artifacts.js';
 export * from './model-schemas.js';
+export * from './decisions.js';
