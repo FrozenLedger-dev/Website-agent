@@ -25,7 +25,6 @@ import {
   buildAnchor,
   buildPage,
   buildSite,
-  MalformedModelOutput,
   ModelClient,
   planSite,
   repairDefect,
@@ -51,10 +50,10 @@ import {
 import {
   authorizeRoute,
   developerOverride,
+  executeRoute,
   permittedStrategies,
   type RouteDecisionRecord,
   type RoutingAuthorization,
-  type Strategy,
 } from './routing.js';
 import {
   blocking,
@@ -221,7 +220,32 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
    * overridden — because "which strategy ran, and who chose it" is exactly the
    * kind of thing the audit trail exists to answer.
    */
-  async function decideStrategy(current: SitePlan): Promise<Strategy> {
+  /**
+   * Persist a routing outcome as a versioned artifact.
+   *
+   * Shared by the decision and by truncation recovery, so both appear in the
+   * same lineage and a reader can see that one-shot was chosen and then had to
+   * be abandoned — rather than seeing only the strategy that finally ran.
+   */
+  async function recordRoute(
+    authorization: RoutingAuthorization,
+    proposed: RouteDecisionRecord['proposed'],
+    modelFailure: string | null,
+  ): Promise<void> {
+    const record: RouteDecisionRecord = {
+      strategy: authorization.strategy,
+      source: authorization.source,
+      refusal: authorization.refusal,
+      proposed,
+      modelFailure,
+      decidedAt: new Date(),
+    };
+    const ref = await registry.put(projectId, 'route-decision', record);
+    await registry.accept(projectId, ref);
+    await workspace.materialiseArtifact('decisions/route-decision.json', record);
+  }
+
+  async function decideStrategy(current: SitePlan): Promise<RoutingAuthorization> {
     const override = developerOverride();
     const permitted = permittedStrategies(current);
 
@@ -259,17 +283,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       };
     }
 
-    const record: RouteDecisionRecord = {
-      strategy: authorization.strategy,
-      source: authorization.source,
-      refusal: authorization.refusal,
-      proposed,
-      modelFailure,
-      decidedAt: new Date(),
-    };
-    const ref = await registry.put(projectId, 'route-decision', record);
-    await registry.accept(projectId, ref);
-    await workspace.materialiseArtifact('decisions/route-decision.json', record);
+    await recordRoute(authorization, proposed, modelFailure);
 
     say({
       phase: 'build',
@@ -280,58 +294,38 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       level: authorization.source === 'sol' ? 'ok' : 'warn',
     });
 
-    return authorization.strategy;
+    return authorization;
   }
 
-  async function buildFromPlan(current: SitePlan): Promise<void> {
-    await store.projects.updateOne({ _id: projectId }, { $set: { state: 'building', updatedAt: new Date() } });
-
-    // The scaffold carries the toolchain, the dependency set and the shadcn
-    // primitives. Terra writes pages against it and never installs anything, so
-    // a build failure is always about the site rather than the toolchain.
-    await scaffoldSite(workspace.siteRoot);
-
   /**
-   * §3's one-shot-first choice, made by Sol and authorised by the harness.
+   * One call writes the whole site.
    *
-   * This was `process.env.BUILD_STRATEGY`, read before anything about the
-   * project was known, with `decompose` reached by throwing a fake truncation
-   * error so the escalation path would catch it. Nothing recorded why either
-   * branch was taken.
+   * Coherent by construction: the layout, the brand tokens and every page come
+   * out of one response, so the navigation, spacing and component vocabulary
+   * cannot drift between pages. It fails when the site does not fit the output
+   * ceiling, which is a genuine runtime failure and is handled as one.
    */
-  const strategy = await decideStrategy(current);
-
-  try {
-    if (strategy === 'decompose') throw new MalformedModelOutput('', new Error('forced: output truncated'));
-
+  async function executeOneShot(current: SitePlan): Promise<void> {
     say({ phase: 'build', detail: 'Terra is attempting the complete site in one pass' });
+
     const built = await buildSite(model, profile, current);
     track('terra', built);
     await workspace.writeSiteFiles(built.value.files);
+
     say({
       phase: 'build',
       detail: `One-shot succeeded: ${built.value.files.length} files (${built.model}, ${(built.ms / 1000).toFixed(1)}s, ${built.outputTokens} out)`,
       level: 'ok',
     });
-  } catch (error) {
-    // §3: one-shot first, decompose only when needed. A truncated build is a
-    // concrete validation failure, so this is the documented escalation path
-    // rather than an invented one. Any other failure is real and propagates.
-    if (!(error instanceof MalformedModelOutput) || !/truncated/.test(error.message)) throw error;
+  }
 
-    // `one-shot` opts out of the escalation entirely, so a truncation is the
-    // run's outcome rather than a trigger to decompose.
-    if (strategy === 'one_shot') throw error;
-
-    say({
-      phase: 'build',
-      detail:
-        strategy === 'decompose'
-          ? 'Building by decomposition: anchor first, then pages in parallel'
-          : 'One-shot exceeded the output ceiling — decomposing into per-page jobs',
-      level: 'warn',
-    });
-
+  /**
+   * An anchor, then the remaining pages in parallel against it.
+   *
+   * Each call stays well below the output ceiling, at the cost of later pages
+   * being built to match a reference rather than written alongside it.
+   */
+  async function executeDecomposed(current: SitePlan): Promise<void> {
     const anchor = await buildAnchor(model, profile, current);
     track('terra', anchor);
     await workspace.writeSiteFiles(anchor.value.files);
@@ -356,6 +350,55 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     }
     say({ phase: 'build', detail: `${rest.length} further pages built in parallel`, level: 'ok' });
   }
+
+  async function buildFromPlan(current: SitePlan): Promise<void> {
+    await store.projects.updateOne({ _id: projectId }, { $set: { state: 'building', updatedAt: new Date() } });
+
+    // The scaffold carries the toolchain, the dependency set and the shadcn
+    // primitives. Terra writes pages against it and never installs anything, so
+    // a build failure is always about the site rather than the toolchain.
+    await scaffoldSite(workspace.siteRoot);
+
+    /**
+     * The accepted route is executed directly.
+     *
+     * Decomposition used to be reached by throwing
+     * `MalformedModelOutput('forced: output truncated')` so the truncation
+     * handler would catch it. That made a deliberate strategy and a runtime
+     * failure the same code path, and indistinguishable afterwards. Each
+     * strategy now has its own function and its own call.
+     */
+    const route = await decideStrategy(current);
+
+    await executeRoute(route, current, {
+      oneShot: () => executeOneShot(current),
+      decomposed: async () => {
+        say({
+          phase: 'build',
+          detail: 'Building by decomposition: anchor first, then pages in parallel',
+        });
+        await executeDecomposed(current);
+      },
+      onRecovery: async (error) => {
+        say({
+          phase: 'build',
+          detail: 'One-shot exceeded the output ceiling — recovering by decomposition',
+          level: 'warn',
+        });
+        // A further version of the same artifact, so the trail reads "Sol chose
+        // one-shot, then the harness recovered" rather than implying that
+        // decomposition had been chosen.
+        await recordRoute(
+          {
+            strategy: 'decompose',
+            source: 'truncation-recovery',
+            refusal: `One-shot exceeded the output ceiling: ${error instanceof Error ? error.message : String(error)}`,
+          },
+          null,
+          null,
+        );
+      },
+    });
 
     await workspace.commit('Terra: build');
   }

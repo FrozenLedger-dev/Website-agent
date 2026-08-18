@@ -13,12 +13,36 @@ export type Strategy = 'one_shot' | 'decompose';
 /** A developer override, honoured only when it names a real strategy. */
 export type StrategyOverride = Strategy | null;
 
+/**
+ * How a strategy came to be chosen.
+ *
+ * `truncation-recovery` is deliberately not a routing decision. It is what the
+ * harness does when a one-shot build genuinely exceeds the output ceiling at
+ * runtime, and it is recorded as its own artifact version so the trail
+ * distinguishes "Sol decided to decompose" from "one-shot was tried and did not
+ * fit". Those were the same code path when decomposition was entered by
+ * throwing a fabricated truncation error, which made the two indistinguishable
+ * after the fact.
+ */
+export type RouteSource = 'sol' | 'developer-override' | 'fallback' | 'truncation-recovery';
+
 export interface RoutingAuthorization {
   strategy: Strategy;
   /** How this strategy came to be chosen — recorded on the artifact. */
-  source: 'sol' | 'developer-override' | 'fallback';
+  source: RouteSource;
   /** Present when the harness refused or replaced Sol's choice. */
   refusal: string | null;
+}
+
+/**
+ * A build that really did exceed the output ceiling.
+ *
+ * The distinction matters now that nothing fabricates this error: a truncation
+ * reaching here is always a genuine runtime failure, so recovering from it is
+ * recovery rather than a strategy anyone chose.
+ */
+export function isTruncationFailure(error: unknown): boolean {
+  return error instanceof Error && error.name === 'MalformedModelOutput' && /truncated/.test(error.message);
 }
 
 /**
@@ -109,7 +133,7 @@ export function authorizeRoute(
 /** What gets stored as the versioned `route-decision` artifact. */
 export interface RouteDecisionRecord {
   strategy: Strategy;
-  source: RoutingAuthorization['source'];
+  source: RouteSource;
   refusal: string | null;
   /** Sol's own words, kept even when the harness did not follow them. */
   proposed: {
@@ -121,4 +145,60 @@ export interface RouteDecisionRecord {
   /** Set when Sol was never consulted or its answer could not be used. */
   modelFailure: string | null;
   decidedAt: Date;
+}
+
+export interface RouteExecutors {
+  /** Build the whole site in one call. */
+  oneShot: () => Promise<void>;
+  /** Build an anchor, then the remaining pages against it. */
+  decomposed: () => Promise<void>;
+  /**
+   * Called when a real one-shot truncation is about to be recovered from, so
+   * the caller can record it. Recovery is not a routing decision and is
+   * recorded separately.
+   */
+  onRecovery: (error: unknown) => Promise<void>;
+}
+
+/**
+ * Execute the accepted route.
+ *
+ * Each strategy has its own call. Decomposition used to be reached by throwing
+ * `MalformedModelOutput('forced: output truncated')` so the truncation handler
+ * would catch it, which made a deliberate strategy and a runtime failure the
+ * same code path and indistinguishable afterwards.
+ *
+ * Truncation recovery survives, because §3's "one-shot first, decompose only
+ * when needed" is a real escalation — but it now triggers only on a truncation
+ * that genuinely happened, and it is reported as recovery rather than as a
+ * strategy anyone selected.
+ *
+ * Two cases deliberately do not recover:
+ *
+ * - an operator who forced one-shot asked for that path specifically, so a
+ *   truncation is the run's outcome rather than a silent switch to the strategy
+ *   they overrode away from;
+ * - a single-page plan cannot be decomposed, because the anchor builds the only
+ *   page and the second phase would be empty.
+ */
+export async function executeRoute(
+  route: RoutingAuthorization,
+  plan: SitePlan,
+  executors: RouteExecutors,
+): Promise<void> {
+  if (route.strategy === 'decompose') {
+    await executors.decomposed();
+    return;
+  }
+
+  try {
+    await executors.oneShot();
+  } catch (error) {
+    if (!isTruncationFailure(error)) throw error;
+    if (route.source === 'developer-override') throw error;
+    if (!permittedStrategies(plan).includes('decompose')) throw error;
+
+    await executors.onRecovery(error);
+    await executors.decomposed();
+  }
 }
