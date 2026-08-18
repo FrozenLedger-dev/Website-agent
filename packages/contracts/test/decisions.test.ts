@@ -12,6 +12,7 @@ import {
   SolApprovalRecommendation,
   SolRouteDecision,
   checkAdjudicationLegal,
+  stripNulls,
   toStrictModelSchema,
   type AdjudicationAction,
 } from '../src/index.js';
@@ -159,5 +160,67 @@ describe('what Sol structurally cannot ask for', () => {
       expect(json.type).toBe('object');
       expect(json.additionalProperties).toBe(false);
     }
+  });
+});
+
+describe('the round trip a live decision actually takes', () => {
+  /**
+   * Strict output requires every key present, so an inapplicable field comes
+   * back as `null` — and `stripNulls` then deletes it before Zod sees anything.
+   * The field therefore arrives as `undefined`, not `null`.
+   *
+   * Every routing decision on the first live run was rejected for exactly this,
+   * while the unit tests above passed because they build the object with an
+   * explicit `null`. These parse what the pipeline really hands over.
+   */
+  const throughPipeline = <T>(value: T): T => stripNulls(value);
+
+  it('accepts a one-shot decision whose null workstreams were stripped', () => {
+    const parsed = SolRouteDecision.safeParse(
+      throughPipeline({
+        action: 'one_shot',
+        reason: 'Five ordinary pages fit one response.',
+        confidence: 0.82,
+        workstreams: null,
+      }),
+    );
+    expect(parsed.success).toBe(true);
+  });
+
+  it('still requires workstreams when decomposing, stripped or not', () => {
+    const parsed = SolRouteDecision.safeParse(
+      throughPipeline({
+        action: 'decompose',
+        reason: 'Eight content-heavy routes.',
+        confidence: 0.7,
+        workstreams: null,
+      }),
+    );
+    expect(parsed.success).toBe(false);
+  });
+
+  it('accepts a stripped adjudication and still enforces its per-action fields', () => {
+    const repair = SolAdjudicationDecision.safeParse(
+      throughPipeline({
+        action: 'repair',
+        reason: 'Two narrow claims defects.',
+        defectIds: ['GATE-001'],
+        objective: null,
+        scope: null,
+      }),
+    );
+    expect(repair.success).toBe(true);
+
+    // `scope` stripped to undefined must not read as "supplied".
+    const replan = SolAdjudicationDecision.safeParse(
+      throughPipeline({
+        action: 'replan',
+        reason: 'The plan is the defect.',
+        defectIds: null,
+        objective: null,
+        scope: null,
+      }),
+    );
+    expect(replan.success).toBe(false);
   });
 });

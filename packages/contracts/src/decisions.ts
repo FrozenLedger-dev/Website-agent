@@ -11,6 +11,15 @@
  * *proposal*. The policy engine decides whether it is legal, and the harness
  * decides whether it executes.
  *
+ * ## Why the optional fields are `.nullish()` rather than `.nullable()`
+ *
+ * The round trip deletes nulls. `toStrictModelSchema` requires every key to be
+ * present and makes the optional ones nullable, the model returns `null`, and
+ * `stripNulls` then removes the key before Zod ever sees it — so the field
+ * arrives as `undefined`. A `.nullable()` field rejects that, which failed
+ * every routing decision on the first live run while passing unit tests that
+ * built the object with an explicit `null`.
+ *
  * ## Why these are flat objects rather than discriminated unions
  *
  * A `z.discriminatedUnion` renders as a top-level `anyOf`, and strict structured
@@ -49,7 +58,7 @@ export const SolRouteDecision = z
     /** How sure Sol is, 0 to 1. Recorded, never used to widen a budget. */
     confidence: z.number(),
     /** Required when decomposing: what each parallel unit builds. */
-    workstreams: z.array(WorkstreamSpec).nullable(),
+    workstreams: z.array(WorkstreamSpec).nullish(),
   })
   .refine((d) => d.action !== 'decompose' || (d.workstreams?.length ?? 0) > 0, {
     message: 'A decompose decision must name the workstreams it splits into.',
@@ -94,11 +103,11 @@ export const SolAdjudicationDecision = z
     action: AdjudicationAction,
     reason: z.string().min(1),
     /** Required for `repair`: which defects, by id. */
-    defectIds: z.array(z.string().min(1)).nullable(),
+    defectIds: z.array(z.string().min(1)).nullish(),
     /** Required for `terra_specialist` and `visual_refine`: what to achieve. */
-    objective: z.string().nullable(),
+    objective: z.string().nullish(),
     /** Required for `replan`: how much of the specification is in question. */
-    scope: z.enum(['page', 'design', 'site']).nullable(),
+    scope: z.enum(['page', 'design', 'site']).nullish(),
   })
   .superRefine((d, ctx) => {
     const needs = (field: 'defectIds' | 'objective' | 'scope', ok: boolean) => {
@@ -114,7 +123,7 @@ export const SolAdjudicationDecision = z
     if (d.action === 'terra_specialist' || d.action === 'visual_refine') {
       needs('objective', (d.objective ?? '').trim().length > 0);
     }
-    if (d.action === 'replan') needs('scope', d.scope !== null);
+    if (d.action === 'replan') needs('scope', d.scope != null);
   });
 export type SolAdjudicationDecision = z.infer<typeof SolAdjudicationDecision>;
 

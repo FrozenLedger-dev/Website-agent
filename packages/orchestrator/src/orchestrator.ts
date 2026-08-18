@@ -29,6 +29,7 @@ import {
   ModelClient,
   planSite,
   repairDefect,
+  routeBuild,
   reviewSite,
   type UsageByTier,
 } from '@statxai/agents';
@@ -47,6 +48,14 @@ import {
   type BuildResult,
   type DeployResult,
 } from '@statxai/workspace';
+import {
+  authorizeRoute,
+  developerOverride,
+  permittedStrategies,
+  type RouteDecisionRecord,
+  type RoutingAuthorization,
+  type Strategy,
+} from './routing.js';
 import {
   blocking,
   buildFailureDefect,
@@ -205,6 +214,75 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   let plan = await producePlan(0);
 
   // -- Phase 3: Build (one-shot first) --------------------------------------
+  /**
+   * Ask Sol how to build, then authorise the answer.
+   *
+   * Sol's decision is persisted either way — including when it is refused or
+   * overridden — because "which strategy ran, and who chose it" is exactly the
+   * kind of thing the audit trail exists to answer.
+   */
+  async function decideStrategy(current: SitePlan): Promise<Strategy> {
+    const override = developerOverride();
+    const permitted = permittedStrategies(current);
+
+    let authorization: RoutingAuthorization;
+    let proposed: RouteDecisionRecord['proposed'] = null;
+    let modelFailure: string | null = null;
+
+    try {
+      const routed = await routeBuild(model, profile, current, {
+        pageCount: current.sitemap.pages.length,
+        sectionCount: current.sitemap.pages.reduce((n, p) => n + p.sections.length, 0),
+        serviceCount: profile.services.length,
+        permittedStrategies: permitted,
+      });
+      track('sol', routed);
+
+      proposed = {
+        action: routed.value.action,
+        reason: routed.value.reason,
+        confidence: routed.value.confidence,
+        workstreams: routed.value.workstreams ?? [],
+      };
+      authorization = authorizeRoute(routed.value, current, override);
+    } catch (error) {
+      /**
+       * Routing is a preference between two working paths, so a model failure
+       * must not end a delivery. The run falls back to the documented default
+       * and says so; it does not silently behave as though Sol had chosen.
+       */
+      modelFailure = error instanceof Error ? error.message : String(error);
+      authorization = {
+        strategy: override ?? 'one_shot',
+        source: override ? 'developer-override' : 'fallback',
+        refusal: `Sol could not be consulted: ${modelFailure}`,
+      };
+    }
+
+    const record: RouteDecisionRecord = {
+      strategy: authorization.strategy,
+      source: authorization.source,
+      refusal: authorization.refusal,
+      proposed,
+      modelFailure,
+      decidedAt: new Date(),
+    };
+    const ref = await registry.put(projectId, 'route-decision', record);
+    await registry.accept(projectId, ref);
+    await workspace.materialiseArtifact('decisions/route-decision.json', record);
+
+    say({
+      phase: 'build',
+      detail:
+        authorization.source === 'sol'
+          ? `Sol routed to ${authorization.strategy} (confidence ${proposed?.confidence.toFixed(2) ?? '—'}): ${proposed?.reason ?? ''}`
+          : `${authorization.strategy} by ${authorization.source} — ${authorization.refusal ?? ''}`,
+      level: authorization.source === 'sol' ? 'ok' : 'warn',
+    });
+
+    return authorization.strategy;
+  }
+
   async function buildFromPlan(current: SitePlan): Promise<void> {
     await store.projects.updateOne({ _id: projectId }, { $set: { state: 'building', updatedAt: new Date() } });
 
@@ -214,13 +292,14 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     await scaffoldSite(workspace.siteRoot);
 
   /**
-   * §3 mandates one-shot first, so `auto` is the default. `decompose` skips
-   * straight to per-page builds: the whole-site attempt is a single very long
-   * request, and on constrained hosts that is the most fragile call in the
-   * pipeline. Forcing decomposition trades one long call for several short
-   * parallel ones.
+   * §3's one-shot-first choice, made by Sol and authorised by the harness.
+   *
+   * This was `process.env.BUILD_STRATEGY`, read before anything about the
+   * project was known, with `decompose` reached by throwing a fake truncation
+   * error so the escalation path would catch it. Nothing recorded why either
+   * branch was taken.
    */
-  const strategy = process.env.BUILD_STRATEGY ?? 'auto';
+  const strategy = await decideStrategy(current);
 
   try {
     if (strategy === 'decompose') throw new MalformedModelOutput('', new Error('forced: output truncated'));
@@ -242,7 +321,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
     // `one-shot` opts out of the escalation entirely, so a truncation is the
     // run's outcome rather than a trigger to decompose.
-    if (strategy === 'one-shot') throw error;
+    if (strategy === 'one_shot') throw error;
 
     say({
       phase: 'build',

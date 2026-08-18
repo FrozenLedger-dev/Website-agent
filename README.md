@@ -65,16 +65,26 @@ setsid nohup node --env-file=.env.local --import tsx scripts/run-agent.ts \
   < /dev/null > run.log 2>&1 &
 ```
 
-`BUILD_STRATEGY` controls how Terra builds:
+**Sol chooses how Terra builds.** After the plan is accepted it makes a routing
+decision — one-shot or decompose — from the shape of that specific plan: routes,
+sections across all of them, and how much copy each needs. The harness then
+authorises it. A decomposition naming routes the sitemap does not contain, or
+any strategy the plan cannot support, falls back to one-shot and records why;
+routing is a preference between two working paths, so a refusal never fails a
+delivery. The decision is stored as a versioned `route-decision` artifact
+alongside Sol's own reason and confidence, including when it was refused.
+
+`BUILD_STRATEGY` remains as an explicit developer override:
 
 | Value | Behaviour |
 |---|---|
-| `auto` (default) | §3's one-shot first, decomposing only if the response truncates |
-| `decompose` | Skip straight to anchor-then-parallel-pages |
-| `one-shot` | Whole-site attempt only; a truncation fails the run |
+| unset (default) | Sol decides |
+| `one-shot` | Force the whole-site attempt; a truncation fails the run |
+| `decompose` | Force anchor-then-parallel-pages |
 
-The whole-site attempt is a single very long request and is the most fragile
-call in the pipeline. `decompose` trades it for several short parallel ones.
+An unrecognised value is ignored rather than guessed at, and an override that
+disagrees with Sol is recorded on the artifact as an override rather than
+silently standing in for the model's decision.
 
 ## The delivery pipeline
 
