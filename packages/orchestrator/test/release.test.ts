@@ -29,9 +29,16 @@ const says = (
   acknowledgedIssues: string[] = [],
 ) => SolApprovalRecommendation.parse({ recommendation, reason: 'because', acknowledgedIssues });
 
+/** Nothing open, and the check to prove it. */
+const nothingOpen = () => verifyAcknowledged([], []);
+
 describe('a recommendation the harness agrees with', () => {
   it('authorises a release', () => {
-    const auth = authorizeRelease({ recommendation: says('accept'), evidence: clean() });
+    const auth = authorizeRelease({
+      recommendation: says('accept'),
+      evidence: clean(),
+      acknowledgement: nothingOpen(),
+    });
     expect(auth).toMatchObject({ authorized: true, action: 'release' });
     expect(auth.policyVersion).toBe(RELEASE_POLICY_VERSION);
   });
@@ -40,9 +47,39 @@ describe('a recommendation the harness agrees with', () => {
     const auth = authorizeRelease({
       recommendation: says('accept'),
       evidence: clean({ deploymentConfigured: false }),
+      acknowledgement: nothingOpen(),
     });
     expect(auth.authorized).toBe(true);
     expect(auth.reason).toContain('no deployment target');
+  });
+});
+
+describe('an acceptance with nothing to check it against', () => {
+  it('fails closed rather than reading absence as "nothing omitted"', () => {
+    // `acknowledgement?.unacknowledged ?? []` treated a missing check as an
+    // empty one, so a caller that simply forgot it got a release. The delivery
+    // loop always supplies one, but an exported policy function has to hold its
+    // own invariant rather than trust every caller to remember.
+    const auth = authorizeRelease({ recommendation: says('accept'), evidence: clean() });
+
+    expect(auth).toMatchObject({ authorized: false, action: 'block' });
+    expect(auth.reason).toContain('no acknowledgement check was supplied');
+  });
+
+  it('does not require one to refuse a rejection', () => {
+    // Only an acceptance ships with anything, so only an acceptance needs the
+    // check. A rejection is refused on its own terms.
+    const auth = authorizeRelease({ recommendation: says('reject'), evidence: clean() });
+    expect(auth.action).toBe('block');
+    expect(auth.reason).toContain('recommended rejection');
+  });
+
+  it('does not require one to refuse on deterministic grounds', () => {
+    const auth = authorizeRelease({
+      recommendation: says('accept'),
+      evidence: clean({ blockingDefects: 1 }),
+    });
+    expect(auth.reason).toContain('not waivable');
   });
 });
 
@@ -80,6 +117,7 @@ describe('a recommendation the harness overrules', () => {
     const auth = authorizeRelease({
       recommendation: says('accept'),
       evidence: clean({ autonomyMode: 'human_in_the_loop' }),
+      acknowledgement: nothingOpen(),
     });
     expect(auth).toMatchObject({ authorized: false, action: 'human_review' });
   });
@@ -439,5 +477,77 @@ describe('git provenance', () => {
     const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
     const code = await readFile(join(src, 'orchestrator.ts'), 'utf8');
     expect(code).not.toContain('PENDING (Phase 2d');
+  });
+});
+
+describe('what a refused release reports to its caller', () => {
+  const source = async () => {
+    const { readFile } = await import('node:fs/promises');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
+    return readFile(join(src, 'orchestrator.ts'), 'utf8');
+  };
+
+  it('does not use the intake-failure helper after a delivery has happened', async () => {
+    /**
+     * `terminal()` zeroes everything, which is accurate before a workspace
+     * exists and wrong afterwards. A run that built a site, scored 92 over
+     * three cycles and two repairs, and was then correctly refused a release,
+     * reported quality 0, no cycles, no repairs, no defects and no commit — the
+     * decision right, the telemetry describing a different run.
+     */
+    const code = await source();
+    const late = code.slice(code.indexOf('if (!authorization?.authorized)'));
+    const branch = late.slice(0, late.indexOf('\n  }\n'));
+
+    expect(branch).toContain('concluded(');
+    expect(branch).not.toContain('terminal(');
+  });
+
+  it('keeps the intake helper for the exits that genuinely have nothing to report', async () => {
+    const code = (await source()).replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+    const calls = code.match(/return terminal\(/g) ?? [];
+
+    // Both remaining uses are intake failures, before a workspace exists.
+    expect(calls).toHaveLength(2);
+    expect(code.match(/return terminal\('intake_insufficient'\)/g) ?? []).toHaveLength(2);
+  });
+
+  it('reports the delivery that actually happened', async () => {
+    const code = await source();
+    const concluded = code.slice(code.indexOf('async function concluded'));
+    const body = concluded.slice(0, concluded.indexOf('\n  }\n'));
+
+    for (const field of [
+      'qualityScore,',
+      'reviewCycles: reviewCycle,',
+      'repairsApplied,',
+      'openDefects,',
+      'workspace.currentCommit()',
+      'siteRoot: workspace.siteRoot,',
+    ]) {
+      expect(body, field).toContain(field);
+    }
+  });
+
+  it('distinguishes a refusal that wants a person from one that gave up', async () => {
+    // `request_human_review` has always been a legal terminal outcome; the late
+    // path returned a bare `blocked` while setting the project state to
+    // awaiting_human_review, so the two disagreed.
+    const code = await source();
+    const late = code.slice(code.indexOf('if (!authorization?.authorized)'));
+    const branch = late.slice(0, late.indexOf('\n  }\n'));
+
+    expect(branch).toContain("'request_human_review'");
+    expect(branch).toContain('awaiting_human_review');
+    expect(branch).toContain('decideTerminal(openDefects, autonomyMode)');
+  });
+
+  it('records a blocked project state when it did not route to a person', async () => {
+    const code = await source();
+    const late = code.slice(code.indexOf('if (!authorization?.authorized)'));
+    const branch = late.slice(0, late.indexOf('\n  }\n'));
+    expect(branch).toContain("state: 'blocked'");
   });
 });

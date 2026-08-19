@@ -1345,18 +1345,33 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
    * exhausted budget, a refused revision — stops here rather than publishing.
    */
   if (!authorization?.authorized) {
-    if (authorization?.action === 'human_review') {
+    const awaitingHuman = authorization?.action === 'human_review';
+
+    if (awaitingHuman) {
       await store.projects.updateOne(
         { _id: projectId },
         { $set: { state: 'awaiting_human_review', updatedAt: new Date() } },
       );
       say({
         phase: 'approve',
-        detail: `Awaiting human review before release: ${authorization.reason}`,
+        detail: `Awaiting human review before release: ${authorization?.reason ?? ''}`,
         level: 'warn',
       });
+    } else {
+      await store.projects.updateOne(
+        { _id: projectId },
+        { $set: { state: 'blocked', updatedAt: new Date() } },
+      );
     }
-    return terminal('blocked');
+
+    // A refusal that routed to a person is not the same terminal state as one
+    // that gave up, and the contract has always had a word for it.
+    return concluded(
+      'blocked',
+      awaitingHuman
+        ? 'request_human_review'
+        : (terminalDecision ?? decideTerminal(openDefects, autonomyMode)),
+    );
   }
 
   await store.projects.updateOne({ _id: projectId }, { $set: { state: 'releasing', updatedAt: new Date() } });
@@ -1479,6 +1494,14 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     phaseMs: { ...phaseMs },
   };
 
+  /**
+   * An exit before there is a delivery to describe.
+   *
+   * Only for intake failures, which happen before a workspace exists, a plan is
+   * made or a token is spent — so the zeroes are accurate rather than missing.
+   * Anything that ends after the build has real values to report and must use
+   * {@link concluded}.
+   */
   function terminal(outcome: RunResult['outcome']): RunResult {
     return {
       projectId,
@@ -1489,6 +1512,35 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       openDefects: [],
       commit: null,
       siteRoot: '',
+      usage,
+      usageByTier,
+      phaseMs: { ...phaseMs },
+    };
+  }
+
+  /**
+   * An exit after a delivery has happened, reporting what it actually did.
+   *
+   * The late release refusal used `terminal()`, so a run that built a site,
+   * scored 92 over three review cycles and two repairs, and was then correctly
+   * refused a release, reported a quality score of 0, no cycles, no repairs, no
+   * open defects, no commit and no site root. The decision was right and the
+   * telemetry described a different run.
+   */
+  async function concluded(
+    outcome: RunResult['outcome'],
+    decision: TerminalOutcome | undefined,
+  ): Promise<RunResult> {
+    return {
+      projectId,
+      outcome,
+      ...(decision ? { terminalDecision: decision } : {}),
+      qualityScore,
+      reviewCycles: reviewCycle,
+      repairsApplied,
+      openDefects,
+      commit: await workspace.currentCommit(),
+      siteRoot: workspace.siteRoot,
       usage,
       usageByTier,
       phaseMs: { ...phaseMs },

@@ -152,7 +152,23 @@ export function authorizeRelease(input: {
    * acknowledgement is load-bearing: it is the stated basis on which something
    * ships with known defects.
    */
-  const omitted = acknowledgement?.unacknowledged ?? [];
+  if (!acknowledgement) {
+    /**
+     * No check supplied is not the same as nothing to report.
+     *
+     * `acknowledgement?.unacknowledged ?? []` read an absent check as "omitted
+     * nothing", so a caller that simply forgot it got a release. The delivery
+     * loop always computes one, but an exported policy function has to hold its
+     * own invariant rather than depend on every caller remembering.
+     */
+    return decided(
+      false,
+      'block',
+      'Sol recommended acceptance, but no acknowledgement check was supplied to verify what it is shipping with.',
+    );
+  }
+
+  const omitted = acknowledgement.unacknowledged;
   if (omitted.length > 0) {
     return decided(
       false,
