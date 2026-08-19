@@ -11,6 +11,7 @@ import { DeploymentManifest, SolApprovalRecommendation, toStrictModelSchema } fr
 import {
   RELEASE_POLICY_VERSION,
   authorizeRelease,
+  terminalForRefusal,
   verifyAcknowledged,
   type ReleaseEvidence,
 } from '../src/release.js';
@@ -531,17 +532,18 @@ describe('what a refused release reports to its caller', () => {
     }
   });
 
-  it('distinguishes a refusal that wants a person from one that gave up', async () => {
-    // `request_human_review` has always been a legal terminal outcome; the late
-    // path returned a bare `blocked` while setting the project state to
-    // awaiting_human_review, so the two disagreed.
+  it('maps its terminal outcome from the authorisation, not the defect list', async () => {
+    // `decideTerminal` answers what to do about outstanding defects and spent
+    // budgets, and prefers `accept_non_blocking` whenever no P0 or P1 remains.
+    // This branch is reached only when none remains, so borrowing it reported a
+    // denied release as an acceptance.
     const code = await source();
     const late = code.slice(code.indexOf('if (!authorization?.authorized)'));
     const branch = late.slice(0, late.indexOf('\n  }\n'));
 
-    expect(branch).toContain("'request_human_review'");
+    expect(branch).toContain('terminalForRefusal(');
+    expect(branch).not.toContain('decideTerminal(');
     expect(branch).toContain('awaiting_human_review');
-    expect(branch).toContain('decideTerminal(openDefects, autonomyMode)');
   });
 
   it('records a blocked project state when it did not route to a person', async () => {
@@ -549,5 +551,80 @@ describe('what a refused release reports to its caller', () => {
     const late = code.slice(code.indexOf('if (!authorization?.authorized)'));
     const branch = late.slice(0, late.indexOf('\n  }\n'));
     expect(branch).toContain("state: 'blocked'");
+  });
+});
+
+describe('the terminal outcome of a denied release', () => {
+  /**
+   * The contradiction this replaces: the late refusal borrowed `decideTerminal`,
+   * which prefers `accept_non_blocking` whenever no P0 or P1 remains — and that
+   * branch is reached only when none remains, because blocking defects are
+   * cleared before an approval is ever sought. A correct Sol rejection could
+   * therefore return `outcome: blocked` beside
+   * `terminalDecision: accept_non_blocking`.
+   */
+  it('reports a Sol rejection as blocked', () => {
+    const auth = authorizeRelease({ recommendation: says('reject'), evidence: clean() });
+    expect(auth.action).toBe('block');
+    expect(terminalForRefusal(auth.action)).toBe('mark_blocked');
+  });
+
+  it('reports an approval that could not be obtained as blocked under full autonomy', () => {
+    const auth = authorizeRelease({ recommendation: null, evidence: clean() });
+    expect(auth.action).toBe('block');
+    expect(terminalForRefusal(auth.action)).toBe('mark_blocked');
+  });
+
+  it('reports an incomplete acknowledgement as blocked', () => {
+    const auth = authorizeRelease({
+      recommendation: says('accept'),
+      evidence: clean(),
+      acknowledgement: verifyAcknowledged([], [{ id: 'QA-004' }]),
+    });
+    expect(auth.action).toBe('block');
+    expect(terminalForRefusal(auth.action)).toBe('mark_blocked');
+  });
+
+  it('reports a human-review transition as a request for one', () => {
+    const auth = authorizeRelease({
+      recommendation: says('human_review'),
+      evidence: clean({ autonomyMode: 'supervised_autonomous' }),
+    });
+    expect(auth.action).toBe('human_review');
+    expect(terminalForRefusal(auth.action)).toBe('request_human_review');
+  });
+
+  it('treats a missing authorisation as blocked, not as a review request', () => {
+    // Null reaches here from every path that never sought approval at all.
+    expect(terminalForRefusal(null)).toBe('mark_blocked');
+  });
+
+  it('never reports a denied release as an acceptance', () => {
+    // The property that matters, across every way a release can be refused.
+    const refusals = [
+      authorizeRelease({ recommendation: says('reject'), evidence: clean() }),
+      authorizeRelease({ recommendation: says('human_review'), evidence: clean() }),
+      authorizeRelease({ recommendation: null, evidence: clean() }),
+      authorizeRelease({ recommendation: says('accept'), evidence: clean() }),
+      authorizeRelease({ recommendation: says('accept'), evidence: clean({ blockingDefects: 1 }) }),
+      authorizeRelease({ recommendation: says('accept'), evidence: clean({ gatesPassed: false }) }),
+      authorizeRelease({ recommendation: says('accept'), evidence: clean({ buildSucceeded: false }) }),
+      authorizeRelease({
+        recommendation: says('accept'),
+        evidence: clean({ autonomyMode: 'human_in_the_loop' }),
+        acknowledgement: verifyAcknowledged([], []),
+      }),
+      authorizeRelease({
+        recommendation: says('accept'),
+        evidence: clean(),
+        acknowledgement: verifyAcknowledged([], [{ id: 'QA-004' }]),
+      }),
+    ];
+
+    for (const auth of refusals) {
+      expect(auth.authorized, auth.reason).toBe(false);
+      expect(terminalForRefusal(auth.action), auth.reason).not.toBe('accept_non_blocking');
+      expect(['mark_blocked', 'request_human_review']).toContain(terminalForRefusal(auth.action));
+    }
   });
 });

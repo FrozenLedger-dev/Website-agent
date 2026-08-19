@@ -65,6 +65,7 @@ import {
 import {
   authorizeRelease,
   RELEASE_POLICY_VERSION,
+  terminalForRefusal,
   verifyAcknowledged,
   type AcknowledgementCheck,
   type ApprovalRecord,
@@ -1364,14 +1365,11 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       );
     }
 
-    // A refusal that routed to a person is not the same terminal state as one
-    // that gave up, and the contract has always had a word for it.
-    return concluded(
-      'blocked',
-      awaitingHuman
-        ? 'request_human_review'
-        : (terminalDecision ?? decideTerminal(openDefects, autonomyMode)),
-    );
+    // Mapped from the authorisation, not from the defect list. A refusal here
+    // happens with no blocking defects outstanding, which is exactly when
+    // `decideTerminal` prefers `accept_non_blocking` — so borrowing it reported
+    // a denied release as an acceptance.
+    return concluded('blocked', terminalForRefusal(authorization?.action ?? null));
   }
 
   await store.projects.updateOne({ _id: projectId }, { $set: { state: 'releasing', updatedAt: new Date() } });

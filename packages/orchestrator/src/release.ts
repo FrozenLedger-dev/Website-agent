@@ -10,7 +10,7 @@
  * deterministic evidence and the autonomy policy can each refuse a release Sol
  * asked for, and none of them can be moved by anything Sol returns.
  */
-import type { SolApprovalRecommendation } from '@statxai/contracts';
+import type { SolApprovalRecommendation, TerminalOutcome } from '@statxai/contracts';
 
 /** The version of these rules, recorded on every authorisation. */
 export const RELEASE_POLICY_VERSION = 'harness-release-policy@1';
@@ -191,6 +191,23 @@ export function authorizeRelease(input: {
   }
 
   return decided(true, 'release', `Sol recommended acceptance and policy permits release: ${recommendation.reason}`);
+}
+
+/**
+ * The terminal outcome of a refused release.
+ *
+ * Deliberately not `decideTerminal`. That helper answers a different question —
+ * what to do about outstanding defects and exhausted budgets — and it prefers
+ * `accept_non_blocking` whenever no P0 or P1 remains. This branch is reached
+ * *only* when none remains, because blocking defects are cleared before an
+ * approval is ever sought, so borrowing it made a refused release report itself
+ * as an acceptance: `outcome: blocked` beside
+ * `terminalDecision: accept_non_blocking`.
+ *
+ * A release refusal has exactly two shapes. It went to a person, or it stopped.
+ */
+export function terminalForRefusal(action: ReleaseAction | null): TerminalOutcome {
+  return action === 'human_review' ? 'request_human_review' : 'mark_blocked';
 }
 
 /** What gets stored as the versioned `approval-recommendation` artifact. */
