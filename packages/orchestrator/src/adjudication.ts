@@ -53,11 +53,12 @@ export function legalAdjudicationActions(c: AdjudicationConstraints): Adjudicati
   const legal: AdjudicationAction[] = [];
 
   /**
-   * `reviewRejections` counts revisions rejected by evaluation, not repair
-   * cycles, so every action that answers a rejection needs one — repair and
-   * replan alike. It previously gated repair only, which meant a replan could
-   * run on a rejection the budget had no room for, and the two counters
-   * measured different things while sharing a name.
+   * `reviewRejections` is how many rejected evaluations may trigger another
+   * corrective action. Every action that answers a rejection needs one — repair
+   * and replan alike — while `block` ends the run rather than answering it and
+   * therefore spends none. It previously gated repair only, which meant a
+   * replan could run on a rejection the budget had no room for, and the two
+   * counters measured different things while sharing a name.
    *
    * With the allowance gone, the site has been rejected as often as the project
    * permits and no amount of remaining repair or replan budget changes that:
@@ -102,14 +103,23 @@ export function firstBlocker(defects: readonly Defect[]): Defect[] {
 /**
  * What the harness does when Sol cannot be consulted or its answer is refused.
  *
- * Deliberately the cheapest legal action rather than the most thorough: a run
- * that has already lost its adjudication should not also spend a replan on a
- * decision nobody made. Repair, then replan, then stop.
+ * The harness may recover operationally. It may not reason semantically in the
+ * reasoning model's absence, and replanning is reasoning: it asserts that the
+ * specification itself is wrong enough to discard and rebuild. That judgement
+ * is Sol's whole purpose here, and a harness that reaches it alone — from a
+ * timeout, a malformed response or an illegal action — has substituted its own
+ * conclusion for the one it failed to obtain, then spent a rebuild on it.
+ *
+ * So the fallback is one narrow repair, or nothing. Repairing a single blocker
+ * is a bounded operational step whose result the next evaluation judges;
+ * `block` stops and leaves the decision to a human. Replanning is reachable
+ * only from a replan Sol actually chose and the harness authorised.
+ *
+ * This function previously returned `replan` whenever repair was unavailable,
+ * which contradicted the comment above it.
  */
 export function fallbackAction(legal: readonly AdjudicationAction[]): AdjudicationAction {
-  if (legal.includes('repair')) return 'repair';
-  if (legal.includes('replan')) return 'replan';
-  return 'block';
+  return legal.includes('repair') ? 'repair' : 'block';
 }
 
 export interface AdjudicationAuthorization {

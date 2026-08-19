@@ -7,7 +7,11 @@
  * the offer.
  */
 import { describe, expect, it } from 'vitest';
-import { SolAdjudicationDecision, toStrictModelSchema } from '@statxai/contracts';
+import {
+  SolAdjudicationDecision,
+  toStrictModelSchema,
+  type AdjudicationAction,
+} from '@statxai/contracts';
 import {
   authorizeAdjudication,
   fallbackAction,
@@ -165,12 +169,84 @@ describe('authorising Sol', () => {
 });
 
 describe('the fallback when Sol cannot be consulted', () => {
-  it('prefers the cheapest legal action', () => {
-    // A run that already lost its adjudication should not also spend a replan
-    // on a decision nobody made.
+  /**
+   * The harness may recover operationally; it may not reason semantically in
+   * the reasoning model's absence. Replanning asserts that the specification is
+   * wrong enough to discard and rebuild, which is the judgement Sol exists to
+   * make — so a timeout, a malformed response or an illegal action must never
+   * reach it.
+   */
+  it('repairs when repair is available', () => {
     expect(fallbackAction(['repair', 'replan', 'block'])).toBe('repair');
-    expect(fallbackAction(['replan', 'block'])).toBe('replan');
+  });
+
+  it('blocks rather than replanning when repair is unavailable', () => {
+    // The case this function used to get wrong: it returned `replan`, so the
+    // harness concluded the specification was at fault and spent a rebuild on
+    // a decision nobody made.
+    expect(fallbackAction(['replan', 'block'])).toBe('block');
+  });
+
+  it('blocks when nothing else is legal', () => {
     expect(fallbackAction(['block'])).toBe('block');
+  });
+
+  it('never returns replan for any legal set', () => {
+    const sets: AdjudicationAction[][] = [
+      ['repair', 'replan', 'block'],
+      ['replan', 'block'],
+      ['repair', 'block'],
+      ['block'],
+      [],
+    ];
+    for (const set of sets) expect(fallbackAction(set), set.join('|')).not.toBe('replan');
+  });
+});
+
+describe('a lost adjudication cannot trigger a rebuild', () => {
+  const sol = (over: Record<string, unknown> = {}) =>
+    SolAdjudicationDecision.parse({
+      action: 'replan',
+      reason: 'The specification is the problem.',
+      defectIds: null,
+      objective: null,
+      scope: 'site',
+      ...over,
+    });
+
+  it('Sol unavailable, repair legal → one narrow repair', () => {
+    // Modelled the way the orchestrator does it: no decision to authorise, so
+    // the harness takes the fallback action directly.
+    const legal = legalAdjudicationActions(constraints());
+    const action = fallbackAction(legal);
+
+    expect(action).toBe('repair');
+    expect(firstBlocker(OPEN)).toHaveLength(1);
+  });
+
+  it('Sol unavailable, only replan and block legal → block', () => {
+    const legal = legalAdjudicationActions(constraints({ repairsLeft: 0 }));
+    expect(legal).toEqual(['replan', 'block']);
+    expect(fallbackAction(legal)).toBe('block');
+  });
+
+  it('illegal Sol decision, only replan and block legal → block', () => {
+    // Sol asks for something the harness did not offer while replan is the only
+    // other action with budget. The refusal must not become a rebuild.
+    const legal = legalAdjudicationActions(constraints({ repairsLeft: 0 }));
+    const auth = authorizeAdjudication(sol({ action: 'repair', defectIds: ['GATE-001'], scope: null }), legal, OPEN);
+
+    expect(auth.source).toBe('fallback');
+    expect(auth.action).toBe('block');
+    expect(auth.targets).toEqual([]);
+  });
+
+  it('a replan Sol actually chose still runs', () => {
+    // The restriction is on the fallback, not on replanning itself.
+    const legal = legalAdjudicationActions(constraints());
+    const auth = authorizeAdjudication(sol(), legal, OPEN);
+
+    expect(auth).toMatchObject({ action: 'replan', source: 'sol', refusal: null });
   });
 });
 

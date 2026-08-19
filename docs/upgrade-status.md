@@ -40,6 +40,18 @@ Phase 0 stays open only on the two items that need a browser.
 The contracts are declared and tested. Persistence arrives with each skill that
 produces a decision, so this closes when Phase 2 does.
 
+### Budget semantics settled during Phase 2b
+
+- `reviewRejections` — how many rejected evaluations may trigger another
+  corrective action. Repair and replan each spend one; `block` ends the run
+  rather than answering it and spends none.
+- `totalRepairJobs` — how much narrow repair was spent.
+- `replans` — how many specification revisions were spent.
+
+A fallback, taken when Sol cannot be consulted or its answer is refused, may
+perform one narrow repair or block. It may never replan: replanning asserts the
+specification is wrong, which is the judgement the harness failed to obtain.
+
 ## Phase 2 — Sol model skills — **IN PROGRESS**
 
 | Skill | Status |

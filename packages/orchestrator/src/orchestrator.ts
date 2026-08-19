@@ -732,17 +732,23 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     /**
      * A rejection is spent once, whatever answers it.
      *
-     * `reviewRejections` counts revisions rejected by evaluation. Repair used
-     * to consume one and replan did not, so a run that replanned twice showed
-     * the same rejection count as one that had never been rejected at all, and
-     * the counter measured "repair cycles" while being named for rejections.
+     * `reviewRejections` is how many rejected evaluations may trigger another
+     * corrective action — not how many rejections occurred, because a terminal
+     * `block` answers nothing and spends none. Repair used to consume one and
+     * replan did not, so a run that replanned twice showed the same count as
+     * one that had never been rejected, and the counter measured "repair
+     * cycles" while being named for rejections.
      *
      * Spent before the action runs and only for actions that answer a
      * rejection: `block` ends the run rather than responding to it.
      */
-    reviewCycle += 1;
     try {
       await spend(store, projectId, 'reviewRejections');
+      // Incremented only once the allowance is actually spent. Legality was
+      // computed from the same budget a moment earlier, so this should not
+      // fail — but under concurrent execution or state drift it can, and the
+      // counter must not report a cycle the budget refused.
+      reviewCycle += 1;
     } catch (error) {
       if (!(error instanceof BudgetExhausted)) throw error;
       terminalDecision = decideTerminal(openDefects, autonomyMode);
