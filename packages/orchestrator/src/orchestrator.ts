@@ -66,6 +66,7 @@ import {
   authorizeRelease,
   RELEASE_POLICY_VERSION,
   verifyAcknowledged,
+  type AcknowledgementCheck,
   type ApprovalRecord,
   type AuthorizationRecord,
   type ReleaseAuthorization,
@@ -658,6 +659,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     };
 
     let recommendation: SolApprovalRecommendation | null = null;
+    let checked: AcknowledgementCheck | undefined;
 
     try {
       const recommended = await recommendApproval(model, {
@@ -693,7 +695,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       track('sol', recommended);
 
       recommendation = recommended.value;
-      const checked = verifyAcknowledged(recommended.value.acknowledgedIssues, context.openNonBlocking);
+      checked = verifyAcknowledged(recommended.value.acknowledgedIssues, context.openNonBlocking);
 
       record.model = recommended.model;
       record.recommendation = recommended.value.recommendation;
@@ -742,7 +744,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
     // The harness decides, having read the recommendation as one input among
     // the deterministic facts it checked for itself.
-    const decision = authorizeRelease({ recommendation, evidence });
+    const decision = authorizeRelease({ recommendation, evidence, acknowledgement: checked });
 
     const authorizationRecord: AuthorizationRecord = {
       reviewCycle,
@@ -765,6 +767,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
     approvalArtifactVersion = approvalDoc?.version ?? null;
     approvalModel = record.model;
+    approvalDecision = record.recommendation;
 
     return decision;
   }
@@ -800,6 +803,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   let authorization: ReleaseAuthorization | null = null;
   let approvalArtifactVersion: number | null = null;
   let approvalModel: string | null = null;
+  let approvalDecision: 'accept' | 'reject' | 'human_review' | null = null;
   /** Set when the review could not be obtained at all, as opposed to rejecting. */
   let reviewUnavailable: string | null = null;
 
@@ -1357,7 +1361,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
   await store.projects.updateOne({ _id: projectId }, { $set: { state: 'releasing', updatedAt: new Date() } });
 
-  const releaseCommit = (await workspace.commit('Sol: accepted revision')) ?? (await workspace.currentCommit());
+  const releaseCommit = (await workspace.commit('Harness: release-authorized revision')) ?? (await workspace.currentCommit());
 
   /**
    * Deploy only after machine approval (§9: "publish from a machine-accepted
@@ -1419,24 +1423,23 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     commit: releaseCommit ?? 'uncommitted',
     environment: deployment ? 'production' : 'preview',
     autonomyMode,
-    // PENDING (Phase 2d, `sol-approve`): this credits Sol for a decision the
-    // harness made alone. It becomes `recommendedBy` + `authorizedBy` when an
-    // approval recommendation actually exists; changing it here would only
-    // move the inaccuracy.
     /**
      * Who judged, and who authorised — separately, and neither standing in for
      * the other. The single `approvedBy: 'sol:machine-approval'` this replaces
      * named a model for a decision the harness made alone.
+     *
+     * The recommendation is the one Sol actually gave, read from the persisted
+     * record rather than inferred from the authorisation. Deriving it from
+     * `action === 'release'` happens to agree today, because a manifest exists
+     * only after an authorised release — but it would report the harness's
+     * conclusion under Sol's name the moment those two could differ, which is
+     * the exact confusion this field was split to end.
      */
     recommendation: {
       by: 'sol' as const,
       model: approvalModel,
       artifactVersion: approvalArtifactVersion,
-      decision: (authorization.action === 'release' ? 'accept' : null) as
-        | 'accept'
-        | 'reject'
-        | 'human_review'
-        | null,
+      decision: approvalDecision,
     },
     authorization: {
       by: 'harness-policy' as const,
@@ -1456,7 +1459,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   };
   await registry.put(projectId, 'deployment-manifest', manifest);
   await workspace.materialiseArtifact('deployment/deployment-manifest.json', manifest);
-  const finalCommit = (await workspace.commit('Sol: release manifest')) ?? releaseCommit;
+  const finalCommit = (await workspace.commit('Harness: release manifest')) ?? releaseCommit;
 
   await store.projects.updateOne({ _id: projectId }, { $set: { state: 'released', updatedAt: new Date() } });
   say({ phase: 'publish', detail: `Released at ${finalCommit?.slice(0, 8) ?? 'HEAD'}`, level: 'ok' });

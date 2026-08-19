@@ -145,8 +145,26 @@ describe('acknowledged issues', () => {
     expect(checked.unknown).toEqual(['QA-999']);
   });
 
-  it('accepts an empty acknowledgement', () => {
-    expect(verifyAcknowledged([], open)).toEqual({ known: [], unknown: [] });
+  it('reports open issues that were never mentioned', () => {
+    // Detecting invented ids without detecting omitted ones catches only the
+    // careless half: a recommendation silent about three open issues reads
+    // identically to one that never looked.
+    const checked = verifyAcknowledged(['QA-004'], open);
+    expect(checked.unacknowledged).toEqual(['GATE-007']);
+  });
+
+  it('reports everything open when nothing was acknowledged', () => {
+    expect(verifyAcknowledged([], open).unacknowledged).toEqual(['QA-004', 'GATE-007']);
+  });
+
+  it('reports nothing outstanding when the list is complete', () => {
+    const checked = verifyAcknowledged(['QA-004', 'GATE-007'], open);
+    expect(checked.unacknowledged).toEqual([]);
+    expect(checked.unknown).toEqual([]);
+  });
+
+  it('accepts an empty acknowledgement when nothing is open', () => {
+    expect(verifyAcknowledged([], [])).toEqual({ known: [], unknown: [], unacknowledged: [] });
   });
 
   it('cannot be used to acknowledge a blocker, because blockers never reach it', () => {
@@ -309,5 +327,117 @@ describe('ordering and reachability in the delivery loop', () => {
     const code = await source();
     expect(code).toContain("by: 'harness-policy' as const");
     expect(code).toContain("by: 'sol' as const");
+  });
+});
+
+describe('an acceptance has to account for what is still open', () => {
+  const open = [{ id: 'QA-004' }, { id: 'QA-005' }];
+
+  it('refuses an acceptance that ignores open issues', () => {
+    // The load-bearing case: `acknowledgedIssues` is the stated basis on which
+    // something ships with known defects. Accepting while silent about them is
+    // not that judgement — it is the absence of one.
+    const auth = authorizeRelease({
+      recommendation: says('accept'),
+      evidence: clean(),
+      acknowledgement: verifyAcknowledged([], open),
+    });
+
+    expect(auth).toMatchObject({ authorized: false, action: 'block' });
+    expect(auth.reason).toContain('QA-004');
+    expect(auth.reason).toContain('QA-005');
+  });
+
+  it('refuses a partial acknowledgement', () => {
+    const auth = authorizeRelease({
+      recommendation: says('accept', ['QA-004']),
+      evidence: clean(),
+      acknowledgement: verifyAcknowledged(['QA-004'], open),
+    });
+    expect(auth.authorized).toBe(false);
+    expect(auth.reason).toContain('QA-005');
+    expect(auth.reason).not.toContain('QA-004');
+  });
+
+  it('authorises when every open issue is accounted for', () => {
+    const auth = authorizeRelease({
+      recommendation: says('accept', ['QA-004', 'QA-005']),
+      evidence: clean(),
+      acknowledgement: verifyAcknowledged(['QA-004', 'QA-005'], open),
+    });
+    expect(auth).toMatchObject({ authorized: true, action: 'release' });
+  });
+
+  it('authorises when nothing is open to acknowledge', () => {
+    const auth = authorizeRelease({
+      recommendation: says('accept'),
+      evidence: clean(),
+      acknowledgement: verifyAcknowledged([], []),
+    });
+    expect(auth.authorized).toBe(true);
+  });
+
+  it('does not apply the check to a rejection', () => {
+    // Only an acceptance ships with known defects, so only an acceptance has to
+    // account for them.
+    const auth = authorizeRelease({
+      recommendation: says('reject'),
+      evidence: clean(),
+      acknowledgement: verifyAcknowledged([], open),
+    });
+    expect(auth.action).toBe('block');
+    expect(auth.reason).toContain('recommended rejection');
+  });
+
+  it('still refuses on deterministic grounds before checking completeness', () => {
+    // Ordering: a blocking defect is refused for being a blocking defect, not
+    // for an unacknowledged P2.
+    const auth = authorizeRelease({
+      recommendation: says('accept'),
+      evidence: clean({ blockingDefects: 1 }),
+      acknowledgement: verifyAcknowledged([], open),
+    });
+    expect(auth.reason).toContain('not waivable');
+  });
+});
+
+describe('git provenance', () => {
+  it('does not credit a model for commits the harness authorised', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+
+    const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
+    const code = await readFile(join(src, 'orchestrator.ts'), 'utf8');
+
+    expect(code).not.toContain("commit('Sol: accepted revision')");
+    expect(code).not.toContain("commit('Sol: release manifest')");
+    expect(code).toContain("commit('Harness: release-authorized revision')");
+    expect(code).toContain("commit('Harness: release manifest')");
+  });
+
+  it('writes the recommendation Sol gave, not one inferred from the outcome', async () => {
+    // Deriving it from `action === 'release'` agrees today only because a
+    // manifest exists solely after an authorised release. It would report the
+    // harness's conclusion under Sol's name the moment those could differ.
+    const { readFile } = await import('node:fs/promises');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+
+    const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
+    const code = await readFile(join(src, 'orchestrator.ts'), 'utf8');
+
+    expect(code).toContain('decision: approvalDecision');
+    expect(code).not.toContain("authorization.action === 'release' ? 'accept' : null");
+  });
+
+  it('carries no stale pending marker for a phase that shipped', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+
+    const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
+    const code = await readFile(join(src, 'orchestrator.ts'), 'utf8');
+    expect(code).not.toContain('PENDING (Phase 2d');
   });
 });

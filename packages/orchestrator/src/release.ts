@@ -45,14 +45,26 @@ export interface ReleaseAuthorization {
  * reference or a typo — so it is separated out and recorded rather than counted
  * as a considered decision.
  */
+export interface AcknowledgementCheck {
+  /** Acknowledged, and genuinely open. */
+  known: string[];
+  /** Acknowledged, but matching nothing open. */
+  unknown: string[];
+  /** Open, and not acknowledged at all. */
+  unacknowledged: string[];
+}
+
 export function verifyAcknowledged(
   acknowledged: readonly string[],
   openNonBlocking: readonly { id: string }[],
-): { known: string[]; unknown: string[] } {
+): AcknowledgementCheck {
   const open = new Set(openNonBlocking.map((i) => i.id));
+  const cited = new Set(acknowledged);
+
   return {
     known: acknowledged.filter((id) => open.has(id)),
     unknown: acknowledged.filter((id) => !open.has(id)),
+    unacknowledged: openNonBlocking.map((i) => i.id).filter((id) => !cited.has(id)),
   };
 }
 
@@ -72,8 +84,10 @@ export function verifyAcknowledged(
 export function authorizeRelease(input: {
   recommendation: SolApprovalRecommendation | null;
   evidence: ReleaseEvidence;
+  /** Absent only where there was no recommendation to check. */
+  acknowledgement?: AcknowledgementCheck | undefined;
 }): ReleaseAuthorization {
-  const { recommendation, evidence } = input;
+  const { recommendation, evidence, acknowledgement } = input;
   const decided = (authorized: boolean, action: ReleaseAction, reason: string) => ({
     authorized,
     action,
@@ -125,6 +139,28 @@ export function authorizeRelease(input: {
   }
 
   // -- accept ---------------------------------------------------------------
+  /**
+   * An acceptance has to account for everything still open.
+   *
+   * `acknowledgedIssues` is the record that a remaining issue was seen and
+   * judged shippable. Accepting while silent about three open P2s is not that
+   * judgement — it is the absence of one, and it reads identically to a
+   * recommendation that never looked. Detecting invented ids without detecting
+   * omitted ones only catches the careless half.
+   *
+   * Refused rather than recorded, because this is the one place the
+   * acknowledgement is load-bearing: it is the stated basis on which something
+   * ships with known defects.
+   */
+  const omitted = acknowledgement?.unacknowledged ?? [];
+  if (omitted.length > 0) {
+    return decided(
+      false,
+      'block',
+      `Sol recommended acceptance without acknowledging ${omitted.length} open non-blocking issue(s): ${omitted.join(', ')}.`,
+    );
+  }
+
   if (evidence.autonomyMode === 'human_in_the_loop') {
     return decided(
       false,

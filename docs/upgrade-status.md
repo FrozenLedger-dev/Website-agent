@@ -118,6 +118,28 @@ The harness checks deterministic facts — build, blocking defects, gates —
 gate never reaches the release path. A missing recommendation is not an
 approval: full autonomy stops, and modes with a human defer to one.
 
+### An acceptance must account for what is open
+
+`acknowledgedIssues` is the stated basis on which a site ships with known
+defects, so an `accept` that omits an open non-blocking issue is refused. The
+first version detected ids Sol invented but not issues it simply left out, which
+catches only the careless half: a recommendation silent about three open P2s
+reads identically to one that never looked.
+
+Invented ids are still recorded rather than refused — they are a data-quality
+signal, not the basis of the decision — while omissions block.
+
+### A deliberate semantic, flagged rather than settled
+
+With no deployment target configured, `authorizeRelease` returns
+`{authorized: true, action: 'release'}` and the project is marked `released`
+against local preview. "Released" therefore currently means *machine-accepted
+and authorised*, not *published to a host*.
+
+That is the intended reading for now, and the tests require it. If it should
+instead mean *published*, the change belongs in the policy-engine phase as a
+deliberate decision, not as an incidental consequence of one of its refactors.
+
 ## Phases 3–17
 
 Not started.
