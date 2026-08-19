@@ -11,6 +11,7 @@ import { SolAdjudicationDecision, toStrictModelSchema } from '@statxai/contracts
 import {
   authorizeAdjudication,
   fallbackAction,
+  firstBlocker,
   legalAdjudicationActions,
   type AdjudicationConstraints,
 } from '../src/adjudication.js';
@@ -55,12 +56,10 @@ describe('which actions the harness offers', () => {
     expect(legalAdjudicationActions(constraints({ repairsLeft: 0 }))).toEqual(['replan', 'block']);
   });
 
-  it('withdraws repair when no rejection cycle remains', () => {
-    // Repairing needs a cycle to run in, not just a job to spend.
-    expect(legalAdjudicationActions(constraints({ reviewRejectionsLeft: 0 }))).toEqual([
-      'replan',
-      'block',
-    ]);
+  it('withdraws every answering action when no rejection remains', () => {
+    // A rejection is spent by whatever answers it, so exhausting the allowance
+    // ends the loop regardless of what repair or replan budget is left.
+    expect(legalAdjudicationActions(constraints({ reviewRejectionsLeft: 0 }))).toEqual(['block']);
   });
 
   it('withdraws replan when the replan budget is gone', () => {
@@ -143,9 +142,25 @@ describe('authorising Sol', () => {
     expect(auth.refusal).toContain('GATE-999');
   });
 
-  it('falls back to every blocking defect, so a refusal still makes progress', () => {
+  it('falls back to exactly one blocker, not the whole set', () => {
+    // Repairing everything in a fallback is a broad semantic choice made by
+    // nobody: it spends a repair job per defect on a batch no one reasoned
+    // about, on a run whose adjudication has already failed.
     const auth = authorizeAdjudication(decision({ defectIds: ['GATE-999'] }), legal, OPEN);
-    expect(auth.targets).toHaveLength(OPEN.length);
+
+    expect(auth.source).toBe('fallback');
+    expect(auth.targets).toHaveLength(1);
+  });
+
+  it('lets a decision Sol actually made name several defects', () => {
+    // The single-blocker rule constrains the fallback only.
+    const auth = authorizeAdjudication(
+      decision({ defectIds: ['GATE-001', 'GATE-002', 'GATE-003'] }),
+      legal,
+      OPEN,
+    );
+    expect(auth.source).toBe('sol');
+    expect(auth.targets).toHaveLength(3);
   });
 });
 
@@ -179,5 +194,65 @@ describe('what adjudication cannot do', () => {
     // mutates a counter; that happens transactionally in the orchestrator.
     const auth = authorizeAdjudication(decision(), legalAdjudicationActions(constraints()), OPEN);
     expect(Object.keys(auth).sort()).toEqual(['action', 'refusal', 'source', 'targets']);
+  });
+});
+
+describe('choosing the one defect a fallback repairs', () => {
+  const at = (id: string, severity: 'P0' | 'P1', index: number) => ({
+    ...fromGateFinding(
+      { gate: 'claims', severity, location: `p${index}.html`, message: 'm', acceptanceTest: 't' },
+      index,
+    ),
+    id,
+  });
+
+  it('takes the most severe blocker', () => {
+    const picked = firstBlocker([at('B', 'P1', 0), at('A', 'P0', 1)]);
+    expect(picked.map((d) => d.id)).toEqual(['A']);
+  });
+
+  it('breaks ties by id, so the choice does not depend on gate ordering', () => {
+    const forwards = firstBlocker([at('GATE-003', 'P1', 0), at('GATE-001', 'P1', 1)]);
+    const backwards = firstBlocker([at('GATE-001', 'P1', 1), at('GATE-003', 'P1', 0)]);
+
+    expect(forwards.map((d) => d.id)).toEqual(['GATE-001']);
+    expect(backwards.map((d) => d.id)).toEqual(['GATE-001']);
+  });
+
+  it('returns nothing when there is nothing blocking', () => {
+    expect(firstBlocker([])).toEqual([]);
+  });
+});
+
+describe('a rejection is a rejection, whatever answers it', () => {
+  /**
+   * `reviewRejections` counts revisions rejected by evaluation. It used to gate
+   * repair only, so a replan ran on a rejection the budget had no room for and
+   * a run that replanned twice reported the same rejection count as one never
+   * rejected at all.
+   */
+  it('withdraws both repair and replan when the allowance is gone', () => {
+    const spent = legalAdjudicationActions(
+      constraints({ reviewRejectionsLeft: 0, repairsLeft: 8, replansLeft: 2 }),
+    );
+    expect(spent).toEqual(['block']);
+  });
+
+  it('offers both while the allowance remains', () => {
+    expect(legalAdjudicationActions(constraints({ reviewRejectionsLeft: 1 }))).toEqual([
+      'repair',
+      'replan',
+      'block',
+    ]);
+  });
+
+  it('still withdraws an action whose own budget is gone', () => {
+    // The rejection allowance is necessary, not sufficient.
+    expect(
+      legalAdjudicationActions(constraints({ reviewRejectionsLeft: 2, replansLeft: 0 })),
+    ).toEqual(['repair', 'block']);
+    expect(
+      legalAdjudicationActions(constraints({ reviewRejectionsLeft: 2, repairsLeft: 0 })),
+    ).toEqual(['replan', 'block']);
   });
 });

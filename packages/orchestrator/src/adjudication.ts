@@ -52,13 +52,51 @@ export interface AdjudicationConstraints {
 export function legalAdjudicationActions(c: AdjudicationConstraints): AdjudicationAction[] {
   const legal: AdjudicationAction[] = [];
 
-  // Repairing needs a defect to repair, a rejection cycle to run in, and a
-  // repair job to spend.
-  if (c.blockingCount > 0 && c.repairsLeft > 0 && c.reviewRejectionsLeft > 0) legal.push('repair');
-  if (c.replansLeft > 0) legal.push('replan');
+  /**
+   * `reviewRejections` counts revisions rejected by evaluation, not repair
+   * cycles, so every action that answers a rejection needs one — repair and
+   * replan alike. It previously gated repair only, which meant a replan could
+   * run on a rejection the budget had no room for, and the two counters
+   * measured different things while sharing a name.
+   *
+   * With the allowance gone, the site has been rejected as often as the project
+   * permits and no amount of remaining repair or replan budget changes that:
+   * `block` is all that is left.
+   */
+  const canAnswerRejection = c.reviewRejectionsLeft > 0;
+
+  if (canAnswerRejection && c.blockingCount > 0 && c.repairsLeft > 0) legal.push('repair');
+  if (canAnswerRejection && c.replansLeft > 0) legal.push('replan');
   legal.push('block');
 
   return legal;
+}
+
+/** Severity order for choosing what to fix first. */
+const SEVERITY_RANK: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
+
+/**
+ * The single defect a fallback repairs.
+ *
+ * When Sol cannot be consulted, or its answer is refused, the harness has no
+ * judgement about which defects belong together — only that something should be
+ * attempted. Repairing *everything* blocking in that state is a broad semantic
+ * choice made by nobody: it spends a repair job per defect on a batch no one
+ * reasoned about, and on a run whose adjudication has already failed.
+ *
+ * So a fallback fixes one blocker and lets the next evaluation decide again.
+ * Most severe first, then by id, so the choice is reproducible from the same
+ * inputs rather than dependent on gate ordering.
+ *
+ * This constrains only the fallback. A decision Sol actually made may name as
+ * many defects as it judged belong together.
+ */
+export function firstBlocker(defects: readonly Defect[]): Defect[] {
+  const [first] = [...defects].sort((a, b) => {
+    const bySeverity = (SEVERITY_RANK[a.severity] ?? 9) - (SEVERITY_RANK[b.severity] ?? 9);
+    return bySeverity !== 0 ? bySeverity : a.id.localeCompare(b.id);
+  });
+  return first ? [first] : [];
 }
 
 /**
@@ -99,7 +137,7 @@ export function authorizeAdjudication(
     const action = fallbackAction(legal);
     return {
       action,
-      targets: action === 'repair' ? [...blockingDefects] : [],
+      targets: action === 'repair' ? firstBlocker(blockingDefects) : [],
       source: 'fallback',
       refusal,
     };

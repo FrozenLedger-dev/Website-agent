@@ -9,25 +9,21 @@ when the type exists.
 
 | Item | Status |
 |---|---|
-| Branch `architecture/model-harness-v2` | **Not done** — work is on `main` |
-| Run the MVP against 3+ representative profiles | Done — 8 fixtures in `examples/`, 9 deliveries |
-| Save source, build output, validation report, review, final state per run | **Not done** — data is in Mongo and workspaces, never collected into a baseline |
-| Record one-shot success rate | **Not done** as a recorded figure |
-| Record Terra calls per project | **Not done** — per-tier usage is now captured, but no baseline was written |
-| Record Luna calls per project | **Not done** — same |
-| Record whether replanning occurred | **Not done** — visible in run events, never tabulated |
-| Record total generation time | Partial — per run, not aggregated |
-| Record total tokens/cost | Partial — per run and per tier, not aggregated |
-| Screenshots of current sites | **Not done** — no browser runtime exists (Phase 9) |
-| `docs/runtime-responsibility-map.md` | Done |
+| Responsibility map (`docs/runtime-responsibility-map.md`) | Done |
 | Document decisions inside `orchestrator.ts` | Done |
 | Classify each as HARNESS/SOL/TERRA/LUNA | Done |
 | Mark mismatches with the approved architecture | Done |
+| Three-project quantitative baseline | Done — `docs/phase0-baseline.md`, measured against `2aa95b5` in a detached worktree |
+| One-shot success rate | Done — 3/3 |
+| Model calls per project | Done — 7, 13, 9 |
+| Token usage | Done — 609,583 in / 135,224 out across the three |
+| Runtime | Done — 334.9s, 595.8s, 427.0s |
+| Repairs, replans and outcomes | Done — 4/0/blocked, 6/2/blocked, 3/0/released |
+| Screenshots of the generated sites | **Pending Phase 9** — needs the browser runtime |
+| Visual-quality baseline | **Pending Phase 9** — same |
+| Branch `architecture/model-harness-v2` | **Not done, and deliberately so.** The work is several commits into `main` and reviewed there; opening a branch now would satisfy the checklist's wording while making the history harder to follow, not easier. |
 
-**Phase 0 is not closed.** The responsibility map — the part later phases depend
-on — is written. The quantitative baseline is not, and without it there is
-nothing to compare the refactor against. It needs a browser runtime for the
-screenshot rows, so it cannot fully close before Phase 9.
+Phase 0 stays open only on the two items that need a browser.
 
 ## Phase 1 — Decision contracts — **PARTIAL**
 

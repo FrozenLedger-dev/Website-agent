@@ -58,6 +58,14 @@ The comparison to draw after Phase 2b is not "is the score higher" but whether
 the same evidence produces a *better-argued* action: fewer wasted replans, and
 repair scoped to defects that repair can actually clear.
 
+## Rerunning the restaurant case after Phase 2b
+
+This is the regression case worth watching. The old rule reached its decision as
+`3 > 1`, with no reasoning about the defects themselves. What matters on a rerun
+is not whether the score is higher but whether the same evidence produces a
+better-argued action: did Sol avoid the rebuild, and did total calls and runtime
+fall from 13 and 595.8s.
+
 ## Reproducing
 
 ```bash

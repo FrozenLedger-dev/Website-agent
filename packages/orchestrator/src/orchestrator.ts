@@ -61,6 +61,7 @@ import { adjudicate } from '@statxai/agents';
 import {
   authorizeAdjudication,
   fallbackAction,
+  firstBlocker,
   legalAdjudicationActions,
   type AdjudicationAuthorization,
   type AdjudicationConstraints,
@@ -688,7 +689,9 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       const action = fallbackAction(legal);
       adjudication = {
         action,
-        targets: action === 'repair' ? [...mustFix] : [],
+        // One blocker, not the whole set: with no adjudication there is no
+        // judgement about which defects belong together.
+        targets: action === 'repair' ? firstBlocker(mustFix) : [],
         source: 'fallback',
         refusal: `Sol could not be consulted: ${adjudicationFailure}`,
       };
@@ -726,6 +729,27 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       break;
     }
 
+    /**
+     * A rejection is spent once, whatever answers it.
+     *
+     * `reviewRejections` counts revisions rejected by evaluation. Repair used
+     * to consume one and replan did not, so a run that replanned twice showed
+     * the same rejection count as one that had never been rejected at all, and
+     * the counter measured "repair cycles" while being named for rejections.
+     *
+     * Spent before the action runs and only for actions that answer a
+     * rejection: `block` ends the run rather than responding to it.
+     */
+    reviewCycle += 1;
+    try {
+      await spend(store, projectId, 'reviewRejections');
+    } catch (error) {
+      if (!(error instanceof BudgetExhausted)) throw error;
+      terminalDecision = decideTerminal(openDefects, autonomyMode);
+      say({ phase: 'escalate', detail: `Rejection budget exhausted → ${terminalDecision}`, level: 'fail' });
+      break;
+    }
+
     if (adjudication.action === 'replan') {
       /**
        * The budget is spent by the harness, never by Sol. `replan` being legal
@@ -756,21 +780,10 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       // profile with no failure context, so the revision cannot learn from what
       // triggered it. Sol now decides *that* a replan happens; deciding *what
       // changes* is the next phase.
-      plan = await producePlan(reviewCycle + 1);
+      plan = await producePlan(reviewCycle);
       await buildFromPlan(plan);
       repairedSinceReview = [];
       continue;
-    }
-
-    // A rejection cycle is spent whenever blocking work remains.
-    reviewCycle += 1;
-    try {
-      await spend(store, projectId, 'reviewRejections');
-    } catch (error) {
-      if (!(error instanceof BudgetExhausted)) throw error;
-      terminalDecision = decideTerminal(openDefects, autonomyMode);
-      say({ phase: 'escalate', detail: `Rejection budget exhausted → ${terminalDecision}`, level: 'fail' });
-      break;
     }
 
     say({
