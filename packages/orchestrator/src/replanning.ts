@@ -113,6 +113,19 @@ export function scopeViolations(scope: ReplanScope, delta: PlanDelta): string[] 
     violations.push('Scope "page" does not cover the brand system, but it changed.');
   }
 
+  /**
+   * Acceptance criteria are project-level state: every rejection has to cite
+   * one, so rewriting them changes what the whole site is measured against. A
+   * page-scoped revision moving them would quietly redefine the bar for pages
+   * it was never authorised to touch.
+   *
+   * `design` keeps them for now — a design revision can legitimately restate a
+   * criterion about composition — and that stays under review.
+   */
+  if (scope === 'page' && delta.acceptanceCriteriaChanged) {
+    violations.push('Scope "page" does not cover the acceptance criteria, but they changed.');
+  }
+
   return violations;
 }
 

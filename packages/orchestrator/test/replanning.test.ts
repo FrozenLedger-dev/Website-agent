@@ -564,3 +564,43 @@ describe('what a refused revision leaves behind', () => {
     expect(body).toContain('return null;');
   });
 });
+
+describe('acceptance criteria are project-level state', () => {
+  const base = {
+    routesAdded: [],
+    routesRemoved: [],
+    routesRevised: ['/services'],
+    brandChanged: false,
+    acceptanceCriteriaChanged: false,
+    strategyChanged: false,
+    valuePropositionChanged: false,
+  } satisfies PlanDelta;
+
+  it('page scope refuses an acceptance-criteria change', () => {
+    // Every rejection cites a criterion, so moving them redefines the bar for
+    // pages the revision was never authorised to touch.
+    const violations = scopeViolations('page', { ...base, acceptanceCriteriaChanged: true });
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain('acceptance criteria');
+  });
+
+  it('design scope still permits it, deliberately', () => {
+    // A design revision can legitimately restate a criterion about composition.
+    // Under review rather than settled.
+    expect(scopeViolations('design', { ...base, acceptanceCriteriaChanged: true })).toEqual([]);
+  });
+
+  it('site scope permits it', () => {
+    expect(scopeViolations('site', { ...base, acceptanceCriteriaChanged: true })).toEqual([]);
+  });
+
+  it('reports it alongside the other page-scope violations', () => {
+    const violations = scopeViolations('page', {
+      ...base,
+      acceptanceCriteriaChanged: true,
+      brandChanged: true,
+      strategyChanged: true,
+    });
+    expect(violations).toHaveLength(3);
+  });
+});

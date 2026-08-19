@@ -1,5 +1,6 @@
 export * from './client.js';
 export * from './skills/sol-adjudicate.js';
+export * from './skills/sol-approve.js';
 export * from './skills/sol-plan.js';
 export * from './skills/sol-replan.js';
 export * from './skills/sol-route.js';

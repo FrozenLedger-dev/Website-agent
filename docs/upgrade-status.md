@@ -25,7 +25,7 @@ when the type exists.
 
 Phase 0 stays open only on the two items that need a browser.
 
-## Phase 1 — Decision contracts — **PARTIAL**
+## Phase 1 — Decision contracts — **COMPLETE**
 
 | Item | Status |
 |---|---|
@@ -34,11 +34,10 @@ Phase 0 stays open only on the two items that need a browser.
 | `SolReplanRequest` / `SolReplanResult` | Done |
 | `SolApprovalRecommendation` | Done |
 | Validate all outputs with Zod | Done |
-| Reject malformed output before it reaches project state | Partial — `sol-route`, `sol-adjudicate` and `sol-replan` use them; approval has no caller |
-| **Store every accepted decision as a versioned artifact** | Partial — `route-decision`, `adjudication-decision` and `replan-decision` are persisted; approval is not, because that skill does not exist yet |
+| Reject malformed output before it reaches project state | Done — every contract has a runtime caller that validates before project state is touched |
+| **Store every accepted decision as a versioned artifact** | Done — `route-decision`, `adjudication-decision`, `replan-decision`, `approval-recommendation` and `release-authorization` |
 
-The contracts are declared and tested. Persistence arrives with each skill that
-produces a decision, so this closes when Phase 2 does.
+Every contract now has a runtime caller and a versioned artifact.
 
 ### Replan scope, settled during Phase 2c
 
@@ -75,7 +74,7 @@ A fallback, taken when Sol cannot be consulted or its answer is refused, may
 perform one narrow repair or block. It may never replan: replanning asserts the
 specification is wrong, which is the judgement the harness failed to obtain.
 
-## Phase 2 — Sol model skills — **IN PROGRESS**
+## Phase 2 — Sol model skills — **COMPLETE**
 
 | Skill | Status |
 |---|---|
@@ -83,7 +82,7 @@ specification is wrong, which is the judgement the harness failed to obtain.
 | `sol-route` execution (2a.1) | Done — each strategy has its own call; nothing fabricates a truncation to steer control flow |
 | `sol-adjudicate` | Done — the harness computes legal actions, Sol chooses, the harness authorises and executes |
 | `sol-replan` | Done — revises the failed plan against the evidence; a failed call blocks rather than regenerating |
-| `sol-approve` | Not started |
+| `sol-approve` | Done — Sol recommends, the harness authorises separately, and the two are persisted apart |
 
 ## Continuous integration
 
@@ -101,6 +100,23 @@ the repository, so a green tick does **not** mean that invariant was checked.
 
 Closing it means giving CI a Mongo service container initialised as a
 single-node replica set. That is a deliberate later decision, not an oversight.
+
+### Release provenance, settled during Phase 2d
+
+The manifest recorded `approvedBy: "sol:machine-approval"` for a decision no
+model was consulted about — the harness checked that no blocking defect remained
+and wrote Sol's name on its own arithmetic. That field is gone.
+
+In its place, two: `recommendation` names Sol, its model and the artifact
+version of its judgement; `authorization` names `harness-policy`, the policy
+version and the action taken. Both authors are fixed by a literal in the schema,
+so neither can be recorded as the other, and there is no field left in which a
+model appears to have authorised or executed a release.
+
+The harness checks deterministic facts — build, blocking defects, gates —
+*before* reading the recommendation, so a model saying `accept` over a failing
+gate never reaches the release path. A missing recommendation is not an
+approval: full autonomy stops, and modes with a human defer to one.
 
 ## Phases 3–17
 

@@ -277,7 +277,28 @@ export const DeploymentManifest = z.object({
   commit: z.string().min(1),
   environment: z.enum(['preview', 'production']),
   autonomyMode: z.string().min(1),
-  approvedBy: z.string().min(1),
+  /**
+   * Who judged, and who authorised — separately.
+   *
+   * This was a single `approvedBy: "sol:machine-approval"`, recorded for a
+   * decision no model was consulted about: the harness checked that no blocking
+   * defect remained and wrote Sol's name on its own arithmetic. Splitting the
+   * two means the trail can show a recommendation and an authorisation that
+   * disagree, and no field remains in which a model can appear to have released
+   * anything.
+   */
+  recommendation: z.object({
+    by: z.literal('sol'),
+    model: z.string().nullable(),
+    artifactVersion: z.number().int().nullable(),
+    decision: z.enum(['accept', 'reject', 'human_review']).nullable(),
+  }),
+  authorization: z.object({
+    by: z.literal('harness-policy'),
+    policyVersion: z.string().min(1),
+    action: z.enum(['release', 'block', 'human_review']),
+    reason: z.string().min(1),
+  }),
   qualityScore: z.number().int().min(0).max(100),
   checks: z.array(z.string()),
   /** Where the release is live. Null when nothing left the machine. */

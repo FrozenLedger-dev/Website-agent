@@ -11,12 +11,6 @@
  * persistence, budgets, permissions, validation, authorisation and deployment
  * belong to this module and the packages it calls, and a model decision only
  * takes effect once the harness has authorised it.
- *
- * PENDING (Phase 2d, `sol-approve`): the release path still decides approval
- * itself and records it as `approvedBy: 'sol:machine-approval'`, which credits
- * a model that was never consulted. It is left as-is deliberately until Sol
- * actually produces an approval recommendation and the harness records its own
- * authorisation separately.
  */
 import {
   BusinessProfile,
@@ -29,6 +23,7 @@ import {
   type AgentTier,
   type DeploymentManifest,
   type SitePlan,
+  type SolApprovalRecommendation,
   type TerminalOutcome,
 } from '@statxai/contracts';
 import {
@@ -57,7 +52,7 @@ import {
   type BuildResult,
   type DeployResult,
 } from '@statxai/workspace';
-import { adjudicate, replanSite } from '@statxai/agents';
+import { adjudicate, recommendApproval, replanSite } from '@statxai/agents';
 import {
   authorizeAdjudication,
   fallbackAction,
@@ -67,6 +62,15 @@ import {
   type AdjudicationConstraints,
   type AdjudicationRecord,
 } from './adjudication.js';
+import {
+  authorizeRelease,
+  RELEASE_POLICY_VERSION,
+  verifyAcknowledged,
+  type ApprovalRecord,
+  type AuthorizationRecord,
+  type ReleaseAuthorization,
+  type ReleaseEvidence,
+} from './release.js';
 import {
   isEmptyDelta,
   planDelta,
@@ -613,6 +617,158 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
   await buildFromPlan(plan);
 
+  /**
+   * Sol judges the release; the harness decides it.
+   *
+   * Two artifacts, in that order, because the trail has to be able to show a
+   * recommendation and an authorisation that disagree. Deployment is reachable
+   * only through the authorisation this returns.
+   */
+  async function seekRelease(context: {
+    gateRun: { passed: boolean; findings: { severity: string; gate: string; location: string; message: string }[]; gatesRun: string[] };
+    buildOk: boolean;
+    buildSummary: string;
+    reviewSummary: string | null;
+    openNonBlocking: readonly Defect[];
+  }): Promise<ReleaseAuthorization> {
+    const planDoc = await store.artifacts.findOne({ projectId, name: 'site-plan' }, { sort: { version: -1 } });
+    const reportDoc = await store.artifacts.findOne({ projectId, name: 'test-report' }, { sort: { version: -1 } });
+    const reviewDoc = await store.artifacts.findOne({ projectId, name: 'visual-review' }, { sort: { version: -1 } });
+
+    const evidence: ReleaseEvidence = {
+      blockingDefects: 0,
+      buildSucceeded: context.buildOk,
+      gatesPassed: context.gateRun.passed,
+      autonomyMode,
+      deploymentConfigured: deploymentConfigured(),
+    };
+
+    const record: ApprovalRecord = {
+      reviewCycle,
+      sitePlanVersion: planDoc?.version ?? null,
+      testReportVersion: reportDoc?.version ?? null,
+      visualReviewVersion: reviewDoc?.version ?? null,
+      recommendation: null,
+      reason: null,
+      acknowledgedIssues: [],
+      unverifiableIssues: [],
+      model: null,
+      modelFailure: null,
+      decidedAt: new Date(),
+    };
+
+    let recommendation: SolApprovalRecommendation | null = null;
+
+    try {
+      const recommended = await recommendApproval(model, {
+        reviewCycle,
+        plan,
+        profile,
+        qualityScore,
+        blockingCount: 0,
+        gatesRun: context.gateRun.gatesRun,
+        gateFindings: context.gateRun.findings.map(
+          (f) => `${f.severity} ${f.gate} ${f.location} — ${f.message}`,
+        ),
+        buildSummary: context.buildSummary,
+        reviewSummary: context.reviewSummary,
+        openNonBlocking: context.openNonBlocking.map((d) => ({
+          id: d.id,
+          severity: d.severity,
+          category: d.category,
+          location: d.location,
+          reason: d.reason,
+        })),
+        repairHistory: repairHistory.map((r) => ({ defectId: r.defectId, outcome: r.outcome })),
+        replanCount: replansUsed,
+        autonomyMode,
+        releasePolicy: {
+          'blocking defects permitted': '0, not waivable',
+          'gates must pass': 'yes',
+          'autonomy mode': autonomyMode,
+          'deployment configured': String(deploymentConfigured()),
+          'authorised by': RELEASE_POLICY_VERSION,
+        },
+      });
+      track('sol', recommended);
+
+      recommendation = recommended.value;
+      const checked = verifyAcknowledged(recommended.value.acknowledgedIssues, context.openNonBlocking);
+
+      record.model = recommended.model;
+      record.recommendation = recommended.value.recommendation;
+      record.reason = recommended.value.reason;
+      record.acknowledgedIssues = checked.known;
+      record.unverifiableIssues = checked.unknown;
+
+      say({
+        phase: 'approve',
+        detail: `Sol recommends ${recommended.value.recommendation}: ${recommended.value.reason}`,
+        level: recommended.value.recommendation === 'accept' ? 'ok' : 'warn',
+      });
+
+      if (checked.unknown.length > 0) {
+        // Recorded rather than treated as considered: an id nothing matches may
+        // be a stale reference or an invention, and either way it is not
+        // evidence that an issue was seen and judged acceptable.
+        say({
+          phase: 'approve',
+          detail: `Acknowledged issues that match nothing open: ${checked.unknown.join(', ')}`,
+          level: 'warn',
+        });
+      }
+    } catch (error) {
+      // A missing recommendation is not an approval, and the harness does not
+      // write one on Sol's behalf.
+      record.modelFailure = error instanceof Error ? error.message : String(error);
+      say({
+        phase: 'approve',
+        detail: `Sol could not be consulted on release: ${record.modelFailure}`,
+        level: 'fail',
+      });
+    }
+
+    const approvalRef = await registry.put(projectId, 'approval-recommendation', record);
+    await registry.accept(projectId, approvalRef);
+    await workspace.materialiseArtifact(
+      `decisions/approval-${String(reviewCycle).padStart(2, '0')}.json`,
+      record,
+    );
+
+    const approvalDoc = await store.artifacts.findOne(
+      { projectId, name: 'approval-recommendation' },
+      { sort: { version: -1 } },
+    );
+
+    // The harness decides, having read the recommendation as one input among
+    // the deterministic facts it checked for itself.
+    const decision = authorizeRelease({ recommendation, evidence });
+
+    const authorizationRecord: AuthorizationRecord = {
+      reviewCycle,
+      recommendationVersion: approvalDoc?.version ?? null,
+      recommendation: record.recommendation,
+      evidence,
+      authorized: decision.authorized,
+      action: decision.action,
+      reason: decision.reason,
+      policyVersion: decision.policyVersion,
+      authorizedBy: 'harness-policy',
+      authorizedAt: new Date(),
+    };
+    const authRef = await registry.put(projectId, 'release-authorization', authorizationRecord);
+    await registry.accept(projectId, authRef);
+    await workspace.materialiseArtifact(
+      `decisions/release-authorization-${String(reviewCycle).padStart(2, '0')}.json`,
+      authorizationRecord,
+    );
+
+    approvalArtifactVersion = approvalDoc?.version ?? null;
+    approvalModel = record.model;
+
+    return decision;
+  }
+
   // -- Phases 4/5: Evaluate, repair, escalate -------------------------------
   let reviewCycle = 0;
   let repairsApplied = 0;
@@ -632,6 +788,18 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
    * from "the plan is the problem".
    */
   const repairHistory: { defectId: string; fingerprint: string; outcome: string }[] = [];
+
+  /** Replans actually executed, for the approval evidence. */
+  let replansUsed = 0;
+
+  /**
+   * The harness's own release decision, and the provenance of the
+   * recommendation it considered. Null until the approval path runs, which is
+   * what keeps deployment unreachable before then.
+   */
+  let authorization: ReleaseAuthorization | null = null;
+  let approvalArtifactVersion: number | null = null;
+  let approvalModel: string | null = null;
   /** Set when the review could not be obtained at all, as opposed to rejecting. */
   let reviewUnavailable: string | null = null;
 
@@ -790,14 +958,35 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     const mustFix = blocking(openDefects);
 
     if (mustFix.length === 0) {
-      // PENDING (Phase 2d): the harness decided this, not Sol. The wording is
-      // corrected here; the misleading `approvedBy` in the manifest and the
-      // absent recommendation are `sol-approve`'s to fix.
-      say({
-        phase: 'evaluate',
-        detail: 'No blocking criteria outstanding — harness accepts the revision',
-        level: 'ok',
+      /**
+       * Nothing blocking remains, so the question becomes whether to release —
+       * which is two questions, asked in order. Sol judges; the harness decides.
+       */
+      say({ phase: 'approve', detail: 'No blocking criteria outstanding — asking Sol to judge release' });
+
+      authorization = await seekRelease({
+        gateRun,
+        buildOk: compiled.ok,
+        buildSummary: compiled.ok
+          ? `succeeded in ${(compiled.durationMs / 1000).toFixed(1)}s`
+          : 'failed',
+        reviewSummary,
+        openNonBlocking: openDefects.filter((d) => d.severity !== 'P0' && d.severity !== 'P1'),
       });
+
+      if (!authorization.authorized) {
+        // The harness refused. `human_review` is a real outcome rather than a
+        // failure, but neither reaches deployment.
+        terminalDecision =
+          authorization.action === 'human_review'
+            ? 'request_human_review'
+            : decideTerminal(openDefects, autonomyMode);
+        say({
+          phase: 'approve',
+          detail: `Release not authorised (${authorization.action}): ${authorization.reason}`,
+          level: 'fail',
+        });
+      }
       break;
     }
 
@@ -998,6 +1187,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       }
 
       await workspace.clearSite();
+      replansUsed += 1;
       plan = revised;
       await buildFromPlan(plan);
       repairedSinceReview = [];
@@ -1143,16 +1333,26 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     };
   }
 
-  if (autonomyMode !== 'full_autonomous') {
-    say({
-      phase: 'review',
-      detail: `Autonomy mode is ${autonomyMode} — awaiting human approval before release`,
-      level: 'warn',
-    });
-    await store.projects.updateOne(
-      { _id: projectId },
-      { $set: { state: 'awaiting_human_review', updatedAt: new Date() } },
-    );
+  /**
+   * Deployment is reachable only through a harness authorisation.
+   *
+   * `authorization` is null unless the approval path ran and returned one, so
+   * every route to this point that skipped it — a terminal escalation, an
+   * exhausted budget, a refused revision — stops here rather than publishing.
+   */
+  if (!authorization?.authorized) {
+    if (authorization?.action === 'human_review') {
+      await store.projects.updateOne(
+        { _id: projectId },
+        { $set: { state: 'awaiting_human_review', updatedAt: new Date() } },
+      );
+      say({
+        phase: 'approve',
+        detail: `Awaiting human review before release: ${authorization.reason}`,
+        level: 'warn',
+      });
+    }
+    return terminal('blocked');
   }
 
   await store.projects.updateOne({ _id: projectId }, { $set: { state: 'releasing', updatedAt: new Date() } });
@@ -1223,7 +1423,27 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     // harness made alone. It becomes `recommendedBy` + `authorizedBy` when an
     // approval recommendation actually exists; changing it here would only
     // move the inaccuracy.
-    approvedBy: 'sol:machine-approval',
+    /**
+     * Who judged, and who authorised — separately, and neither standing in for
+     * the other. The single `approvedBy: 'sol:machine-approval'` this replaces
+     * named a model for a decision the harness made alone.
+     */
+    recommendation: {
+      by: 'sol' as const,
+      model: approvalModel,
+      artifactVersion: approvalArtifactVersion,
+      decision: (authorization.action === 'release' ? 'accept' : null) as
+        | 'accept'
+        | 'reject'
+        | 'human_review'
+        | null,
+    },
+    authorization: {
+      by: 'harness-policy' as const,
+      policyVersion: authorization.policyVersion,
+      action: authorization.action,
+      reason: authorization.reason,
+    },
     qualityScore,
     // The gates that actually certified this revision, not a fresh run against
     // a tree that may have moved on. Re-running them here would also mean
