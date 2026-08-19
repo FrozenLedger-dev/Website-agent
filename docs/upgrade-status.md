@@ -62,6 +62,23 @@ specification is wrong, which is the judgement the harness failed to obtain.
 | `sol-replan` | Not started |
 | `sol-approve` | Not started |
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs typecheck, lint and `pnpm test:unit` on every
+push and pull request. It provisions nothing and holds no credentials.
+
+**Known gap.** Three suites — `packages/state/test/budgets.test.ts`,
+`packages/job-engine/test/engine.test.ts` and
+`packages/workspace/test/workspace.test.ts`, 32 tests — connect to a real Mongo
+replica set and are not covered by CI. They are integration tests by intent: the
+properties they pin are transaction semantics, and mocking the driver would
+assert only that the code calls the functions it calls. Among them is the guard
+on the `$expr` budget filter, which is the single most important invariant in
+the repository, so a green tick does **not** mean that invariant was checked.
+
+Closing it means giving CI a Mongo service container initialised as a
+single-node replica set. That is a deliberate later decision, not an oversight.
+
 ## Phases 3–17
 
 Not started.

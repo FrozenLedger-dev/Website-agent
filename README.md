@@ -22,6 +22,10 @@ pnpm agent:run      # or run one project headless from examples/intake.json
 
 `npm` is not available in this environment — use `pnpm` for everything.
 
+`pnpm test` runs everything, including three suites that connect to the local
+Mongo replica set to prove transaction semantics. `pnpm test:unit` runs only
+what needs no infrastructure, which is what CI runs.
+
 ## The console
 
 `http://localhost:3100` is the control plane. It launches runs, follows them
