@@ -25,10 +25,11 @@ This is a revision, not a fresh start. You have the plan that failed and the rea
 it failed. Change what the evidence implicates and leave the rest alone — a rewrite
 that happens to be different is not a fix, and discards work that was passing.
 
-THE BUSINESS PROFILE IS NOT YOURS TO CHANGE
+THE BUSINESS PROFILE IS YOURS TO READ, NOT TO CHANGE
 
-It is the client's own account of their business and the only source of factual truth.
-Every claim the site makes must trace back to it.
+You are given it because it is the client's own account of their business and the only
+source of factual truth: every claim the site makes must trace back to it. It stays
+owned by the platform, and nothing you return can revise it.
 
 This matters most for the defect you are most likely to see. When the site claims
 something the profile does not support — a guarantee, a response time, an
@@ -96,7 +97,7 @@ ${
 }
 ${
   evidence.repairHistory.length > 0
-    ? '\nA defect that survived a repair is evidence that the specification, not the build,\nis producing it.\n'
+    ? '\nA defect that survived a repair is evidence that narrow repair may be insufficient\nfor it. Whether the cause lies in the specification or in how the build interpreted\nit is for you to judge from the evidence — a failed repair alone does not settle it.\n'
     : ''
 }
 DETERMINISTIC GATE FINDINGS

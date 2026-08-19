@@ -68,6 +68,7 @@ import {
   type AdjudicationRecord,
 } from './adjudication.js';
 import {
+  isEmptyDelta,
   planDelta,
   scopeViolations,
   type ReplanRecord,
@@ -298,6 +299,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       preservedAreas: [],
       delta: null,
       scopeViolations: [],
+      rejected: null,
       model: null,
       modelFailure: null,
       decidedAt: new Date(),
@@ -341,6 +343,31 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       record.modelFailure = error instanceof Error ? error.message : String(error);
     }
 
+    /**
+     * Two objective reasons to refuse a revision that parsed cleanly.
+     *
+     * A scope violation is not a narrow revision that went slightly wide: it is
+     * a different decision from the one adjudication authorised, and executing
+     * it would let the requested scope mean nothing.
+     *
+     * An empty delta means Sol reported changes the plan does not contain.
+     * Rebuilding from it would reproduce the site that just failed, spend the
+     * cycle, and arrive at the same defects.
+     *
+     * Either way the decision is still persisted — a refused revision is part
+     * of the history — but the plan is not activated, the site is not cleared,
+     * and Sol is not called again.
+     */
+    if (revisedPlan && record.scopeViolations.length > 0) {
+      record.rejected = `Revision exceeded the "${record.scope}" scope it was authorised for.`;
+      revisedPlan = null;
+    } else if (revisedPlan && record.delta && isEmptyDelta(record.delta)) {
+      record.rejected =
+        `Sol reported ${record.changes.length} change(s), but the revised plan is ` +
+        'identical to the one that failed.';
+      revisedPlan = null;
+    }
+
     const ref = await registry.put(projectId, 'replan-decision', record);
     await registry.accept(projectId, ref);
     await workspace.materialiseArtifact(
@@ -348,7 +375,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       record,
     );
 
-    if (!revisedPlan) {
+    if (record.modelFailure) {
       say({
         phase: 'replan',
         detail: `Sol could not revise the specification: ${record.modelFailure}`,
@@ -357,17 +384,18 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       return null;
     }
 
-    if (record.scopeViolations.length > 0) {
-      // Recorded rather than refused: the revision came from the evidence, and
-      // discarding it on a heuristic would block an otherwise usable plan.
+    if (record.rejected) {
       for (const violation of record.scopeViolations) {
-        say({ phase: 'replan', detail: `Scope exceeded — ${violation}`, level: 'warn' });
+        say({ phase: 'replan', detail: `Scope exceeded — ${violation}`, level: 'fail' });
       }
+      say({ phase: 'replan', detail: `Revision refused: ${record.rejected}`, level: 'fail' });
+      return null;
     }
 
     // A new version of site-plan, never an overwrite: the plan that failed
-    // stays readable next to the one that replaced it.
-    await persistPlan(revisedPlan);
+    // stays readable next to the one that replaced it. Reached only by a
+    // revision the harness accepted.
+    await persistPlan(revisedPlan!);
 
     const d = record.delta!;
     say({

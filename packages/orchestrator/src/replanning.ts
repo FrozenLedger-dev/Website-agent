@@ -22,6 +22,8 @@ export interface PlanDelta {
   routesRevised: string[];
   brandChanged: boolean;
   acceptanceCriteriaChanged: boolean;
+  strategyChanged: boolean;
+  valuePropositionChanged: boolean;
 }
 
 const canonical = (value: unknown): string => JSON.stringify(value ?? null);
@@ -43,37 +45,70 @@ export function planDelta(previous: SitePlan, revised: SitePlan): PlanDelta {
     brandChanged: canonical(previous.brandSystem) !== canonical(revised.brandSystem),
     acceptanceCriteriaChanged:
       canonical(previous.acceptanceCriteria) !== canonical(revised.acceptanceCriteria),
+    strategyChanged: previous.strategy !== revised.strategy,
+    valuePropositionChanged: previous.valueProposition !== revised.valueProposition,
   };
+}
+
+/**
+ * True when the revision changed nothing the harness can detect.
+ *
+ * Sol reporting changes it did not make is not a reason to rebuild: the build
+ * would reproduce the site that just failed, spend the cycle, and arrive at the
+ * same defects. The discrepancy between the reported changes and the measured
+ * delta is recorded, because a model claiming work it did not do is worth
+ * seeing.
+ */
+export function isEmptyDelta(delta: PlanDelta): boolean {
+  return (
+    delta.routesAdded.length === 0 &&
+    delta.routesRemoved.length === 0 &&
+    delta.routesRevised.length === 0 &&
+    !delta.brandChanged &&
+    !delta.acceptanceCriteriaChanged &&
+    !delta.strategyChanged &&
+    !delta.valuePropositionChanged
+  );
 }
 
 /**
  * Where a revision exceeded the scope that was asked for.
  *
- * Only objectively checkable overreach is reported: whether routes appeared or
- * disappeared, and whether the brand system moved. Whether a page's *content*
+ * Only objectively checkable overreach is reported. Whether a page's *content*
  * changed more than it needed to is a judgement, and a wrong answer would
  * either block a good revision or wave through a bad one, so it is left to
- * later policy work.
+ * later policy work. What is measurable is structural: which routes exist,
+ * whether the brand system moved, and whether the site's strategy or value
+ * proposition was rewritten.
  *
- * These are recorded, not enforced. A revision that overreaches is still a
- * revision produced from the evidence, and discarding it would send an
- * otherwise-usable plan to `block` on a heuristic — a worse outcome than
- * shipping the delta into the audit trail where it can be read.
+ * These are enforced. A `page` scope that quietly rewrites the site's strategy
+ * is not a narrower revision that went slightly wide — it is a different
+ * decision from the one adjudication authorised, and executing it would let the
+ * scope mean nothing.
  */
 export function scopeViolations(scope: ReplanScope, delta: PlanDelta): string[] {
-  const violations: string[] = [];
-  const structural = delta.routesAdded.length > 0 || delta.routesRemoved.length > 0;
+  if (scope === 'site') return [];
 
-  if (scope === 'page' || scope === 'design') {
-    if (structural) {
-      violations.push(
-        `Scope "${scope}" does not cover adding or removing routes, but the revision ` +
-          `added [${delta.routesAdded.join(', ') || 'none'}] and removed ` +
-          `[${delta.routesRemoved.join(', ') || 'none'}].`,
-      );
-    }
+  const violations: string[] = [];
+
+  // Neither `page` nor `design` covers which pages exist.
+  if (delta.routesAdded.length > 0 || delta.routesRemoved.length > 0) {
+    violations.push(
+      `Scope "${scope}" does not cover adding or removing routes, but the revision ` +
+        `added [${delta.routesAdded.join(', ') || 'none'}] and removed ` +
+        `[${delta.routesRemoved.join(', ') || 'none'}].`,
+    );
   }
 
+  // Nor the site's overall positioning.
+  if (delta.strategyChanged) {
+    violations.push(`Scope "${scope}" does not cover the site strategy, but it changed.`);
+  }
+  if (delta.valuePropositionChanged) {
+    violations.push(`Scope "${scope}" does not cover the value proposition, but it changed.`);
+  }
+
+  // `design` exists to revise the brand system; `page` does not.
   if (scope === 'page' && delta.brandChanged) {
     violations.push('Scope "page" does not cover the brand system, but it changed.');
   }
@@ -96,6 +131,8 @@ export interface ReplanRecord {
   /** Computed by the harness, not reported by Sol. */
   delta: PlanDelta | null;
   scopeViolations: string[];
+  /** Set when the harness refused the revision, with the reason. */
+  rejected: string | null;
   model: string | null;
   modelFailure: string | null;
   decidedAt: Date;

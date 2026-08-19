@@ -47,9 +47,21 @@ revision actually made — routes added, removed and revised, whether the brand
 system moved, whether the acceptance criteria changed. Overreach that is
 objectively checkable is recorded on the artifact as `scopeViolations`.
 
-It is **recorded, not enforced**. Whether a page's content changed more than it
-needed to is a judgement, and refusing a revision on a heuristic would send an
-otherwise usable plan to `block`. Stronger enforcement waits for policy work.
+Objectively detectable overreach is **enforced**: a `page` scope may not add or
+remove routes, move the brand system, or rewrite the strategy or value
+proposition; a `design` scope may move the brand but not the routes, strategy or
+value proposition; `site` permits all of them. A revision that exceeds its scope
+is not a narrow change that went slightly wide — it is a different decision from
+the one adjudication authorised.
+
+A revision whose measured delta is empty is refused too: Sol reporting changes
+the plan does not contain would otherwise rebuild the site that just failed.
+
+Both refusals persist the decision, including the violation, and then withhold
+activation — the plan is not accepted, the site is not cleared, and Sol is not
+called again. What stays **unenforced** is subjective overreach: whether a
+page's copy changed more than it needed to is a judgement, and a wrong answer
+would either block a good revision or wave through a bad one.
 
 ### Budget semantics settled during Phase 2b
 

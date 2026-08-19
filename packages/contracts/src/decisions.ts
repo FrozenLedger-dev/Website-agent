@@ -187,11 +187,14 @@ export type SolReplanRequest = z.infer<typeof SolReplanRequest>;
  * The revision, and the reasoning behind it.
  *
  * There is no field for a budget, a permission, a credential, a deployment
- * target or a gate override — and none for the business profile either. A
- * defect like an unsupported "24/7 emergency service" claim must be answered by
- * changing what the site says, never by revising the facts it is measured
- * against. The profile is not reachable from here, so that is structural rather
- * than a rule Sol is asked to follow.
+ * target or a gate override — and none for the business profile either.
+ *
+ * Sol *reads* the profile: it is supplied as canonical factual context, because
+ * a revision that cannot see the facts cannot check its claims against them.
+ * What it cannot do is send one back. A defect like an unsupported "24/7
+ * emergency service" claim must therefore be answered by changing what the site
+ * says, never by revising the facts it is measured against — and that is
+ * structural, not a rule Sol is asked to follow.
  */
 export const SolReplanResult = z.object({
   /** What was actually wrong with the previous plan. */

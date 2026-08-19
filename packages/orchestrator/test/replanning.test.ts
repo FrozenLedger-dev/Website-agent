@@ -13,7 +13,7 @@ import {
   toStrictModelSchema,
   type SitePlan,
 } from '@statxai/contracts';
-import { planDelta, scopeViolations, type PlanDelta } from '../src/replanning.js';
+import { isEmptyDelta, planDelta, scopeViolations, type PlanDelta } from '../src/replanning.js';
 
 const page = (route: string, heading = 'H', layout = 'split-hero') => ({
   route,
@@ -51,6 +51,8 @@ describe('what actually changed', () => {
       routesRevised: [],
       brandChanged: false,
       acceptanceCriteriaChanged: false,
+      strategyChanged: false,
+      valuePropositionChanged: false,
     });
   });
 
@@ -87,20 +89,18 @@ describe('what actually changed', () => {
 });
 
 describe('scope', () => {
-  const structural: PlanDelta = {
-    routesAdded: ['/faq'],
-    routesRemoved: ['/about'],
+  const unchanged = {
+    routesAdded: [],
+    routesRemoved: [],
     routesRevised: [],
     brandChanged: false,
     acceptanceCriteriaChanged: false,
-  };
-  const brandOnly: PlanDelta = {
-    routesAdded: [],
-    routesRemoved: [],
-    routesRevised: ['/services'],
-    brandChanged: true,
-    acceptanceCriteriaChanged: false,
-  };
+    strategyChanged: false,
+    valuePropositionChanged: false,
+  } satisfies PlanDelta;
+
+  const structural: PlanDelta = { ...unchanged, routesAdded: ['/faq'], routesRemoved: ['/about'] };
+  const brandOnly: PlanDelta = { ...unchanged, routesRevised: ['/services'], brandChanged: true };
 
   it('flags routes appearing under a page scope', () => {
     const violations = scopeViolations('page', structural);
@@ -124,14 +124,7 @@ describe('scope', () => {
   });
 
   it('permits a page scope that only revises the page it was given', () => {
-    const withinScope: PlanDelta = {
-      routesAdded: [],
-      routesRemoved: [],
-      routesRevised: ['/services'],
-      brandChanged: false,
-      acceptanceCriteriaChanged: false,
-    };
-    expect(scopeViolations('page', withinScope)).toEqual([]);
+    expect(scopeViolations('page', { ...unchanged, routesRevised: ['/services'] })).toEqual([]);
   });
 });
 
@@ -140,9 +133,10 @@ describe('what the replan contract cannot touch', () => {
     /profile|business|budget|permission|credential|secret|token|deploy|environment|autonomy|override|gate/i;
 
   it('offers no field for the business profile, budgets, permissions or deployment', () => {
-    // A defect like an unsupported "24/7 emergency service" claim must be
-    // answered by changing what the site says, never by revising the facts it
-    // is measured against. The profile is not reachable from the result at all.
+    // Sol reads the profile — it is supplied as canonical factual context, since
+    // a revision that cannot see the facts cannot check its claims against them.
+    // What it cannot do is send one back, so an unsupported "24/7 emergency
+    // service" claim can only be answered by changing what the site says.
     const json = toStrictModelSchema(SolReplanResult) as { properties?: Record<string, unknown> };
     for (const key of Object.keys(json.properties ?? {})) {
       expect(forbidden.test(key), key).toBe(false);
@@ -333,7 +327,9 @@ describe('regression: a plan that requires an unsupported claim', () => {
     expect(delta.brandChanged).toBe(false);
     expect(scopeViolations('page', delta)).toEqual([]);
 
-    // And the profile is untouched, because it never left the harness.
+    // The profile is unchanged. Sol was given it to read; the result carries no
+    // field through which a revised one could return, so the harness's copy
+    // remains authoritative.
     expect(PROFILE.services[0]?.description).toBe('Weekday faults, on site within two hours.');
   });
 
@@ -389,5 +385,182 @@ describe('a replan that cannot be produced', () => {
 
     expect(code).toContain('if (!revised) {');
     expect(code).toContain('Replan could not be produced');
+  });
+});
+
+/**
+ * Scope is enforced, not merely observed.
+ *
+ * A revision that exceeds the scope adjudication authorised is not a narrow
+ * change that went slightly wide — it is a different decision from the one that
+ * was approved, and executing it would let the requested scope mean nothing.
+ */
+describe('objectively detectable overreach is refused', () => {
+  const base = {
+    routesAdded: [],
+    routesRemoved: [],
+    routesRevised: ['/services'],
+    brandChanged: false,
+    acceptanceCriteriaChanged: false,
+    strategyChanged: false,
+    valuePropositionChanged: false,
+  } satisfies PlanDelta;
+
+  it('page scope refuses a route addition', () => {
+    expect(scopeViolations('page', { ...base, routesAdded: ['/pricing'] })).toHaveLength(1);
+  });
+
+  it('page scope refuses a route removal', () => {
+    expect(scopeViolations('page', { ...base, routesRemoved: ['/about'] })).toHaveLength(1);
+  });
+
+  it('page scope refuses a brand-system change', () => {
+    expect(scopeViolations('page', { ...base, brandChanged: true })).toHaveLength(1);
+  });
+
+  it('page scope refuses a strategy change', () => {
+    const violations = scopeViolations('page', { ...base, strategyChanged: true });
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain('strategy');
+  });
+
+  it('page scope refuses a value-proposition change', () => {
+    const violations = scopeViolations('page', { ...base, valuePropositionChanged: true });
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain('value proposition');
+  });
+
+  it('design scope refuses route changes', () => {
+    expect(scopeViolations('design', { ...base, routesAdded: ['/pricing'] })).toHaveLength(1);
+    expect(scopeViolations('design', { ...base, routesRemoved: ['/about'] })).toHaveLength(1);
+  });
+
+  it('design scope refuses strategy and value-proposition changes', () => {
+    expect(scopeViolations('design', { ...base, strategyChanged: true })).toHaveLength(1);
+    expect(scopeViolations('design', { ...base, valuePropositionChanged: true })).toHaveLength(1);
+  });
+
+  it('design scope permits the brand change it exists for', () => {
+    expect(scopeViolations('design', { ...base, brandChanged: true })).toEqual([]);
+  });
+
+  it('site scope permits every one of them', () => {
+    const everything: PlanDelta = {
+      routesAdded: ['/pricing'],
+      routesRemoved: ['/about'],
+      routesRevised: ['/services'],
+      brandChanged: true,
+      acceptanceCriteriaChanged: true,
+      strategyChanged: true,
+      valuePropositionChanged: true,
+    };
+    expect(scopeViolations('site', everything)).toEqual([]);
+  });
+
+  it('reports every violation, not just the first', () => {
+    const violations = scopeViolations('page', {
+      ...base,
+      routesAdded: ['/pricing'],
+      brandChanged: true,
+      strategyChanged: true,
+      valuePropositionChanged: true,
+    });
+    expect(violations).toHaveLength(4);
+  });
+});
+
+describe('a revision that changed nothing', () => {
+  it('is detected however Sol described it', () => {
+    // Rebuilding from it would reproduce the site that just failed, spend the
+    // cycle, and arrive at the same defects.
+    const identical = plan(FOUR);
+    expect(isEmptyDelta(planDelta(identical, plan(FOUR)))).toBe(true);
+  });
+
+  it('is not confused with a real change', () => {
+    const revised = plan(FOUR);
+    revised.strategy = 'A different strategy';
+    expect(isEmptyDelta(planDelta(plan(FOUR), revised))).toBe(false);
+
+    const reworded = plan(FOUR);
+    reworded.valueProposition = 'Something else';
+    expect(isEmptyDelta(planDelta(plan(FOUR), reworded))).toBe(false);
+  });
+
+  it('notices a change in any single dimension', () => {
+    const dimensions: ((p: SitePlan) => void)[] = [
+      (p) => void (p.strategy = 'x'),
+      (p) => void (p.valueProposition = 'x'),
+      (p) => void (p.brandSystem.palette.accent = '#0f0'),
+      (p) => void p.acceptanceCriteria.push('d'),
+      (p) => void (p.sitemap.pages[0]!.title = 'x'),
+    ];
+    for (const mutate of dimensions) {
+      const revised = plan(FOUR);
+      mutate(revised);
+      expect(isEmptyDelta(planDelta(plan(FOUR), revised))).toBe(false);
+    }
+  });
+});
+
+describe('what a refused revision leaves behind', () => {
+  it('activates the plan only after both checks pass', async () => {
+    // `persistPlan` makes a revision the accepted plan and `clearSite` discards
+    // the build. Both must sit behind the rejection, or a refused revision
+    // would still take effect.
+    const { readFile } = await import('node:fs/promises');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+
+    const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
+    const code = await readFile(join(src, 'orchestrator.ts'), 'utf8');
+
+    const revise = code.slice(code.indexOf('async function revisePlan'));
+    const body = revise.slice(0, revise.indexOf('\n  }\n'));
+
+    // The refusal returns before the plan is persisted.
+    expect(body.indexOf('if (record.rejected)')).toBeLessThan(body.indexOf('await persistPlan'));
+    expect(body).toContain('record.scopeViolations.length > 0');
+    expect(body).toContain('isEmptyDelta(record.delta)');
+
+    // And the caller clears the site only after a non-null revision.
+    const caller = code.slice(code.indexOf('const revised = await revisePlan'));
+    expect(caller.indexOf('if (!revised)')).toBeLessThan(caller.indexOf('clearSite()'));
+  });
+
+  it('persists the decision even when the revision is refused', async () => {
+    // A refused revision is part of the history: the artifact records the
+    // violation and the reason, and only the activation is withheld.
+    const { readFile } = await import('node:fs/promises');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+
+    const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
+    const code = await readFile(join(src, 'orchestrator.ts'), 'utf8');
+    const revise = code.slice(code.indexOf('async function revisePlan'));
+
+    expect(revise.indexOf('record.rejected =')).toBeLessThan(
+      revise.indexOf("registry.put(projectId, 'replan-decision'"),
+    );
+  });
+
+  it('does not call Sol again after refusing', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+
+    const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
+    const code = (await readFile(join(src, 'orchestrator.ts'), 'utf8'))
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/.*$/gm, '');
+
+    // One call site in the whole module, and one inside revisePlan's own body:
+    // a refusal returns, it does not ask Sol for a different answer.
+    expect(code.match(/replanSite\(/g) ?? []).toHaveLength(1);
+
+    const revise = code.slice(code.indexOf('async function revisePlan'));
+    const body = revise.slice(0, revise.indexOf('\n  }\n'));
+    expect(body.match(/replanSite\(/g) ?? []).toHaveLength(1);
+    expect(body).toContain('return null;');
   });
 });
