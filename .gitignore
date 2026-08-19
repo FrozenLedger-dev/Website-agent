@@ -22,4 +22,3 @@ next-env.d.ts
 templates/site/node_modules/
 templates/site/.next/
 templates/site/out/
-docs/
