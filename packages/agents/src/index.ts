@@ -1,4 +1,5 @@
 export * from './client.js';
+export * from './skills/sol-adjudicate.js';
 export * from './skills/sol-plan.js';
 export * from './skills/sol-route.js';
 export * from './skills/terra-build.js';

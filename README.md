@@ -98,8 +98,14 @@ intake ──validate──> Sol plan ──> Terra build ──> deterministic 
                             └──── budgets bound it ─────┴──> release
 ```
 
-- **Sol** (orchestrator) plans, adjudicates, owns budgets and gives the final
-  machine approval. It never edits a file.
+**Models provide intelligence; the harness provides authority.** Sol reasons and
+recommends; it never edits a file, spends a budget, grants a permission or
+releases anything.
+
+- **Sol** (orchestrator) plans, chooses the execution strategy, and adjudicates
+  failed evaluations. Each of those is a proposal the harness validates against
+  a contract, checks for legality, records as an artifact, and only then
+  executes.
 - **Terra** (worker) builds the site, and separately reviews it. The reviewer is
   given only the specification and the artifact — never the builder's reasoning.
 - **Luna** (repair) fixes one defect at a time, scoped to the files the defect

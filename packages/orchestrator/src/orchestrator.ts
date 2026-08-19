@@ -3,10 +3,20 @@
  *
  *   discover → plan → build → evaluate → repair/escalate → publish
  *
- * Sol owns project state, policy, execution budgets and the final machine
- * approval. It never edits a file itself: it decides what happens next, and
- * every decision it makes is bounded by a budget that commits transactionally
- * with the work it authorises.
+ * Models provide intelligence; the harness provides authority.
+ *
+ * Sol reasons and recommends — it plans, it chooses an execution strategy, and
+ * it adjudicates failed evaluations. It never edits a file, spends a budget,
+ * grants a permission or releases anything. Project state, artifact
+ * persistence, budgets, permissions, validation, authorisation and deployment
+ * belong to this module and the packages it calls, and a model decision only
+ * takes effect once the harness has authorised it.
+ *
+ * PENDING (Phase 2d, `sol-approve`): the release path still decides approval
+ * itself and records it as `approvedBy: 'sol:machine-approval'`, which credits
+ * a model that was never consulted. It is left as-is deliberately until Sol
+ * actually produces an approval recommendation and the harness records its own
+ * authorisation separately.
  */
 import {
   BusinessProfile,
@@ -47,6 +57,15 @@ import {
   type BuildResult,
   type DeployResult,
 } from '@statxai/workspace';
+import { adjudicate } from '@statxai/agents';
+import {
+  authorizeAdjudication,
+  fallbackAction,
+  legalAdjudicationActions,
+  type AdjudicationAuthorization,
+  type AdjudicationConstraints,
+  type AdjudicationRecord,
+} from './adjudication.js';
 import {
   authorizeRoute,
   developerOverride,
@@ -245,6 +264,16 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     await workspace.materialiseArtifact('decisions/route-decision.json', record);
   }
 
+  /** Persist an adjudication outcome as a versioned artifact. */
+  async function recordAdjudication(record: AdjudicationRecord): Promise<void> {
+    const ref = await registry.put(projectId, 'adjudication-decision', record);
+    await registry.accept(projectId, ref);
+    await workspace.materialiseArtifact(
+      `decisions/adjudication-${String(record.reviewCycle).padStart(2, '0')}.json`,
+      record,
+    );
+  }
+
   async function decideStrategy(current: SitePlan): Promise<RoutingAuthorization> {
     const override = developerOverride();
     const permitted = permittedStrategies(current);
@@ -415,6 +444,15 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   let terminalDecision: TerminalOutcome | undefined;
   /** Repaired but not yet re-verified — carried into the next review. */
   let repairedSinceReview: { id: string; reason: string; acceptanceTest: string }[] = [];
+
+  /**
+   * Every repair attempted so far, with what became of it.
+   *
+   * Sol needs this to tell a first-time defect from one that narrow repair has
+   * already failed on — which is the evidence that distinguishes "repair again"
+   * from "the plan is the problem".
+   */
+  const repairHistory: { defectId: string; fingerprint: string; outcome: string }[] = [];
   /** Set when the review could not be obtained at all, as opposed to rejecting. */
   let reviewUnavailable: string | null = null;
 
@@ -488,6 +526,10 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
     gatesCertified = compiled.ok ? ['build', ...gateRun.gatesRun] : ['build'];
 
+    // Carried into adjudication so Sol sees the reviewer's verdict, not just
+    // the defects it produced.
+    let reviewSummary: string | null = null;
+
     const gateDefects = compiled.ok
       ? gateRun.findings.map(fromGateFinding)
       : [buildFailureDefect(compiled.output)];
@@ -550,6 +592,12 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         reviewCycle,
       });
 
+      reviewSummary =
+        `  decision ${reviewed.value.decision}, quality ${qualityScore}, blocking=${reviewed.value.blocking}\n` +
+        reviewed.value.issues
+          .map((i) => `  ${i.severity} ${i.category} ${i.location} — ${i.reason}`)
+          .join('\n');
+
       say({
         phase: 'evaluate',
         detail: `Review: ${reviewed.value.decision}, score ${qualityScore}, ${reviewed.value.issues.length} issues, blocking=${reviewed.value.blocking}`,
@@ -563,22 +611,127 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     const mustFix = blocking(openDefects);
 
     if (mustFix.length === 0) {
-      say({ phase: 'evaluate', detail: 'No blocking criteria outstanding — Sol approves', level: 'ok' });
+      // PENDING (Phase 2d): the harness decided this, not Sol. The wording is
+      // corrected here; the misleading `approvedBy` in the manifest and the
+      // absent recommendation are `sol-approve`'s to fix.
+      say({
+        phase: 'evaluate',
+        detail: 'No blocking criteria outstanding — harness accepts the revision',
+        level: 'ok',
+      });
       break;
     }
 
     /**
-     * §7's escalation ladder is repair → specialist → specification revision,
-     * and this is the third rung. When the blocking work exceeds what the
-     * repair budget could ever clear, repairing is not convergent: the plan is
-     * the defect, not the pages. One run planned every page nested under
-     * "about/faq/" with no homepage, produced ninety blocking findings against
-     * a budget of eight, and ground through repairs that could never finish.
+     * §7's escalation ladder, decided by Sol rather than by arithmetic.
+     *
+     * The harness computes what is affordable and executable; Sol reasons about
+     * which of those is appropriate; the harness authorises and acts. Two rules
+     * used to do all of it: `mustFix.length > repairsLeft` triggered a replan,
+     * and everything else went to Luna. Neither asked what kind of defect it
+     * was looking at.
      */
     const currentBudget = (await store.budgets.findOne({ _id: projectId }))!;
-    const repairsLeft = currentBudget.limits.totalRepairJobs - currentBudget.used.totalRepairJobs;
+    const constraints: AdjudicationConstraints = {
+      blockingCount: mustFix.length,
+      repairsLeft: currentBudget.limits.totalRepairJobs - currentBudget.used.totalRepairJobs,
+      replansLeft: currentBudget.limits.replans - currentBudget.used.replans,
+      reviewRejectionsLeft:
+        currentBudget.limits.reviewRejections - currentBudget.used.reviewRejections,
+      previousRepairs: repairHistory,
+      autonomyMode,
+    };
+    const legal = legalAdjudicationActions(constraints);
 
-    if (mustFix.length > repairsLeft) {
+    let adjudication: AdjudicationAuthorization;
+    let proposedAdjudication: AdjudicationRecord['proposed'] = null;
+    let adjudicationFailure: string | null = null;
+
+    try {
+      const decided = await adjudicate(model, {
+        reviewCycle,
+        legalActions: legal,
+        gateFindings: gateRun.findings.map(
+          (f) => `${f.severity} ${f.gate} ${f.location} — ${f.message}`,
+        ),
+        reviewSummary: reviewSummary,
+        openBlockingDefects: mustFix.map((d) => ({
+          id: d.id,
+          category: d.category,
+          severity: d.severity,
+          location: d.location,
+          reason: d.reason,
+          acceptanceTest: d.acceptanceTest,
+        })),
+        previousRepairs: repairHistory,
+        remainingBudgets: {
+          totalRepairJobs: constraints.repairsLeft,
+          replans: constraints.replansLeft,
+          reviewRejections: constraints.reviewRejectionsLeft,
+        },
+        autonomyMode,
+      });
+      track('sol', decided);
+
+      proposedAdjudication = {
+        action: decided.value.action,
+        reason: decided.value.reason,
+        defectIds: decided.value.defectIds ?? [],
+        objective: decided.value.objective ?? null,
+        scope: decided.value.scope ?? null,
+      };
+      adjudication = authorizeAdjudication(decided.value, legal, mustFix);
+    } catch (error) {
+      // An adjudication that cannot be obtained must not end a delivery: the
+      // harness takes the cheapest legal action and records that Sol was absent.
+      adjudicationFailure = error instanceof Error ? error.message : String(error);
+      const action = fallbackAction(legal);
+      adjudication = {
+        action,
+        targets: action === 'repair' ? [...mustFix] : [],
+        source: 'fallback',
+        refusal: `Sol could not be consulted: ${adjudicationFailure}`,
+      };
+    }
+
+    await recordAdjudication({
+      reviewCycle,
+      action: adjudication.action,
+      source: adjudication.source,
+      refusal: adjudication.refusal,
+      targetDefectIds: adjudication.targets.map((d) => d.id),
+      legalActions: legal,
+      constraints,
+      proposed: proposedAdjudication,
+      modelFailure: adjudicationFailure,
+      decidedAt: new Date(),
+    });
+
+    say({
+      phase: 'adjudicate',
+      detail:
+        adjudication.source === 'sol'
+          ? `Sol chose ${adjudication.action}: ${proposedAdjudication?.reason ?? ''}`
+          : `${adjudication.action} by fallback — ${adjudication.refusal ?? ''}`,
+      level: adjudication.source === 'sol' ? 'ok' : 'warn',
+    });
+
+    if (adjudication.action === 'block') {
+      terminalDecision = decideTerminal(openDefects, autonomyMode);
+      say({
+        phase: 'escalate',
+        detail: `Adjudicated as unrecoverable → ${terminalDecision}`,
+        level: 'fail',
+      });
+      break;
+    }
+
+    if (adjudication.action === 'replan') {
+      /**
+       * The budget is spent by the harness, never by Sol. `replan` being legal
+       * means the budget had room when the actions were computed; spending it
+       * is still transactional, because that is where the guarantee lives.
+       */
       try {
         await spend(store, projectId, 'replans');
       } catch (error) {
@@ -594,11 +747,15 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
       say({
         phase: 'escalate',
-        detail: `${mustFix.length} blocking defects exceed the ${repairsLeft} repair jobs remaining — revising the specification`,
+        detail: `Revising the specification (${mustFix.length} blocking defects, scope ${proposedAdjudication?.scope ?? 'site'})`,
         level: 'warn',
       });
 
       await workspace.clearSite();
+      // PENDING (Phase 2c, `sol-replan`): this still re-plans from the original
+      // profile with no failure context, so the revision cannot learn from what
+      // triggered it. Sol now decides *that* a replan happens; deciding *what
+      // changes* is the next phase.
       plan = await producePlan(reviewCycle + 1);
       await buildFromPlan(plan);
       repairedSinceReview = [];
@@ -618,11 +775,11 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
     say({
       phase: 'repair',
-      detail: `Cycle ${reviewCycle}/${budgetLimits.reviewRejections}: repairing ${mustFix.length} blocking defect(s)`,
+      detail: `Cycle ${reviewCycle}/${budgetLimits.reviewRejections}: repairing ${adjudication.targets.length} of ${mustFix.length} blocking defect(s)`,
     });
 
     let exhausted = false;
-    for (const defect of mustFix) {
+    for (const defect of adjudication.targets) {
       try {
         await store.withTransaction((session) =>
           spendRepairAttempt(store, projectId, defect.fingerprint, reviewCycle, session),
@@ -700,6 +857,17 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         acceptanceTest: defect.acceptanceTest,
       });
       if (written > 0) repairsApplied += 1;
+
+      // Recorded so the next adjudication can tell a first attempt from a
+      // defect that narrow repair has already failed to clear.
+      repairHistory.push({
+        defectId: defect.id,
+        fingerprint: defect.fingerprint,
+        outcome:
+          failed > 0 && written === 0
+            ? `failed (${failed} file(s))`
+            : `${written} file(s) rewritten${refused > 0 ? `, ${refused} refused` : ''}`,
+      });
 
       say({
         phase: 'repair',
@@ -820,6 +988,10 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     commit: releaseCommit ?? 'uncommitted',
     environment: deployment ? 'production' : 'preview',
     autonomyMode,
+    // PENDING (Phase 2d, `sol-approve`): this credits Sol for a decision the
+    // harness made alone. It becomes `recommendedBy` + `authorizedBy` when an
+    // approval recommendation actually exists; changing it here would only
+    // move the inaccuracy.
     approvedBy: 'sol:machine-approval',
     qualityScore,
     // The gates that actually certified this revision, not a fresh run against
