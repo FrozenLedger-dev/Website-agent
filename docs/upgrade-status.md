@@ -34,11 +34,22 @@ Phase 0 stays open only on the two items that need a browser.
 | `SolReplanRequest` / `SolReplanResult` | Done |
 | `SolApprovalRecommendation` | Done |
 | Validate all outputs with Zod | Done |
-| Reject malformed output before it reaches project state | Partial — `sol-route` and `sol-adjudicate` use them; replan and approval have no caller |
-| **Store every accepted decision as a versioned artifact** | Partial — `route-decision` and `adjudication-decision` are persisted; replan and approval are not, because those skills do not exist yet |
+| Reject malformed output before it reaches project state | Partial — `sol-route`, `sol-adjudicate` and `sol-replan` use them; approval has no caller |
+| **Store every accepted decision as a versioned artifact** | Partial — `route-decision`, `adjudication-decision` and `replan-decision` are persisted; approval is not, because that skill does not exist yet |
 
 The contracts are declared and tested. Persistence arrives with each skill that
 produces a decision, so this closes when Phase 2 does.
+
+### Replan scope, settled during Phase 2c
+
+The adjudication's scope reaches Sol, and the harness computes the delta the
+revision actually made — routes added, removed and revised, whether the brand
+system moved, whether the acceptance criteria changed. Overreach that is
+objectively checkable is recorded on the artifact as `scopeViolations`.
+
+It is **recorded, not enforced**. Whether a page's content changed more than it
+needed to is a judgement, and refusing a revision on a heuristic would send an
+otherwise usable plan to `block`. Stronger enforcement waits for policy work.
 
 ### Budget semantics settled during Phase 2b
 
@@ -59,7 +70,7 @@ specification is wrong, which is the judgement the harness failed to obtain.
 | `sol-route` | Done — Sol decides, the harness authorises, the decision is persisted |
 | `sol-route` execution (2a.1) | Done — each strategy has its own call; nothing fabricates a truncation to steer control flow |
 | `sol-adjudicate` | Done — the harness computes legal actions, Sol chooses, the harness authorises and executes |
-| `sol-replan` | Not started |
+| `sol-replan` | Done — revises the failed plan against the evidence; a failed call blocks rather than regenerating |
 | `sol-approve` | Not started |
 
 ## Continuous integration

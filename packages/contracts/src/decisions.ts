@@ -132,34 +132,74 @@ export type SolAdjudicationDecision = z.infer<typeof SolAdjudicationDecision>;
 // ---------------------------------------------------------------------------
 
 /**
+ * A single revision, with the evidence that motivated it.
+ *
+ * Structured rather than a sentence so the diff is reviewable: "what changed"
+ * and "why it addresses the failure" are separate questions, and a prose list
+ * answers neither reliably.
+ */
+export const ReplanChange = z.object({
+  /** What was revised — a route, the brand system, the acceptance criteria. */
+  area: z.string().min(1),
+  change: z.string().min(1),
+  /** Which piece of evidence this answers. */
+  reason: z.string().min(1),
+});
+export type ReplanChange = z.infer<typeof ReplanChange>;
+
+/**
  * What a replan needs to know, assembled by the harness.
  *
- * The current implementation calls the planner again with the original business
- * profile and nothing else, so the revision cannot possibly learn from the
- * failure that triggered it — it is a fresh guess wearing a second attempt's
- * name. Every field here exists because its absence made that true.
+ * The implementation this replaces called the planner again with the business
+ * profile and nothing else, so the revision could not learn from the failure
+ * that triggered it — a fresh guess wearing a second attempt's name. Every
+ * field here exists because its absence made that true.
+ *
+ * The previous plan travels as an object, not a summary. Sol is revising it,
+ * and cannot revise what it has only been told about.
  */
 export const SolReplanRequest = z.object({
-  previousPlanRef: z.string().min(1),
-  reasonForReplan: z.string().min(1),
+  reviewCycle: z.number().int().nonnegative(),
+  previousPlan: SitePlan,
+  /** Verbatim from the authorised adjudication that asked for this. */
+  adjudicationReason: z.string().min(1),
   scope: z.enum(['page', 'design', 'site']),
-  deterministicFailures: z.array(z.string()),
-  reviewFindings: z.array(z.string()),
-  attemptedRepairs: z.array(z.string()),
-  unresolvedDefects: z.array(z.string()),
+  unresolvedDefects: z.array(
+    z.object({
+      id: z.string(),
+      category: z.string(),
+      severity: z.string(),
+      location: z.string(),
+      reason: z.string(),
+    }),
+  ),
+  gateFindings: z.array(z.string()),
+  reviewSummary: z.string().nullable(),
+  repairHistory: z.array(
+    z.object({ defectId: z.string(), fingerprint: z.string(), outcome: z.string() }),
+  ),
   /** Informational. A plan may be trimmed to fit; budgets are not negotiable. */
   remainingBudgets: z.record(z.string(), z.number()),
 });
 export type SolReplanRequest = z.infer<typeof SolReplanRequest>;
 
+/**
+ * The revision, and the reasoning behind it.
+ *
+ * There is no field for a budget, a permission, a credential, a deployment
+ * target or a gate override — and none for the business profile either. A
+ * defect like an unsupported "24/7 emergency service" claim must be answered by
+ * changing what the site says, never by revising the facts it is measured
+ * against. The profile is not reachable from here, so that is structural rather
+ * than a rule Sol is asked to follow.
+ */
 export const SolReplanResult = z.object({
-  /** What was actually wrong with the previous strategy. */
-  diagnosis: z.string().min(1),
-  /** What this revision changes, so the diff is reviewable. */
-  changes: z.array(z.string().min(1)).min(1),
-  /** Accepted facts carried forward untouched. */
-  preserved: z.array(z.string()),
-  plan: SitePlan,
+  /** What was actually wrong with the previous plan. */
+  failureDiagnosis: z.string().min(1),
+  changes: z.array(ReplanChange).min(1),
+  /** What was deliberately left alone, so the diff can be read as intentional. */
+  preservedAreas: z.array(z.string()),
+  revisedPlan: SitePlan,
 });
 export type SolReplanResult = z.infer<typeof SolReplanResult>;
 

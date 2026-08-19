@@ -57,7 +57,7 @@ import {
   type BuildResult,
   type DeployResult,
 } from '@statxai/workspace';
-import { adjudicate } from '@statxai/agents';
+import { adjudicate, replanSite } from '@statxai/agents';
 import {
   authorizeAdjudication,
   fallbackAction,
@@ -67,6 +67,12 @@ import {
   type AdjudicationConstraints,
   type AdjudicationRecord,
 } from './adjudication.js';
+import {
+  planDelta,
+  scopeViolations,
+  type ReplanRecord,
+  type ReplanScope,
+} from './replanning.js';
 import {
   authorizeRoute,
   developerOverride,
@@ -219,6 +225,20 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       level: 'ok',
     });
 
+    await persistPlan(produced);
+    return produced;
+  }
+
+  /**
+   * Store a plan as the next version of `site-plan`.
+   *
+   * Shared by the initial plan and by every revision, so a replan appends to
+   * the history rather than overwriting it: the plan that failed stays readable
+   * next to the one that replaced it, which is what makes the audit trail —
+   * plan v1 → evidence → adjudication → replan decision → plan v2 —
+   * reconstructable.
+   */
+  async function persistPlan(produced: SitePlan): Promise<void> {
     const ref = await registry.put(projectId, 'site-plan', produced);
     await registry.accept(projectId, ref);
     await workspace.materialiseArtifact('design/brand-system.json', produced.brandSystem);
@@ -227,10 +247,140 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       const slug = page.route === HOME_ROUTE ? 'home' : page.route.replace(/^\//, '').replace(/\//g, '_');
       await workspace.materialiseArtifact(`specs/pages/${slug}.json`, page);
     }
-    return produced;
   }
 
   let plan = await producePlan(0);
+
+  /**
+   * Revise the failed specification, or return null.
+   *
+   * Everything the revision needs is passed as a structured runtime value —
+   * the plan object itself, the open defects, the gate findings, the repair
+   * outcomes — rather than reconstructed from progress prose after the fact.
+   *
+   * Returns null when Sol cannot be consulted or its answer does not satisfy
+   * its contract. The caller stops rather than regenerating: falling back to
+   * the planner would reinstate the defect this replaces.
+   */
+  async function revisePlan(context: {
+    scope: ReplanScope;
+    adjudicationReason: string;
+    unresolvedDefects: readonly Defect[];
+    gateFindings: readonly string[];
+    reviewSummary: string | null;
+  }): Promise<SitePlan | null> {
+    const budget = (await store.budgets.findOne({ _id: projectId }))!;
+
+    // Versions are read before the new ones are written, so the record points
+    // at what this revision actually came from.
+    const previousPlanDoc = await store.artifacts.findOne(
+      { projectId, name: 'site-plan' },
+      { sort: { version: -1 } },
+    );
+    const adjudicationDoc = await store.artifacts.findOne(
+      { projectId, name: 'adjudication-decision' },
+      { sort: { version: -1 } },
+    );
+
+    say({
+      phase: 'replan',
+      detail: `Sol is revising the specification (scope ${context.scope}, ${context.unresolvedDefects.length} unresolved)`,
+    });
+
+    const record: ReplanRecord = {
+      reviewCycle,
+      previousPlanVersion: previousPlanDoc?.version ?? null,
+      adjudicationVersion: adjudicationDoc?.version ?? null,
+      adjudicationReason: context.adjudicationReason,
+      scope: context.scope,
+      failureDiagnosis: null,
+      changes: [],
+      preservedAreas: [],
+      delta: null,
+      scopeViolations: [],
+      model: null,
+      modelFailure: null,
+      decidedAt: new Date(),
+    };
+
+    let revisedPlan: SitePlan | null = null;
+
+    try {
+      const replanned = await replanSite(model, {
+        profile,
+        reviewCycle,
+        previousPlan: plan,
+        adjudicationReason: context.adjudicationReason,
+        scope: context.scope,
+        unresolvedDefects: context.unresolvedDefects.map((d) => ({
+          id: d.id,
+          category: d.category,
+          severity: d.severity,
+          location: d.location,
+          reason: d.reason,
+        })),
+        gateFindings: [...context.gateFindings],
+        reviewSummary: context.reviewSummary,
+        repairHistory: [...repairHistory],
+        remainingBudgets: {
+          totalRepairJobs: budget.limits.totalRepairJobs - budget.used.totalRepairJobs,
+          replans: budget.limits.replans - budget.used.replans,
+          reviewRejections: budget.limits.reviewRejections - budget.used.reviewRejections,
+        },
+      });
+      track('sol', replanned);
+
+      revisedPlan = replanned.value.revisedPlan;
+      record.model = replanned.model;
+      record.failureDiagnosis = replanned.value.failureDiagnosis;
+      record.changes = replanned.value.changes;
+      record.preservedAreas = replanned.value.preservedAreas;
+      record.delta = planDelta(plan, revisedPlan);
+      record.scopeViolations = scopeViolations(context.scope, record.delta);
+    } catch (error) {
+      record.modelFailure = error instanceof Error ? error.message : String(error);
+    }
+
+    const ref = await registry.put(projectId, 'replan-decision', record);
+    await registry.accept(projectId, ref);
+    await workspace.materialiseArtifact(
+      `decisions/replan-${String(reviewCycle).padStart(2, '0')}.json`,
+      record,
+    );
+
+    if (!revisedPlan) {
+      say({
+        phase: 'replan',
+        detail: `Sol could not revise the specification: ${record.modelFailure}`,
+        level: 'fail',
+      });
+      return null;
+    }
+
+    if (record.scopeViolations.length > 0) {
+      // Recorded rather than refused: the revision came from the evidence, and
+      // discarding it on a heuristic would block an otherwise usable plan.
+      for (const violation of record.scopeViolations) {
+        say({ phase: 'replan', detail: `Scope exceeded — ${violation}`, level: 'warn' });
+      }
+    }
+
+    // A new version of site-plan, never an overwrite: the plan that failed
+    // stays readable next to the one that replaced it.
+    await persistPlan(revisedPlan);
+
+    const d = record.delta!;
+    say({
+      phase: 'replan',
+      detail:
+        `${record.changes.length} change(s): ` +
+        `+${d.routesAdded.length}/-${d.routesRemoved.length}/~${d.routesRevised.length} routes` +
+        `${d.brandChanged ? ', brand revised' : ''} — ${record.failureDiagnosis}`,
+      level: 'ok',
+    });
+
+    return revisedPlan;
+  }
 
   // -- Phase 3: Build (one-shot first) --------------------------------------
   /**
@@ -781,12 +931,46 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         level: 'warn',
       });
 
+      /**
+       * Sol revises the plan against the evidence that condemned it.
+       *
+       * This used to call the planner again with the business profile and
+       * nothing else, so the revision could not know what broke, what had
+       * already been repaired, or which parts were working — a second guess
+       * drawn from the same inputs as the first.
+       */
+      const scope = (proposedAdjudication?.scope ?? 'site') as ReplanScope;
+      const revised = await revisePlan({
+        scope,
+        adjudicationReason: proposedAdjudication?.reason ?? adjudication.refusal ?? 'unspecified',
+        unresolvedDefects: mustFix,
+        gateFindings: gateRun.findings.map(
+          (f) => `${f.severity} ${f.gate} ${f.location} — ${f.message}`,
+        ),
+        reviewSummary,
+      });
+
+      if (!revised) {
+        /**
+         * A replan that cannot be obtained is not a licence to regenerate.
+         *
+         * Falling back to the original planner would reinstate exactly the
+         * defect this phase removes, and inventing a revision in the harness
+         * would be the harness reasoning semantically in the model's absence.
+         * The budget is already spent, so the run stops with the reason
+         * recorded.
+         */
+        terminalDecision = decideTerminal(openDefects, autonomyMode);
+        say({
+          phase: 'escalate',
+          detail: `Replan could not be produced → ${terminalDecision}`,
+          level: 'fail',
+        });
+        break;
+      }
+
       await workspace.clearSite();
-      // PENDING (Phase 2c, `sol-replan`): this still re-plans from the original
-      // profile with no failure context, so the revision cannot learn from what
-      // triggered it. Sol now decides *that* a replan happens; deciding *what
-      // changes* is the next phase.
-      plan = await producePlan(reviewCycle);
+      plan = revised;
       await buildFromPlan(plan);
       repairedSinceReview = [];
       continue;
