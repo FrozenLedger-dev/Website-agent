@@ -4,14 +4,12 @@ import { defineConfig } from 'vitest/config';
  * The suites that need no infrastructure.
  *
  * Four files connect to a real Mongo replica set, deliberately: the properties
- * they pin are transaction semantics, and mocking the driver would assert only
- * that the code calls the functions it calls. That makes them integration
- * tests, and the defect was never that they exist — it was that `pnpm test`
- * conflated them with the deterministic suites, so there was no way to run one
- * without provisioning the other.
+ * they pin are transaction semantics and end-to-end orchestration, and mocking
+ * the driver would assert only that the code calls the functions it calls.
  *
- * CI runs this config. `pnpm test` still runs everything, which is what a
- * developer with `pnpm db:up` running wants.
+ * They run in CI too, as a separate job driven by `vitest.integration.config.ts`.
+ * The split exists so the two signals stay readable and so a developer without
+ * a replica set can still run the deterministic half.
  */
 export default defineConfig({
   test: {

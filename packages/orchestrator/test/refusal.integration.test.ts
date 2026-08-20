@@ -16,8 +16,8 @@
  * artifact registry, the project state and the result itself — which is the
  * boundary the reporting bugs lived in.
  *
- * Integration: needs the Mongo replica set, so it is excluded from CI along
- * with the other three suites that do.
+ * Integration: needs the Mongo replica set, so it runs in CI's second job
+ * alongside the other three suites that do, not in the deterministic one.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as Agents from '@statxai/agents';

@@ -22,9 +22,16 @@ pnpm agent:run      # or run one project headless from examples/intake.json
 
 `npm` is not available in this environment — use `pnpm` for everything.
 
-`pnpm test` runs everything, including three suites that connect to the local
-Mongo replica set to prove transaction semantics. `pnpm test:unit` runs only
-what needs no infrastructure, which is what CI runs.
+`pnpm test` runs everything. It splits in two, and CI runs both as separate
+jobs:
+
+| Script | Covers | Needs |
+|---|---|---|
+| `pnpm test:unit` | the deterministic suites | nothing |
+| `pnpm test:integration` | four suites that prove transaction semantics and end-to-end orchestration | `pnpm db:up` |
+
+The two partition the inventory exactly: together they run what `pnpm test`
+runs, once each.
 
 ## The console
 

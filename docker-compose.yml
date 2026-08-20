@@ -19,11 +19,19 @@ services:
     volumes:
       - mongo-data:/data/db
     healthcheck:
-      # Idempotently initiates the replica set once mongod accepts connections.
+      # Idempotently initiates the replica set, then reports healthy only once
+      # the node is actually a writable primary.
+      #
+      # A successful `rs.initiate()` was previously treated as healthy on its
+      # own, which it is not: the election has been called but not necessarily
+      # won, so a caller waking on that signal can reach a node that still
+      # refuses writes. The transaction probe would catch it, but as a flaky
+      # failure rather than a wait.
       test: >
         mongosh --port 27018 --quiet --eval "
-          try { rs.status().ok }
-          catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27018'}]}).ok }
+          try { rs.status() }
+          catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27018'}]}) }
+          if (!db.hello().isWritablePrimary) { quit(1) }
         "
       interval: 5s
       timeout: 10s

@@ -1,10 +1,16 @@
 name: CI
 
-# Every push and every pull request, so a green tick means the same three
-# checks passed on a clean machine rather than on a developer's.
+# Every push and every pull request, so a green tick means the checks passed on
+# a clean machine rather than on a developer's.
+#
+# `workflow_dispatch` is here because a ref updated through the API does not
+# always raise the `push` event a workflow listens for, and a CI setup nobody
+# can trigger is indistinguishable from one that is disabled. This makes the
+# Actions tab a way to run it against any ref on demand.
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
