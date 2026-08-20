@@ -9,9 +9,12 @@
  * isolation and nothing asserted the boundary the caller actually sees.
  *
  * This runs the real orchestrator against a real store and asserts the whole
- * `RunResult`, the persisted project state, and that nothing was deployed. The
- * model and the build toolchain are stubbed; the control flow, the artifacts
- * and the result are not.
+ * `RunResult`, the persisted project state, and that nothing was deployed.
+ *
+ * Stubbed: the model tiers, the build toolchain, and deterministic gate
+ * execution. Real: the orchestration control flow, the budget transactions, the
+ * artifact registry, the project state and the result itself — which is the
+ * boundary the reporting bugs lived in.
  *
  * Integration: needs the Mongo replica set, so it is excluded from CI along
  * with the other three suites that do.
@@ -27,8 +30,42 @@ import { join } from 'node:path';
 
 /** Set per test to steer the stubbed approval. */
 let approval: { recommendation: string; reason: string; acknowledgedIssues: string[] };
-/** Review issues the stubbed Terra returns. */
-let reviewIssues: { id: string; category: string; severity: string; location: string; reason: string; acceptanceTest: string; recommendedAction: string; evidence: string[] }[];
+interface ReviewIssue {
+  id: string;
+  category: string;
+  severity: string;
+  location: string;
+  reason: string;
+  acceptanceTest: string;
+  recommendedAction: string;
+  evidence: string[];
+}
+
+/**
+ * Reviews the stubbed Terra returns, consumed in order.
+ *
+ * A sequence rather than a fixed value so a delivery can actually progress:
+ * blocking first, clean after the repair. The last entry repeats, so a run that
+ * loops more than expected does not fall off the end.
+ */
+let reviewSequence: { qualityScore: number; blocking: boolean; issues: ReviewIssue[] }[];
+/** Adjudications the stubbed Sol returns, same convention. */
+let adjudications: { action: string; reason: string; defectIds: string[] | null; objective: null; scope: null }[];
+const repairCalls: string[] = [];
+
+const issue = (over: Partial<ReviewIssue> = {}): ReviewIssue => ({
+  id: 'QA-004',
+  category: 'accessibility',
+  severity: 'P2',
+  location: 'index.html',
+  reason: 'Focus indicator relies on an undefined custom property.',
+  acceptanceTest: 'Focus is visible on every control.',
+  recommendedAction: 'targeted_repair',
+  evidence: [],
+  ...over,
+});
+
+const next = <T>(queue: T[]): T => (queue.length > 1 ? queue.shift()! : queue[0]!);
 const deployCalls: string[] = [];
 
 const PLAN = {
@@ -67,15 +104,31 @@ vi.mock('@statxai/agents', async (importOriginal) => {
       model: 'gpt-5.6-terra',
       ...usage,
     })),
-    reviewSite: vi.fn(async () => ({
-      value: { decision: 'accept', qualityScore: 92, blocking: false, issues: reviewIssues, summary: 's' },
-      model: 'gpt-5.6-terra',
-      ...usage,
-    })),
+    reviewSite: vi.fn(async () => {
+      const r = next(reviewSequence);
+      return {
+        value: {
+          decision: r.blocking ? 'reject' : 'accept',
+          qualityScore: r.qualityScore,
+          blocking: r.blocking,
+          issues: r.issues,
+          summary: 's',
+        },
+        model: 'gpt-5.6-terra',
+        ...usage,
+      };
+    }),
     recommendApproval: vi.fn(async () => ({ value: approval, model: 'gpt-5.6-sol', ...usage })),
-    adjudicate: vi.fn(),
+    adjudicate: vi.fn(async () => ({ value: next(adjudications), model: 'gpt-5.6-sol', ...usage })),
     replanSite: vi.fn(),
-    repairDefect: vi.fn(),
+    repairDefect: vi.fn(async (_client: unknown, _profile: unknown, task: { id: string }) => {
+      repairCalls.push(task.id);
+      return {
+        value: { files: [{ path: 'app/page.tsx', contents: 'export default function P(){return null}' }], notes: '' },
+        model: 'gpt-5.6-luna',
+        ...usage,
+      };
+    }),
   };
 });
 
@@ -143,18 +196,9 @@ afterAll(async () => {
 
 beforeEach(async () => {
   deployCalls.length = 0;
-  reviewIssues = [
-    {
-      id: 'QA-004',
-      category: 'accessibility',
-      severity: 'P2',
-      location: 'index.html',
-      reason: 'Focus indicator relies on an undefined custom property.',
-      acceptanceTest: 'Focus is visible on every control.',
-      recommendedAction: 'targeted_repair',
-      evidence: [],
-    },
-  ];
+  repairCalls.length = 0;
+  reviewSequence = [{ qualityScore: 92, blocking: false, issues: [issue()] }];
+  adjudications = [{ action: 'block', reason: 'unused by default', defectIds: null, objective: null, scope: null }];
   await store.artifacts.deleteMany({});
   await store.runs.deleteMany({});
 });
@@ -180,9 +224,13 @@ describe('a delivery whose release Sol rejects', () => {
     expect(result.outcome).toBe('blocked');
     expect(result.terminalDecision).toBe('mark_blocked');
 
-    // The fields the old late-exit helper zeroed.
+    // The fields the old late-exit helper zeroed. `qualityScore` alone would
+    // catch a wholesale reset, but not a narrower one, so each is asserted at
+    // its actual value — see the repair scenario below for cycles and repairs
+    // with something other than zero to lose.
     expect(result.qualityScore).toBe(92);
-    expect(result.reviewCycles).toBeGreaterThanOrEqual(0);
+    expect(result.reviewCycles).toBe(0);
+    expect(result.repairsApplied).toBe(0);
     expect(result.openDefects.some((d) => d.id === 'QA-004')).toBe(true);
     expect(result.siteRoot).not.toBe('');
     expect(result.siteRoot).toContain(projectId);
@@ -276,5 +324,72 @@ describe('an acceptance that ignores what is still open', () => {
 
     const authDoc = await store.artifacts.findOne({ projectId, name: 'release-authorization' });
     expect((authDoc?.data as { reason?: string })?.reason).toContain('QA-004');
+  });
+});
+
+describe('a delivery that repairs before its release is refused', () => {
+  /**
+   * The scenario with something other than zero to lose.
+   *
+   * The earlier cases catch a wholesale reset because `qualityScore` is 92, but
+   * they leave `reviewCycles` and `repairsApplied` legitimately at zero — so a
+   * narrower regression that dropped only those would pass. Here a P1 is raised,
+   * adjudicated to a repair, repaired, and the next evaluation comes back clean
+   * apart from a P2, which Sol then refuses to ship.
+   */
+  beforeEach(() => {
+    reviewSequence = [
+      // First pass: a blocking defect, so adjudication runs.
+      {
+        qualityScore: 71,
+        blocking: true,
+        issues: [
+          issue({
+            id: 'QA-001',
+            severity: 'P1',
+            category: 'business_accuracy',
+            reason: 'States a guarantee the profile does not support.',
+          }),
+        ],
+      },
+      // After the repair: only the cosmetic issue remains.
+      { qualityScore: 88, blocking: false, issues: [issue()] },
+    ];
+    adjudications = [
+      { action: 'repair', reason: 'One local unsupported claim.', defectIds: ['QA-001'], objective: null, scope: null },
+    ];
+    approval = {
+      recommendation: 'reject',
+      reason: 'The focus indicator problem should be fixed before release.',
+      acknowledgedIssues: [],
+    };
+  });
+
+  it('reports the cycles and repairs it actually performed', async () => {
+    const result = await run('proj_refusal_repaired', 'full_autonomous');
+
+    expect(repairCalls).toEqual(['QA-001']);
+    expect(result.reviewCycles).toBe(1);
+    expect(result.repairsApplied).toBe(1);
+
+    // And the rest of the boundary, at its real values rather than defaults.
+    expect(result.outcome).toBe('blocked');
+    expect(result.terminalDecision).toBe('mark_blocked');
+    expect(result.qualityScore).toBe(88);
+    expect(result.openDefects.some((d) => d.id === 'QA-004')).toBe(true);
+    expect(result.openDefects.some((d) => d.id === 'QA-001')).toBe(false);
+    expect(result.commit).not.toBeNull();
+    expect(result.siteRoot).toContain('proj_refusal_repaired');
+    expect(deployCalls).toEqual([]);
+  });
+
+  it('spent the budgets the work required', async () => {
+    const projectId = 'proj_refusal_repaired_budget';
+    await run(projectId, 'full_autonomous');
+
+    const budget = await store.budgets.findOne({ _id: projectId });
+    expect(budget?.used.reviewRejections).toBe(1);
+    expect(budget?.used.totalRepairJobs).toBe(1);
+    expect(budget?.used.replans).toBe(0);
   });
 });

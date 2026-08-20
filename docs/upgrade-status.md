@@ -89,63 +89,29 @@ specification is wrong, which is the judgement the harness failed to obtain.
 `.github/workflows/ci.yml` runs typecheck, lint and `pnpm test:unit` on every
 push and pull request. It provisions nothing and holds no credentials.
 
-**Known gap.** Four suites — `packages/state/test/budgets.test.ts`,
-`packages/job-engine/test/engine.test.ts` and
-`packages/workspace/test/workspace.test.ts` and
-`packages/orchestrator/test/refusal.integration.test.ts`, 43 tests — connect to
-a real Mongo replica set and are not covered by CI. They are integration tests by intent: the
-properties they pin are transaction semantics, and mocking the driver would
-assert only that the code calls the functions it calls. Among them is the guard
-on the `$expr` budget filter, which is the single most important invariant in
-the repository, so a green tick does **not** mean that invariant was checked.
+CI runs two jobs, so the signals stay separable:
 
-Closing it means giving CI a Mongo service container initialised as a
-single-node replica set. That is a deliberate later decision, not an oversight.
+| Job | Runs | Needs |
+|---|---|---|
+| Typecheck, lint and unit tests | `pnpm test:unit` — 357 | nothing |
+| Mongo integration tests | `pnpm test:integration` — 45 | the compose replica set |
 
-### Release provenance, settled during Phase 2d
+Together they cover the whole inventory exactly once: 357 + 45 = 402, which is
+what `pnpm test` runs. The integration job starts the same `docker-compose`
+service developers use, waits for the healthcheck that initiates the replica
+set, and proves the deployment accepts transactions before running anything —
+the failure mode is otherwise silent, and a suite that quietly skipped would
+look identical to one that passed.
 
-The manifest recorded `approvedBy: "sol:machine-approval"` for a decision no
-model was consulted about — the harness checked that no blocking defect remained
-and wrote Sol's name on its own arithmetic. That field is gone.
-
-In its place, two: `recommendation` names Sol, its model and the artifact
-version of its judgement; `authorization` names `harness-policy`, the policy
-version and the action taken. Both authors are fixed by a literal in the schema,
-so neither can be recorded as the other, and there is no field left in which a
-model appears to have authorised or executed a release.
-
-The harness checks deterministic facts — build, blocking defects, gates —
-*before* reading the recommendation, so a model saying `accept` over a failing
-gate never reaches the release path. A missing recommendation is not an
-approval: full autonomy stops, and modes with a human defer to one.
-
-### An acceptance must account for what is open
-
-`acknowledgedIssues` is the stated basis on which a site ships with known
-defects, so an `accept` that omits an open non-blocking issue is refused. The
-first version detected ids Sol invented but not issues it simply left out, which
-catches only the careless half: a recommendation silent about three open P2s
-reads identically to one that never looked.
-
-Invented ids are still recorded rather than refused — they are a data-quality
-signal, not the basis of the decision — while omissions block.
-
-### A deliberate semantic, flagged rather than settled
-
-With no deployment target configured, `authorizeRelease` returns
-`{authorized: true, action: 'release'}` and the project is marked `released`
-against local preview. "Released" therefore currently means *machine-accepted
-and authorised*, not *published to a host*.
-
-That is the intended reading for now, and the tests require it. If it should
-instead mean *published*, the change belongs in the policy-engine phase as a
-deliberate decision, not as an incidental consequence of one of its refactors.
+Neither job holds a credential. No OpenAI key, no deployment token, no
+`.env.local`.
 
 ## Phase 3 — Policy engine — **IN PROGRESS**
 
 | Item | Status |
 |---|---|
-| End-to-end refusal regression test | Done — `refusal.integration.test.ts` |
+| End-to-end refusal regression test | Done — `refusal.integration.test.ts`, 13 tests |
+| CI covers the Mongo-backed suites | Done — a second job, so nothing is outside CI |
 | Extract scattered harness policy into a policy layer | Not started |
 
 The regression test is the opening safety net. The last three defects in the

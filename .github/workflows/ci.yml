@@ -43,10 +43,61 @@ jobs:
       - name: Lint
         run: pnpm lint
 
-      # `pnpm test` also runs three suites that connect to a real Mongo replica
-      # set to prove transaction semantics. They are deliberately not mocked and
-      # deliberately not run here: this job provisions nothing and holds no
-      # credentials, so a green tick means the deterministic checks passed and
-      # says nothing about the integration suites.
+      # The Mongo-backed suites run in the integration job below, so the two
+      # together cover the whole inventory exactly once. This job provisions
+      # nothing and holds no credentials.
       - name: Unit tests (no external infrastructure)
         run: pnpm test:unit
+
+  integration:
+    name: Mongo integration tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.18.0
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The same compose service developers use. It runs a single-node replica
+      # set rather than a standalone, which is not a preference: the budget
+      # guarantees depend on multi-document transactions, and a standalone
+      # mongod cannot run them. `--wait` holds until the healthcheck that
+      # initiates the replica set reports healthy, so the tests never race the
+      # election.
+      - name: Start MongoDB
+        run: docker compose up -d --wait mongo
+
+      # Proves the transaction capability rather than assuming it — the failure
+      # mode is otherwise silent, and a suite that quietly skipped would look
+      # identical to one that passed.
+      #
+      # Invoked directly rather than through `pnpm db:check`, which loads
+      # `.env.local` via `--env-file`; that flag fails outright on a missing
+      # file, and CI has no such file and needs no secrets. The URI is the one
+      # docker-compose publishes.
+      - name: Verify the replica set accepts transactions
+        env:
+          MONGODB_URI: mongodb://localhost:27018/statxai_test?replicaSet=rs0
+        run: node --import tsx scripts/db-check.ts
+
+      - name: Integration tests
+        env:
+          MONGODB_URI: mongodb://localhost:27018/statxai_test?replicaSet=rs0
+        run: pnpm test:integration
+
+      - name: Stop MongoDB
+        if: always()
+        run: docker compose down -v
