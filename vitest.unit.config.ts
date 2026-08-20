@@ -3,7 +3,7 @@ import { defineConfig } from 'vitest/config';
 /**
  * The suites that need no infrastructure.
  *
- * Three files connect to a real Mongo replica set, deliberately: the properties
+ * Four files connect to a real Mongo replica set, deliberately: the properties
  * they pin are transaction semantics, and mocking the driver would assert only
  * that the code calls the functions it calls. That makes them integration
  * tests, and the defect was never that they exist — it was that `pnpm test`
@@ -21,6 +21,7 @@ export default defineConfig({
       'packages/state/test/budgets.test.ts',
       'packages/job-engine/test/engine.test.ts',
       'packages/workspace/test/workspace.test.ts',
+      'packages/orchestrator/test/refusal.integration.test.ts',
     ],
     testTimeout: 20_000,
     hookTimeout: 30_000,

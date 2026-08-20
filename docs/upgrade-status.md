@@ -89,10 +89,11 @@ specification is wrong, which is the judgement the harness failed to obtain.
 `.github/workflows/ci.yml` runs typecheck, lint and `pnpm test:unit` on every
 push and pull request. It provisions nothing and holds no credentials.
 
-**Known gap.** Three suites — `packages/state/test/budgets.test.ts`,
+**Known gap.** Four suites — `packages/state/test/budgets.test.ts`,
 `packages/job-engine/test/engine.test.ts` and
-`packages/workspace/test/workspace.test.ts`, 32 tests — connect to a real Mongo
-replica set and are not covered by CI. They are integration tests by intent: the
+`packages/workspace/test/workspace.test.ts` and
+`packages/orchestrator/test/refusal.integration.test.ts`, 43 tests — connect to
+a real Mongo replica set and are not covered by CI. They are integration tests by intent: the
 properties they pin are transaction semantics, and mocking the driver would
 assert only that the code calls the functions it calls. Among them is the guard
 on the `$expr` budget filter, which is the single most important invariant in
@@ -140,6 +141,25 @@ That is the intended reading for now, and the tests require it. If it should
 instead mean *published*, the change belongs in the policy-engine phase as a
 deliberate decision, not as an incidental consequence of one of its refactors.
 
-## Phases 3–17
+## Phase 3 — Policy engine — **IN PROGRESS**
+
+| Item | Status |
+|---|---|
+| End-to-end refusal regression test | Done — `refusal.integration.test.ts` |
+| Extract scattered harness policy into a policy layer | Not started |
+
+The regression test is the opening safety net. The last three defects in the
+approval area were all in the *result* rather than the decision — zeroed
+telemetry, a dropped terminal outcome, and a denied release reporting itself as
+`accept_non_blocking` — and every one was found by reading code, because each
+test checked a piece in isolation while nothing asserted the boundary the caller
+sees.
+
+It runs the real orchestrator against a real store with the model and the build
+toolchain stubbed, and asserts the whole `RunResult`, the persisted project
+state, the artifacts, and that nothing deployed. Verified by mutation:
+reintroducing the `accept_non_blocking` mapping fails four of its assertions.
+
+## Phases 4–17
 
 Not started.
