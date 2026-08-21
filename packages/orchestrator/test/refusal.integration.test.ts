@@ -584,3 +584,179 @@ describe('a repair naming more defects than the project allowance can pay for', 
     expect(repairCalls).toHaveLength(8);
   });
 });
+
+describe('an adjudication artifact explains its own decision', () => {
+  /**
+   * Policy is deterministic, which is only worth something if the record keeps
+   * the inputs. The snapshot first kept just the defect ids — and the merged
+   * defect, carrying the fingerprint the repair budget is charged against, is
+   * computed in the orchestrator and stored nowhere else: `test-report` has the
+   * raw gate findings and `visual-review` the raw reviewer value. So an
+   * artifact could not explain why one target was kept and another trimmed
+   * without recomputing the merge from two other artifacts.
+   *
+   * Each persisted decision is replayed back through the policy engine and must
+   * reproduce what was recorded. Two scenarios, because the two facts the
+   * snapshot gained bind in different places: severity decides a capacity trim,
+   * and fingerprint decides per-defect exhaustion.
+   */
+  const replayAll = async (projectId: string) => {
+    const { legalAdjudicationActions, authorizeAdjudication } = await import(
+      '@statxai/policy-engine'
+    );
+
+    await run(projectId, 'full_autonomous');
+
+    const decisions = await store.artifacts
+      .find({ projectId, name: 'adjudication-decision' })
+      .sort({ version: 1 })
+      .toArray();
+
+    expect(decisions.length).toBeGreaterThan(1);
+
+    for (const [cycle, doc] of decisions.entries()) {
+      const record = doc.data as {
+        action: string;
+        source: string;
+        refusal: string | null;
+        targetDefectIds: string[];
+        legalActions: string[];
+        constraints: Parameters<typeof legalAdjudicationActions>[0];
+        proposed: { action: string; defectIds: string[] } | null;
+      };
+
+      // The recorded constraints alone must reproduce the legal set...
+      expect(legalAdjudicationActions(record.constraints), `cycle ${cycle} legal`).toEqual(
+        record.legalActions,
+      );
+
+      // ...and, with Sol's own words, the authorisation that followed.
+      if (!record.proposed) continue;
+      const replayed = authorizeAdjudication(
+        { action: record.proposed.action as 'repair', defectIds: record.proposed.defectIds },
+        record.legalActions as 'repair'[],
+        record.constraints,
+      );
+
+      expect(replayed.action, `cycle ${cycle} action`).toBe(record.action);
+      expect(replayed.source, `cycle ${cycle} source`).toBe(record.source);
+      expect(replayed.targetIds, `cycle ${cycle} targets`).toEqual(record.targetDefectIds);
+      expect(replayed.refusal, `cycle ${cycle} refusal`).toBe(record.refusal);
+    }
+
+    return decisions;
+  };
+
+  const claim = (id: string, severity: 'P0' | 'P1', index: number) =>
+    issue({
+      id,
+      severity,
+      category: 'business_accuracy',
+      location: `page-${index}.html`,
+      reason: `Unsupported guarantee (${id}).`,
+    });
+
+  describe('a decision whose targets were trimmed for capacity', () => {
+    /**
+     * Five defects against the default budget: cycle one spends five of eight,
+     * and cycle two has three units for five named defects — so the trim runs,
+     * and it runs on severity.
+     *
+     * `QA-E` is the P0 deliberately: it sorts last by id, so a replay that lost
+     * severity would keep a different pair and this would fail.
+     */
+    const FIVE = ['QA-A', 'QA-B', 'QA-C', 'QA-D', 'QA-E'];
+
+    beforeEach(() => {
+      const blockers = () => FIVE.map((id, i) => claim(id, id === 'QA-E' ? 'P0' : 'P1', i));
+      reviewSequence = [
+        { qualityScore: 51, blocking: true, issues: blockers() },
+        { qualityScore: 54, blocking: true, issues: blockers() },
+        { qualityScore: 57, blocking: true, issues: blockers() },
+      ];
+      adjudications = FIVE.map(() => ({
+        action: 'repair',
+        reason: 'All five are local unsupported claims.',
+        defectIds: [...FIVE],
+        objective: null,
+        scope: null,
+      }));
+      approval = { recommendation: 'accept', reason: 'unused', acknowledgedIssues: [] };
+    });
+
+    it('replays to the same decision', async () => {
+      const decisions = await replayAll('proj_replay_capacity');
+
+      // The trim really happened, and severity really chose: the P0 survives a
+      // cut that id order alone would have dropped it from.
+      const second = decisions[1]?.data as { targetDefectIds: string[] };
+      expect(second.targetDefectIds).toHaveLength(3);
+      expect(second.targetDefectIds).toContain('QA-E');
+    });
+  });
+
+  describe('a decision refused because the fingerprints were spent', () => {
+    /**
+     * Three defects, so the project allowance never binds first: each spends its
+     * own two attempts over two cycles, and the third adjudication is refused on
+     * per-fingerprint exhaustion alone. A replay that lost the fingerprint would
+     * read every defect as fresh and offer repair.
+     */
+    const THREE = ['QA-A', 'QA-B', 'QA-C'];
+
+    beforeEach(() => {
+      const blockers = () => THREE.map((id, i) => claim(id, 'P1', i));
+      reviewSequence = [
+        { qualityScore: 51, blocking: true, issues: blockers() },
+        { qualityScore: 54, blocking: true, issues: blockers() },
+        { qualityScore: 57, blocking: true, issues: blockers() },
+      ];
+      adjudications = THREE.map(() => ({
+        action: 'repair',
+        reason: 'All three are local unsupported claims.',
+        defectIds: [...THREE],
+        objective: null,
+        scope: null,
+      }));
+      approval = { recommendation: 'accept', reason: 'unused', acknowledgedIssues: [] };
+    });
+
+    it('replays to the same decision', async () => {
+      const decisions = await replayAll('proj_replay_exhaustion');
+
+      // Repair was withdrawn on per-defect grounds, with project budget left.
+      const last = decisions.at(-1)?.data as {
+        legalActions: string[];
+        constraints: { repairsLeft: number };
+      };
+      expect(last.legalActions).not.toContain('repair');
+      expect(last.constraints.repairsLeft).toBeGreaterThan(0);
+    });
+  });
+
+  it('carries the policy input for each defect, and nothing beyond it', async () => {
+    reviewSequence = [
+      { qualityScore: 51, blocking: true, issues: [claim('QA-A', 'P1', 0)] },
+      { qualityScore: 88, blocking: false, issues: [issue()] },
+    ];
+    adjudications = [
+      { action: 'repair', reason: 'One claim.', defectIds: ['QA-A'], objective: null, scope: null },
+    ];
+    approval = { recommendation: 'reject', reason: 'unused', acknowledgedIssues: [] };
+
+    const projectId = 'proj_replay_shape';
+    await run(projectId, 'full_autonomous');
+
+    const doc = await store.artifacts.findOne({ projectId, name: 'adjudication-decision' });
+    const blocking = (doc?.data as { constraints: { blockingDefects: unknown[] } }).constraints
+      .blockingDefects as { id: string; severity: string; fingerprint: string }[];
+
+    expect(blocking).toHaveLength(1);
+    expect(blocking[0]?.severity).toMatch(/^P[0-3]$/);
+    expect(blocking[0]?.fingerprint).toBeTruthy();
+
+    // The reviewer's prose stays on the review outcome rather than being copied
+    // into every adjudication: only what a policy rule reads goes in.
+    expect(Object.keys(blocking[0]!).sort()).toEqual(['fingerprint', 'id', 'severity']);
+  });
+});

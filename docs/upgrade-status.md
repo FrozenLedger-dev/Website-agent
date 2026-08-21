@@ -94,9 +94,9 @@ CI runs two jobs, so the signals stay separable:
 | Job | Runs | Needs |
 |---|---|---|
 | Typecheck, lint and unit tests | `pnpm test:unit` — 415 | nothing |
-| Mongo integration tests | `pnpm test:integration` — 50 | the compose replica set |
+| Mongo integration tests | `pnpm test:integration` — 53 | the compose replica set |
 
-Together they cover the whole inventory exactly once: 415 + 50 = 465, which is
+Together they cover the whole inventory exactly once: 415 + 53 = 468, which is
 what `pnpm test` runs. The integration job starts the same `docker-compose`
 service developers use, waits for the healthcheck that initiates the replica
 set, and proves the deployment accepts transactions before running anything —
@@ -230,10 +230,32 @@ and policy answers the question it was always being asked:
 - the fallback repairs an *eligible* blocker, not merely the most severe — the
   same failure was reachable from the recovery path.
 
-The persisted constraint snapshot keeps `blockingDefectIds` rather than the
-defects themselves; they already live on the review outcome for the same cycle.
-It keeps `repairsUsedByFingerprint` in full, because that is the evidence for
-why an action was not offered.
+### An artifact that explains its own decision
+
+The persisted snapshot first kept only the defect ids, on the reasoning that the
+defects in full already lived on the review outcome. That was wrong.
+`test-report` holds the raw gate findings and `visual-review` the raw reviewer
+value; the *merged* defect — the one policy sees, carrying the fingerprint the
+repair budget is charged against — is produced by `mergeByFingerprint` and
+existed only in memory. So an adjudication artifact could not explain why one
+target was kept and another trimmed without recomputing the merge from two other
+artifacts.
+
+It now carries the minimal policy input per blocking defect: id, severity and
+fingerprint. The verbose fields stay out — they really are on the review
+outcome, and no policy rule reads them.
+
+Nothing derived is stored. `repairEligibility` and `maxRepairTargets` are
+functions of the recorded fields, so a copy could only ever disagree with them.
+Instead, an integration test replays every persisted decision back through the
+policy engine and asserts it reproduces the recorded `legalActions`, action,
+source, targets and refusal — which proves the snapshot is sufficient rather
+than asserting it.
+
+Two scenarios, because the two new fields bind in different places: severity
+decides a capacity trim, fingerprint decides per-defect exhaustion. Verified by
+dropping each independently — severity alone fails the trim replay, fingerprint
+alone fails the exhaustion replay.
 
 ### Both budgets, not one
 
