@@ -17,13 +17,16 @@ import {
   fallbackAction,
   firstBlockerId,
   legalAdjudicationActions,
+  repairableDefects,
   type AdjudicationConstraints,
   type PolicyDefect,
 } from '../src/adjudication.js';
 
 const constraints = (over: Partial<AdjudicationConstraints> = {}): AdjudicationConstraints => ({
-  blockingCount: 3,
+  blockingDefects: OPEN,
   repairsLeft: 5,
+  repairsPerDefect: 2,
+  repairsUsedByFingerprint: {},
   replansLeft: 2,
   reviewRejectionsLeft: 3,
   previousRepairs: [],
@@ -31,10 +34,15 @@ const constraints = (over: Partial<AdjudicationConstraints> = {}): AdjudicationC
   ...over,
 });
 
-const defect = (id: string, severity: PolicyDefect['severity'] = 'P1'): PolicyDefect => ({
-  id,
-  severity,
-});
+/**
+ * Defects are collapsed by fingerprint before policy sees them, so a distinct
+ * id implies a distinct fingerprint unless a test deliberately says otherwise.
+ */
+const defect = (
+  id: string,
+  severity: PolicyDefect['severity'] = 'P1',
+  fingerprint = `fp:${id}`,
+): PolicyDefect => ({ id, severity, fingerprint });
 
 const OPEN = [defect('GATE-001'), defect('GATE-002'), defect('GATE-003')];
 
@@ -87,7 +95,7 @@ describe('authorising Sol', () => {
   const legal = legalAdjudicationActions(constraints());
 
   it('follows a repair naming open defects, and scopes to exactly those', () => {
-    const auth = authorizeAdjudication(decision({ defectIds: ['GATE-001', 'GATE-003'] }), legal, OPEN);
+    const auth = authorizeAdjudication(decision({ defectIds: ['GATE-001', 'GATE-003'] }), legal, constraints());
 
     expect(auth.source).toBe('sol');
     expect(auth.action).toBe('repair');
@@ -98,14 +106,12 @@ describe('authorising Sol', () => {
   it('follows a replan', () => {
     const auth = authorizeAdjudication(
       decision({ action: 'replan', defectIds: null, scope: 'site' }),
-      legal,
-      OPEN,
-    );
+      legal, constraints());
     expect(auth).toMatchObject({ action: 'replan', source: 'sol', targetIds: [] });
   });
 
   it('follows a block', () => {
-    const auth = authorizeAdjudication(decision({ action: 'block', defectIds: null }), legal, OPEN);
+    const auth = authorizeAdjudication(decision({ action: 'block', defectIds: null }), legal, constraints());
     expect(auth).toMatchObject({ action: 'block', source: 'sol' });
   });
 
@@ -114,9 +120,7 @@ describe('authorising Sol', () => {
     const withoutReplan = legalAdjudicationActions(constraints({ replansLeft: 0 }));
     const auth = authorizeAdjudication(
       decision({ action: 'replan', defectIds: null, scope: 'site' }),
-      withoutReplan,
-      OPEN,
-    );
+      withoutReplan, constraints());
 
     expect(auth.source).toBe('fallback');
     expect(auth.action).toBe('repair');
@@ -125,7 +129,7 @@ describe('authorising Sol', () => {
 
   it('refuses a repair naming defects nobody raised', () => {
     // Otherwise the budget is spent on a fingerprint that does not exist.
-    const auth = authorizeAdjudication(decision({ defectIds: ['GATE-999'] }), legal, OPEN);
+    const auth = authorizeAdjudication(decision({ defectIds: ['GATE-999'] }), legal, constraints());
 
     expect(auth.source).toBe('fallback');
     expect(auth.refusal).toContain('named no open blocking defect');
@@ -134,9 +138,7 @@ describe('authorising Sol', () => {
   it('honours the recognised part of a partly-unknown list, and records the rest', () => {
     const auth = authorizeAdjudication(
       decision({ defectIds: ['GATE-002', 'GATE-999'] }),
-      legal,
-      OPEN,
-    );
+      legal, constraints());
 
     expect(auth.source).toBe('sol');
     expect(auth.targetIds).toEqual(['GATE-002']);
@@ -147,7 +149,7 @@ describe('authorising Sol', () => {
     // Repairing everything in a fallback is a broad semantic choice made by
     // nobody: it spends a repair job per defect on a batch no one reasoned
     // about, on a run whose adjudication has already failed.
-    const auth = authorizeAdjudication(decision({ defectIds: ['GATE-999'] }), legal, OPEN);
+    const auth = authorizeAdjudication(decision({ defectIds: ['GATE-999'] }), legal, constraints());
 
     expect(auth.source).toBe('fallback');
     expect(auth.targetIds).toHaveLength(1);
@@ -157,9 +159,7 @@ describe('authorising Sol', () => {
     // The single-blocker rule constrains the fallback only.
     const auth = authorizeAdjudication(
       decision({ defectIds: ['GATE-001', 'GATE-002', 'GATE-003'] }),
-      legal,
-      OPEN,
-    );
+      legal, constraints());
     expect(auth.source).toBe('sol');
     expect(auth.targetIds).toHaveLength(3);
   });
@@ -231,7 +231,7 @@ describe('a lost adjudication cannot trigger a rebuild', () => {
     // Sol asks for something the harness did not offer while replan is the only
     // other action with budget. The refusal must not become a rebuild.
     const legal = legalAdjudicationActions(constraints({ repairsLeft: 0 }));
-    const auth = authorizeAdjudication(sol({ action: 'repair', defectIds: ['GATE-001'], scope: null }), legal, OPEN);
+    const auth = authorizeAdjudication(sol({ action: 'repair', defectIds: ['GATE-001'], scope: null }), legal, constraints());
 
     expect(auth.source).toBe('fallback');
     expect(auth.action).toBe('block');
@@ -241,7 +241,7 @@ describe('a lost adjudication cannot trigger a rebuild', () => {
   it('a replan Sol actually chose still runs', () => {
     // The restriction is on the fallback, not on replanning itself.
     const legal = legalAdjudicationActions(constraints());
-    const auth = authorizeAdjudication(sol(), legal, OPEN);
+    const auth = authorizeAdjudication(sol(), legal, constraints());
 
     expect(auth).toMatchObject({ action: 'replan', source: 'sol', refusal: null });
   });
@@ -265,13 +265,13 @@ describe('what adjudication cannot do', () => {
   it('leaves budget spending to the harness', () => {
     // The authorisation names an action and its targets. Nothing about it
     // mutates a counter; that happens transactionally in the orchestrator.
-    const auth = authorizeAdjudication(decision(), legalAdjudicationActions(constraints()), OPEN);
+    const auth = authorizeAdjudication(decision(), legalAdjudicationActions(constraints()), constraints());
     expect(Object.keys(auth).sort()).toEqual(['action', 'refusal', 'source', 'targetIds']);
   });
 });
 
 describe('choosing the one defect a fallback repairs', () => {
-  const at = (id: string, severity: 'P0' | 'P1'): PolicyDefect => ({ id, severity });
+  const at = (id: string, severity: 'P0' | 'P1'): PolicyDefect => defect(id, severity);
 
   it('takes the most severe blocker', () => {
     const picked = firstBlockerId([at('B', 'P1'), at('A', 'P0')]);
@@ -321,5 +321,177 @@ describe('a rejection is a rejection, whatever answers it', () => {
     expect(
       legalAdjudicationActions(constraints({ reviewRejectionsLeft: 2, repairsLeft: 0 })),
     ).toEqual(['replan', 'block']);
+  });
+});
+
+describe('per-defect repair eligibility', () => {
+  /**
+   * `totalRepairJobs` is a project-wide allowance; `repairsPerDefect` is a
+   * per-fingerprint one that outlives a cycle. Having the first does not imply
+   * having the second, and policy used to reason only about the first — so it
+   * offered `repair`, Sol chose it, and `spendRepairAttempt` then refused each
+   * target in turn. The cycle spent a review rejection to repair nothing.
+   */
+  const spent = (fingerprints: string[]) =>
+    Object.fromEntries(fingerprints.map((f) => [f, 2]));
+
+  describe('which defects can still be charged for', () => {
+    it('counts a fingerprint nobody has repaired as eligible', () => {
+      // A missing key means none used, not "unknown, assume spent".
+      expect(
+        repairableDefects(OPEN, { repairsPerDefect: 2, repairsUsedByFingerprint: {} }),
+      ).toHaveLength(3);
+    });
+
+    it('excludes a fingerprint that has reached the limit', () => {
+      const eligible = repairableDefects(OPEN, {
+        repairsPerDefect: 2,
+        repairsUsedByFingerprint: { 'fp:GATE-002': 2 },
+      });
+      expect(eligible.map((d) => d.id)).toEqual(['GATE-001', 'GATE-003']);
+    });
+
+    it('treats the limit as exclusive, matching the guarded increment', () => {
+      // `spendRepairAttempt` matches on `repairsUsed < repairsPerDefect`, so
+      // one below the limit is still spendable and exactly at it is not.
+      const at = (used: number) =>
+        repairableDefects([defect('A')], {
+          repairsPerDefect: 2,
+          repairsUsedByFingerprint: { 'fp:A': used },
+        }).length;
+
+      expect(at(0)).toBe(1);
+      expect(at(1)).toBe(1);
+      expect(at(2)).toBe(0);
+      expect(at(3)).toBe(0);
+    });
+
+    it('keys on the fingerprint, not the id', () => {
+      // The budget survives a reviewer rephrasing the defect into a new id.
+      const renamed = defect('GATE-999', 'P1', 'fp:GATE-001');
+      expect(
+        repairableDefects([renamed], {
+          repairsPerDefect: 2,
+          repairsUsedByFingerprint: { 'fp:GATE-001': 2 },
+        }),
+      ).toEqual([]);
+    });
+  });
+
+  describe('what gets offered', () => {
+    it('withdraws repair when every blocker has spent its own allowance', () => {
+      // The defect this commit fixes. Project budget remains, so the old rule
+      // offered repair here and nothing could be charged for.
+      const c = constraints({
+        repairsLeft: 5,
+        repairsUsedByFingerprint: spent(['fp:GATE-001', 'fp:GATE-002', 'fp:GATE-003']),
+      });
+
+      expect(c.repairsLeft).toBeGreaterThan(0);
+      expect(legalAdjudicationActions(c)).toEqual(['replan', 'block']);
+    });
+
+    it('still offers repair while one blocker can be charged for', () => {
+      const c = constraints({
+        repairsUsedByFingerprint: spent(['fp:GATE-001', 'fp:GATE-003']),
+      });
+      expect(legalAdjudicationActions(c)).toContain('repair');
+    });
+
+    it('withdraws repair when the project allowance is gone, whatever the defects have left', () => {
+      // The other direction, unchanged: both allowances have to hold.
+      const c = constraints({ repairsLeft: 0, repairsUsedByFingerprint: {} });
+      expect(legalAdjudicationActions(c)).not.toContain('repair');
+    });
+
+    it('withdraws repair when nothing is blocking, as before', () => {
+      expect(legalAdjudicationActions(constraints({ blockingDefects: [] }))).toEqual([
+        'replan',
+        'block',
+      ]);
+    });
+  });
+
+  describe('what gets authorised', () => {
+    it('drops an exhausted target, keeps the rest, and says which it dropped', () => {
+      const c = constraints({ repairsUsedByFingerprint: spent(['fp:GATE-002']) });
+      const auth = authorizeAdjudication(
+        decision({ defectIds: ['GATE-001', 'GATE-002'] }),
+        legalAdjudicationActions(c),
+        c,
+      );
+
+      expect(auth.source).toBe('sol');
+      expect(auth.targetIds).toEqual(['GATE-001']);
+      expect(auth.refusal).toContain('GATE-002');
+    });
+
+    it('falls back when Sol names only defects whose allowance is spent', () => {
+      // Previously these were handed to Luna and refused one at a time inside
+      // the transaction, after the cycle had already been committed to.
+      const c = constraints({ repairsUsedByFingerprint: spent(['fp:GATE-002']) });
+      const auth = authorizeAdjudication(
+        decision({ defectIds: ['GATE-002'] }),
+        legalAdjudicationActions(c),
+        c,
+      );
+
+      expect(auth.source).toBe('fallback');
+      expect(auth.refusal).toContain('per-defect budget is spent');
+      expect(auth.targetIds).not.toContain('GATE-002');
+    });
+
+    it('never authorises a target that cannot be charged for', () => {
+      // The property behind the cases above, over every subset of exhaustion.
+      const ids = ['GATE-001', 'GATE-002', 'GATE-003'];
+      for (let mask = 0; mask < 8; mask += 1) {
+        const exhausted = ids.filter((_, i) => (mask >> i) & 1);
+        const c = constraints({ repairsUsedByFingerprint: spent(exhausted.map((id) => `fp:${id}`)) });
+        const auth = authorizeAdjudication(
+          decision({ defectIds: ids }),
+          legalAdjudicationActions(c),
+          c,
+        );
+
+        for (const id of auth.targetIds) {
+          expect(exhausted, `authorised ${id} with mask ${mask}`).not.toContain(id);
+        }
+      }
+    });
+
+    it('falls back to a blocker that can be repaired, not merely the most severe', () => {
+      // The fallback takes the most severe blocker. If that one is exhausted it
+      // has to take the next, or a refused adjudication spends a cycle doing
+      // nothing — the same failure, reached from the recovery path.
+      const worst = defect('A', 'P0');
+      const rest = defect('B', 'P1');
+      const c = constraints({
+        blockingDefects: [worst, rest],
+        repairsUsedByFingerprint: spent(['fp:A']),
+      });
+      const auth = authorizeAdjudication(
+        decision({ defectIds: ['GATE-999'] }),
+        legalAdjudicationActions(c),
+        c,
+      );
+
+      expect(auth.source).toBe('fallback');
+      expect(auth.action).toBe('repair');
+      expect(auth.targetIds).toEqual(['B']);
+    });
+
+    it('blocks rather than repairing nothing when no blocker is eligible', () => {
+      const c = constraints({
+        repairsUsedByFingerprint: spent(['fp:GATE-001', 'fp:GATE-002', 'fp:GATE-003']),
+      });
+      const auth = authorizeAdjudication(
+        decision({ defectIds: ['GATE-001'] }),
+        legalAdjudicationActions(c),
+        c,
+      );
+
+      expect(auth.action).toBe('block');
+      expect(auth.targetIds).toEqual([]);
+    });
   });
 });

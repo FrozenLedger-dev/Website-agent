@@ -393,3 +393,115 @@ describe('a delivery that repairs before its release is refused', () => {
     expect(budget?.used.replans).toBe(0);
   });
 });
+
+describe('a defect that has spent its own repair allowance', () => {
+  /**
+   * `totalRepairJobs` is a project-wide allowance and `repairsPerDefect` is a
+   * per-fingerprint one, and having the first does not imply having the second.
+   * Policy used to reason only about the first, so a third cycle on the same
+   * stubborn defect was authorised as a repair, reached `spendRepairAttempt`,
+   * and was refused there — after the cycle had already been committed to.
+   *
+   * The same P1 comes back each time. `repairsPerDefect` is 2, so the third
+   * adjudication must no longer be offered a repair it cannot be charged for.
+   *
+   * The cost of getting this wrong is a whole extra cycle: the run used to
+   * adjudicate a third repair, fail to charge for it, evaluate again, and only
+   * then block with its review-rejection allowance gone. So these assert the
+   * *number* of cycles as much as their content — the old behaviour reached the
+   * same ending, one wasted rejection later.
+   */
+  const stubborn = () =>
+    issue({
+      id: 'QA-001',
+      severity: 'P1',
+      category: 'business_accuracy',
+      location: 'index.html',
+      reason: 'States a guarantee the profile does not support.',
+    });
+
+  beforeEach(() => {
+    reviewSequence = [
+      { qualityScore: 62, blocking: true, issues: [stubborn()] },
+      { qualityScore: 64, blocking: true, issues: [stubborn()] },
+      { qualityScore: 66, blocking: true, issues: [stubborn()] },
+    ];
+    adjudications = [
+      { action: 'repair', reason: 'Narrow claim fix.', defectIds: ['QA-001'], objective: null, scope: null },
+      { action: 'repair', reason: 'Still there; try once more.', defectIds: ['QA-001'], objective: null, scope: null },
+      { action: 'repair', reason: 'Try again.', defectIds: ['QA-001'], objective: null, scope: null },
+    ];
+    approval = { recommendation: 'accept', reason: 'unused', acknowledgedIssues: [] };
+  });
+
+  it('stops offering repair once the fingerprint is spent', async () => {
+    const projectId = 'proj_repair_allowance';
+    await run(projectId, 'full_autonomous');
+
+    const decisions = await store.artifacts
+      .find({ projectId, name: 'adjudication-decision' })
+      .sort({ version: 1 })
+      .toArray();
+
+    const legalPerCycle = decisions.map(
+      (d) => (d.data as { legalActions: string[] }).legalActions,
+    );
+
+    // Three cycles, not four: the run does not spend a review rejection to
+    // discover an allowance policy could already see was gone.
+    expect(legalPerCycle).toHaveLength(3);
+
+    // Offered while the allowance lasts, withdrawn once it does not.
+    expect(legalPerCycle[0]).toContain('repair');
+    expect(legalPerCycle[1]).toContain('repair');
+    expect(legalPerCycle[2]).not.toContain('repair');
+    expect(legalPerCycle[2]).toEqual(['replan', 'block']);
+  });
+
+  it('charges the per-defect allowance exactly twice, and no more', async () => {
+    const projectId = 'proj_repair_allowance_spend';
+    await run(projectId, 'full_autonomous');
+
+    const spent = await store.defectBudgets.find({ projectId }).toArray();
+    expect(spent).toHaveLength(1);
+    expect(spent[0]?.repairsUsed).toBe(2);
+
+    // Every repair Luna was asked for was one the budget could pay for. Before
+    // the fix a third was authorised and refused inside the transaction, which
+    // rolled the spend back and left these two identical — the waste showed up
+    // as an extra cycle rather than an extra charge.
+    expect(repairCalls).toEqual(['QA-001', 'QA-001']);
+
+    // Two rejections answered, and the third evaluation answered with `block`,
+    // which spends none. The old path charged a third here for a repair it
+    // could not perform.
+    const budget = await store.budgets.findOne({ _id: projectId });
+    expect(budget?.used.totalRepairJobs).toBe(2);
+    expect(budget?.used.reviewRejections).toBe(2);
+  });
+
+  it('records what it refused, and why, on the last decision', async () => {
+    const projectId = 'proj_repair_allowance_record';
+    await run(projectId, 'full_autonomous');
+
+    const decisions = await store.artifacts
+      .find({ projectId, name: 'adjudication-decision' })
+      .sort({ version: 1 })
+      .toArray();
+    expect(decisions).toHaveLength(3);
+    const last = decisions[2]?.data as {
+      action: string;
+      source: string;
+      targetDefectIds: string[];
+      constraints: { repairsUsedByFingerprint: Record<string, number>; repairsLeft: number };
+    };
+
+    expect(last.action).not.toBe('repair');
+    expect(last.targetDefectIds).toEqual([]);
+
+    // The evidence for the refusal is on the artifact: project budget remained,
+    // and the fingerprint's own allowance did not.
+    expect(last.constraints.repairsLeft).toBeGreaterThan(0);
+    expect(Object.values(last.constraints.repairsUsedByFingerprint)).toEqual([2]);
+  });
+});

@@ -59,6 +59,7 @@ import {
   decideTerminal,
   fallbackAction,
   firstBlockerId,
+  repairableDefects,
   isReleaseBlocked,
   legalAdjudicationActions,
   permittedStrategies,
@@ -73,7 +74,7 @@ import {
   type ReplanScope,
   type RoutingAuthorization,
 } from '@statxai/policy-engine';
-import type { AdjudicationRecord } from './adjudication.js';
+import { recordedConstraints, type AdjudicationRecord } from './adjudication.js';
 import type { ApprovalRecord, AuthorizationRecord } from './release.js';
 import { planDelta, type ReplanRecord } from './replanning.js';
 import { developerOverride, executeRoute, type RouteDecisionRecord } from './routing.js';
@@ -996,9 +997,20 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
      * was looking at.
      */
     const currentBudget = (await store.budgets.findOne({ _id: projectId }))!;
+
+    // What each fingerprint has already spent. Policy decides eligibility from
+    // this; it cannot read the collection itself, and counting open defects is
+    // not the same question — the per-defect allowance outlives a cycle.
+    const spentPerDefect = await store.defectBudgets.find({ projectId }).toArray();
+    const repairsUsedByFingerprint = Object.fromEntries(
+      spentPerDefect.map((d) => [d.fingerprint, d.repairsUsed]),
+    );
+
     const constraints: AdjudicationConstraints = {
-      blockingCount: mustFix.length,
+      blockingDefects: mustFix,
       repairsLeft: currentBudget.limits.totalRepairJobs - currentBudget.used.totalRepairJobs,
+      repairsPerDefect: currentBudget.limits.repairsPerDefect,
+      repairsUsedByFingerprint,
       replansLeft: currentBudget.limits.replans - currentBudget.used.replans,
       reviewRejectionsLeft:
         currentBudget.limits.reviewRejections - currentBudget.used.reviewRejections,
@@ -1044,7 +1056,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         objective: decided.value.objective ?? null,
         scope: decided.value.scope ?? null,
       };
-      adjudication = authorizeAdjudication(decided.value, legal, mustFix);
+      adjudication = authorizeAdjudication(decided.value, legal, constraints);
     } catch (error) {
       // An adjudication that cannot be obtained must not end a delivery: the
       // harness takes the cheapest legal action and records that Sol was absent.
@@ -1053,8 +1065,9 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       adjudication = {
         action,
         // One blocker, not the whole set: with no adjudication there is no
-        // judgement about which defects belong together.
-        targetIds: action === 'repair' ? firstBlockerId(mustFix) : [],
+        // judgement about which defects belong together — and one that can
+        // still be charged for, or the cycle would repair nothing.
+        targetIds: action === 'repair' ? firstBlockerId(repairableDefects(mustFix, constraints)) : [],
         source: 'fallback',
         refusal: `Sol could not be consulted: ${adjudicationFailure}`,
       };
@@ -1067,7 +1080,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       refusal: adjudication.refusal,
       targetDefectIds: [...adjudication.targetIds],
       legalActions: legal,
-      constraints,
+      constraints: recordedConstraints(constraints),
       proposed: proposedAdjudication,
       modelFailure: adjudicationFailure,
       decidedAt: new Date(),

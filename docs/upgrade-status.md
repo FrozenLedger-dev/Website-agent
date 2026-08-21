@@ -93,10 +93,10 @@ CI runs two jobs, so the signals stay separable:
 
 | Job | Runs | Needs |
 |---|---|---|
-| Typecheck, lint and unit tests | `pnpm test:unit` — 381 | nothing |
-| Mongo integration tests | `pnpm test:integration` — 45 | the compose replica set |
+| Typecheck, lint and unit tests | `pnpm test:unit` — 396 | nothing |
+| Mongo integration tests | `pnpm test:integration` — 48 | the compose replica set |
 
-Together they cover the whole inventory exactly once: 381 + 45 = 426, which is
+Together they cover the whole inventory exactly once: 396 + 48 = 444, which is
 what `pnpm test` runs. The integration job starts the same `docker-compose`
 service developers use, waits for the healthcheck that initiates the replica
 set, and proves the deployment accepts transactions before running anything —
@@ -113,7 +113,7 @@ Neither job holds a credential. No OpenAI key, no deployment token, no
 | End-to-end refusal regression test | Done — `refusal.integration.test.ts`, 13 tests |
 | CI covers the Mongo-backed suites | Done — a second job, so nothing is outside CI |
 | Extract scattered harness policy into a policy layer (3a) | Done — `packages/policy-engine` — both CI checks green on `70a86ba` |
-| Harden the policy the extraction froze (3b) | Next — the two category-C items below |
+| Harden the policy the extraction froze (3b) | Per-fingerprint repair eligibility done; the routing invariant remains |
 
 The regression test is the opening safety net. The last three defects in the
 approval area were all in the *result* rather than the decision — zeroed
@@ -188,17 +188,7 @@ adding a second `isEmptyDelta` to the orchestrator fails it by name.
 
 **C — real policy that is still implicit.** Named here, not fixed:
 
-1. **Per-fingerprint repair eligibility.** `legalAdjudicationActions` offers
-   `repair` from a *global* `repairsLeft`, but `spendRepairAttempt` charges the
-   budget **per fingerprint**. So Sol can be offered `repair`, choose defects
-   whose individual fingerprint budgets are already spent, and the harness
-   discovers it only at spend time — catching `BudgetExhausted` per defect and
-   continuing. A cycle can therefore be authorised, apply zero repairs, and fall
-   through to the exhaustion guard. Policy has no `repairableFingerprints`
-   input, so it cannot rule those defects out before offering them. Closing it
-   means threading the per-fingerprint remainders into
-   `AdjudicationConstraints`, which changes what gets offered — a behaviour
-   change, so not part of an extraction commit.
+1. ~~**Per-fingerprint repair eligibility.**~~ Fixed in Phase 3b, below.
 2. **A decomposition that names only the homepage.** `authorizeRoute` documents
    three ways Sol's choice does not survive, and implements two: the third —
    decomposing while naming no route other than the homepage, which the anchor
@@ -218,6 +208,52 @@ adding a second `isEmptyDelta` to the orchestrator fails it by name.
 4. `decideTerminal`'s preference order is an `if` ladder rather than a declared
    ranking. Correct today, and pinned by a test asserting it only ever returns
    something the legal set contained.
+
+## Phase 3b — per-fingerprint repair eligibility
+
+The first behaviour change the extraction made cheap.
+
+Two allowances govern a repair. `totalRepairJobs` is project-wide;
+`repairsPerDefect` is charged against the defect's **fingerprint** and outlives
+a cycle. Having the first does not imply having the second — but
+`legalAdjudicationActions` only ever saw the first, so it offered `repair` from
+a count of open blockers. Sol chose it, and `spendRepairAttempt` then refused
+each target one at a time, inside the transaction, after the cycle had already
+been committed to.
+
+The cost was a whole extra cycle. On a defect that survives two repairs, the
+run used to adjudicate a third, fail to charge for it, evaluate again, and only
+then block — with its review-rejection allowance spent. Measured end to end:
+**four adjudication cycles and three review rejections before; three and two
+after.**
+
+### What changed
+
+`PolicyDefect` now carries its `fingerprint`, and `AdjudicationConstraints`
+carries the per-defect limit plus what each fingerprint has already spent. The
+orchestrator reads those counters — policy cannot open the collection itself —
+and policy answers the question it was always being asked:
+
+- `repairableDefects` names the blockers that can still be charged for;
+- `repair` is offered only when at least one of them exists;
+- an authorised repair is narrowed to the eligible targets, with the dropped
+  ones recorded on the decision rather than discarded;
+- the fallback repairs an *eligible* blocker, not merely the most severe — the
+  same failure was reachable from the recovery path.
+
+The persisted constraint snapshot keeps `blockingDefectIds` rather than the
+defects themselves; they already live on the review outcome for the same cycle.
+It keeps `repairsUsedByFingerprint` in full, because that is the evidence for
+why an action was not offered.
+
+### That the two agree
+
+The failure was two components answering slightly different questions, so a
+test now pins them to the same one: policy's eligibility rule is checked against
+the exact predicate `spendRepairAttempt` guards with (`repairsUsed <
+repairsPerDefect`), for every count around the limit. Mutation-verified in both
+directions — restoring the old rule fails five policy tests and all three
+end-to-end ones.
 
 ## Phases 4–17
 

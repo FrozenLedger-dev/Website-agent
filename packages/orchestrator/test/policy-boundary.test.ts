@@ -114,3 +114,42 @@ describe('what the policy engine is not allowed to touch', () => {
     }
   });
 });
+
+describe('policy eligibility and the transaction that enforces it', () => {
+  /**
+   * Two places decide whether a defect may be repaired again: the policy engine
+   * decides whether to *offer* it, and `spendRepairAttempt` decides whether to
+   * *charge* for it. They were previously asking different questions — policy
+   * counted the project-wide allowance and the transaction counted the
+   * fingerprint's — which is how a cycle could be authorised and repair
+   * nothing. They now ask the same one, and this fails if they drift apart.
+   */
+  const STATE_SRC = join(SRC, '..', '..', 'state', 'src', 'budgets.ts');
+
+  it('guards on the same predicate the transaction does', async () => {
+    const code = await readFile(STATE_SRC, 'utf8');
+
+    // `$lt` is an exclusive comparison against the same limit policy reads, so
+    // one below the limit is spendable and exactly at it is not.
+    expect(code).toContain('repairsUsed: { $lt: budget.limits.repairsPerDefect }');
+    expect(code).toContain("throw new BudgetExhausted('repairsPerDefect')");
+  });
+
+  it('agrees with it at the boundary, for every count around the limit', async () => {
+    const { repairableDefects } = policy;
+    const limit = 2;
+
+    for (const repairsUsed of [0, 1, 2, 3]) {
+      const offered =
+        repairableDefects([{ id: 'A', severity: 'P1', fingerprint: 'fp:A' }], {
+          repairsPerDefect: limit,
+          repairsUsedByFingerprint: { 'fp:A': repairsUsed },
+        }).length > 0;
+
+      // What the Mongo filter `{ repairsUsed: { $lt: limit } }` would match.
+      const chargeable = repairsUsed < limit;
+
+      expect(offered, `repairsUsed=${repairsUsed}`).toBe(chargeable);
+    }
+  });
+});

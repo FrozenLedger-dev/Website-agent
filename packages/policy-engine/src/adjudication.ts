@@ -23,6 +23,15 @@ import type { AdjudicationAction, Severity } from '@statxai/contracts';
 export interface PolicyDefect {
   id: string;
   severity: Severity;
+  /**
+   * The unit the repair budget is charged against.
+   *
+   * Defects are collapsed by fingerprint before they reach here, so this is
+   * one-to-one with `id` for any given evaluation — but the *budget* is keyed
+   * on the fingerprint and survives across cycles, which is why policy has to
+   * see it rather than counting defects.
+   */
+  fingerprint: string;
 }
 
 /**
@@ -33,8 +42,13 @@ export interface PolicyDefect {
  * nothing Sol returns can change the number.
  */
 export interface AdjudicationConstraints {
-  blockingCount: number;
+  /** The open blocking defects, not just how many there are. */
+  blockingDefects: readonly PolicyDefect[];
   repairsLeft: number;
+  /** How many repairs any one fingerprint may receive, from the project budget. */
+  repairsPerDefect: number;
+  /** Repairs already charged, by fingerprint. A missing key means none. */
+  repairsUsedByFingerprint: Readonly<Record<string, number>>;
   replansLeft: number;
   reviewRejectionsLeft: number;
   /** Fingerprints already repaired at least once, with their outcome. */
@@ -54,6 +68,23 @@ export interface AdjudicationConstraints {
  * `block` is always legal. Giving up is the one action that never needs budget,
  * and a legal set that could be empty would leave Sol nothing to return.
  */
+/**
+ * The blocking defects a repair could still be charged for.
+ *
+ * `totalRepairJobs` is a project-wide allowance and `repairsPerDefect` is a
+ * per-fingerprint one, and having the first does not imply having the second.
+ * A defect that has already used its own allowance cannot be repaired again
+ * however much project budget is left, so it must not be counted towards
+ * whether `repair` is worth offering, and must not be handed to Luna as a
+ * target.
+ */
+export function repairableDefects(
+  defects: readonly PolicyDefect[],
+  c: Pick<AdjudicationConstraints, 'repairsPerDefect' | 'repairsUsedByFingerprint'>,
+): PolicyDefect[] {
+  return defects.filter((d) => (c.repairsUsedByFingerprint[d.fingerprint] ?? 0) < c.repairsPerDefect);
+}
+
 export function legalAdjudicationActions(c: AdjudicationConstraints): AdjudicationAction[] {
   const legal: AdjudicationAction[] = [];
 
@@ -71,7 +102,15 @@ export function legalAdjudicationActions(c: AdjudicationConstraints): Adjudicati
    */
   const canAnswerRejection = c.reviewRejectionsLeft > 0;
 
-  if (canAnswerRejection && c.blockingCount > 0 && c.repairsLeft > 0) legal.push('repair');
+  /**
+   * Offering `repair` needs a defect that can actually receive one. Counting
+   * open blockers instead meant a cycle could be authorised, reach
+   * `spendRepairAttempt`, be refused per fingerprint, and apply nothing — with
+   * the run having spent a review rejection to learn that.
+   */
+  const repairable = repairableDefects(c.blockingDefects, c).length;
+
+  if (canAnswerRejection && repairable > 0 && c.repairsLeft > 0) legal.push('repair');
   if (canAnswerRejection && c.replansLeft > 0) legal.push('replan');
   legal.push('block');
 
@@ -135,21 +174,32 @@ export interface AdjudicationAuthorization {
 /**
  * Turn a well-formed decision into an authorised action.
  *
- * Two refusals are possible and both fall back rather than failing the run:
- * an action the harness did not offer, and a repair naming defects that are not
- * in the open blocking set — which would otherwise spend the budget on a
- * fingerprint nothing raised.
+ * Three refusals are possible and all of them fall back rather than failing the
+ * run: an action the harness did not offer, a repair naming defects that are
+ * not in the open blocking set, and a repair naming only defects whose own
+ * fingerprint budget is spent. The last was previously invisible here — the
+ * targets were handed over, and `spendRepairAttempt` refused them one at a time
+ * afterwards, so a cycle could be authorised and repair nothing.
+ *
+ * A partly-eligible list is honoured for the part that is eligible, matching
+ * how a partly-recognised list is treated: the harness does what it can and
+ * records what it would not do.
  */
 export function authorizeAdjudication(
   decision: { action: AdjudicationAction; defectIds?: readonly string[] | null | undefined },
   legal: readonly AdjudicationAction[],
-  blockingDefects: readonly PolicyDefect[],
+  constraints: AdjudicationConstraints,
 ): AdjudicationAuthorization {
+  const blockingDefects = constraints.blockingDefects;
+  const repairable = repairableDefects(blockingDefects, constraints);
+
   const fallback = (refusal: string): AdjudicationAuthorization => {
     const action = fallbackAction(legal);
     return {
       action,
-      targetIds: action === 'repair' ? firstBlockerId(blockingDefects) : [],
+      // The fallback repairs a defect that can still receive one, never merely
+      // the most severe.
+      targetIds: action === 'repair' ? firstBlockerId(repairable) : [],
       source: 'fallback',
       refusal,
     };
@@ -166,19 +216,32 @@ export function authorizeAdjudication(
   }
 
   const named = new Set(decision.defectIds ?? []);
-  const targetIds = blockingDefects.filter((d) => named.has(d.id)).map((d) => d.id);
+  const open = blockingDefects.filter((d) => named.has(d.id));
   const unknown = [...named].filter((id) => !blockingDefects.some((d) => d.id === id));
 
-  if (targetIds.length === 0) {
+  if (open.length === 0) {
     return fallback(`Sol's repair named no open blocking defect (${[...named].join(', ') || 'none'}).`);
+  }
+
+  const eligible = repairableDefects(open, constraints);
+  const exhausted = open.filter((d) => !eligible.some((e) => e.id === d.id)).map((d) => d.id);
+
+  if (eligible.length === 0) {
+    return fallback(
+      `Sol's repair named only defects whose per-defect budget is spent: ${exhausted.join(', ')}.`,
+    );
+  }
+
+  const notes: string[] = [];
+  if (unknown.length > 0) notes.push(`Ignored unknown defect ids: ${unknown.join(', ')}.`);
+  if (exhausted.length > 0) {
+    notes.push(`Dropped defects whose per-defect budget is spent: ${exhausted.join(', ')}.`);
   }
 
   return {
     action: 'repair',
-    targetIds,
+    targetIds: eligible.map((d) => d.id),
     source: 'sol',
-    // A partially-recognised list is honoured for the part that exists, and the
-    // discrepancy is recorded rather than silently dropped.
-    refusal: unknown.length > 0 ? `Ignored unknown defect ids: ${unknown.join(', ')}.` : null,
+    refusal: notes.length > 0 ? notes.join(' ') : null,
   };
 }
