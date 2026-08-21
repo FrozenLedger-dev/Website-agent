@@ -93,10 +93,10 @@ CI runs two jobs, so the signals stay separable:
 
 | Job | Runs | Needs |
 |---|---|---|
-| Typecheck, lint and unit tests | `pnpm test:unit` — 406 | nothing |
+| Typecheck, lint and unit tests | `pnpm test:unit` — 415 | nothing |
 | Mongo integration tests | `pnpm test:integration` — 50 | the compose replica set |
 
-Together they cover the whole inventory exactly once: 406 + 50 = 456, which is
+Together they cover the whole inventory exactly once: 415 + 50 = 465, which is
 what `pnpm test` runs. The integration job starts the same `docker-compose`
 service developers use, waits for the healthcheck that initiates the replica
 set, and proves the deployment accepts transactions before running anything —
@@ -113,7 +113,7 @@ Neither job holds a credential. No OpenAI key, no deployment token, no
 | End-to-end refusal regression test | Done — `refusal.integration.test.ts`, 13 tests |
 | CI covers the Mongo-backed suites | Done — a second job, so nothing is outside CI |
 | Extract scattered harness policy into a policy layer (3a) | Done — `packages/policy-engine` — both CI checks green on `70a86ba` |
-| Harden the policy the extraction froze (3b) | Repair eligibility done, both budgets; the routing invariant remains |
+| Harden the policy the extraction froze (3b) | Done — repair eligibility on both budgets, and the routing workstream set |
 
 The regression test is the opening safety net. The last three defects in the
 approval area were all in the *result* rather than the decision — zeroed
@@ -189,19 +189,8 @@ adding a second `isEmptyDelta` to the orchestrator fails it by name.
 **C — real policy that is still implicit.** Named here, not fixed:
 
 1. ~~**Per-fingerprint repair eligibility.**~~ Fixed in Phase 3b, below.
-2. **A decomposition that names only the homepage.** `authorizeRoute` documents
-   three ways Sol's choice does not survive, and implements two: the third —
-   decomposing while naming no route other than the homepage, which the anchor
-   already builds — is described in the comment and absent from the code, and no
-   test covers it. On a five-page plan, `decompose` with a single `/` workstream
-   is authorised today.
-
-   It does not break a build, because `executeDecomposed` never reads
-   `decision.workstreams`: it builds the anchor, then every remaining page from
-   the sitemap. So the workstreams are recorded on the `route-decision` artifact
-   and then ignored, which makes this a contract/policy inconsistency rather
-   than an execution failure — and makes the audit trail claim a decomposition
-   plan the run did not follow. Predates the extraction.
+2. ~~**A decomposition that names only the homepage.**~~ Fixed in Phase 3b,
+   below, and more broadly than first recorded.
 3. `REPAIR_COMPANIONS` decides what a repair is always allowed to see. That is a
    permission, but it is tied to the Next.js workspace layout rather than to
    policy.
@@ -290,6 +279,41 @@ the exact predicate `spendRepairAttempt` guards with (`repairsUsed <
 repairsPerDefect`), for every count around the limit. Mutation-verified in both
 directions — restoring the old rule fails five policy tests and all three
 end-to-end ones.
+
+### The workstream set a decomposition must describe
+
+The routing invariant recorded in the audit turned out to be wider than
+"decompose while naming only the homepage". `executeDecomposed` builds the
+anchor — layout plus the homepage — and then every *remaining* sitemap page, so
+the workstream set has exactly one correct value: the sitemap minus `/`, each
+route named once. Policy validated only unknown routes, which let four shapes
+through:
+
+| Shape | Was |
+|---|---|
+| a route the sitemap does not have | refused |
+| `/`, which the anchor already builds | authorised |
+| the same route twice | authorised |
+| omitting a route the decomposition would build | authorised |
+
+None broke a build, because execution reads the sitemap and ignores the
+workstreams. What they broke was the record — the `route-decision` artifact kept
+a plan the delivery did not follow, which is the evidence an audit trail exists
+to preserve. `workstreamFaults` now checks the set exactly and reports every
+fault rather than the first, so a refusal does not have to be fixed one shape at
+a time.
+
+Writing the tests first paid: the duplicate check was written as
+`named.filter((r) => !seen.add(r))`, and `Set.add` returns the set rather than
+whether it inserted, so that predicate was always false and the check never
+fired.
+
+### One duplicated rule removed
+
+The release-refusal branch still assigned a terminal outcome with
+`decideTerminal`, dead since the refusal path started exiting through
+`terminalForRefusal`. Removed — it was a second copy of a rule the policy engine
+owns, which is exactly what the boundary test exists to prevent.
 
 ## Phases 4–17
 

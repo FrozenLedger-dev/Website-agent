@@ -976,10 +976,12 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       if (!authorization.authorized) {
         // The harness refused. `human_review` is a real outcome rather than a
         // failure, but neither reaches deployment.
-        terminalDecision =
-          authorization.action === 'human_review'
-            ? 'request_human_review'
-            : decideTerminal(openDefects, autonomyMode);
+        //
+        // No terminal outcome is chosen here: the refusal path exits through
+        // `terminalForRefusal(authorization.action)` below, which is the only
+        // mapping that holds when nothing blocking remains. This branch used to
+        // assign one too — dead since the refusal semantics were fixed, and a
+        // second copy of a rule the policy engine owns.
         say({
           phase: 'approve',
           detail: `Release not authorised (${authorization.action}): ${authorization.reason}`,

@@ -7,7 +7,7 @@
  * rather than evaluation, and executing the strategy, including recovery from a
  * truncation that actually happened.
  */
-import type { SolRouteDecision, SitePlan } from '@statxai/contracts';
+import { HOME_ROUTE, type SolRouteDecision, type SitePlan } from '@statxai/contracts';
 
 export type Strategy = 'one_shot' | 'decompose';
 
@@ -49,17 +49,13 @@ export function permittedStrategies(plan: SitePlan): Strategy[] {
 /**
  * Turn a well-formed decision into an authorised strategy.
  *
- * Three ways Sol's choice does not survive:
+ * Two ways Sol's choice does not survive: it names a strategy the harness did
+ * not offer, or it decomposes into a workstream set that does not describe the
+ * work decomposition would actually do — see {@link workstreamFaults}.
  *
- * - it names a strategy the harness did not offer;
- * - it decomposes into workstreams naming routes the sitemap does not contain,
- *   which would schedule work for pages that do not exist;
- * - it decomposes but names no route other than the homepage, which the anchor
- *   already builds.
- *
- * None of these fail the run. Routing is a preference between two working
- * paths, so a refusal falls back to `one_shot` — the architecture's documented
- * default — and records why, rather than ending a delivery over a strategy.
+ * Neither fails the run. Routing is a preference between two working paths, so
+ * a refusal falls back to `one_shot` — the architecture's documented default —
+ * and records why, rather than ending a delivery over a strategy.
  */
 export function authorizeRoute(
   decision: SolRouteDecision,
@@ -87,15 +83,12 @@ export function authorizeRoute(
   }
 
   if (decision.action === 'decompose') {
-    const routes = new Set(plan.sitemap.pages.map((p) => p.route));
-    const named = decision.workstreams ?? [];
-    const unknown = named.filter((w) => !routes.has(w.route)).map((w) => w.route);
-
-    if (unknown.length > 0) {
+    const faults = workstreamFaults(decision.workstreams ?? [], plan);
+    if (faults.length > 0) {
       return {
         strategy: 'one_shot',
         source: 'fallback',
-        refusal: `Sol's workstreams name routes absent from the sitemap: ${unknown.join(', ')}.`,
+        refusal: `Sol's workstreams do not describe the decomposition: ${faults.join(' ')}`,
       };
     }
   }
@@ -104,3 +97,56 @@ export function authorizeRoute(
 }
 
 /** What gets stored as the versioned `route-decision` artifact. */
+
+/**
+ * Whether a decomposition's workstreams describe the work it would actually do.
+ *
+ * `executeDecomposed` builds the anchor — layout plus the homepage — and then
+ * every *remaining* sitemap page. So the workstream set has exactly one correct
+ * value: the sitemap routes minus the homepage, each named once.
+ *
+ * Only unknown routes used to be checked, which let four other shapes through:
+ * omitting a route that would be built anyway, including `/` which the anchor
+ * already covers, naming the same route twice, and naming one route on a
+ * five-page site. None broke a build, because execution reads the sitemap and
+ * ignores the workstreams entirely — the cost was that the `route-decision`
+ * artifact recorded a plan the delivery did not follow, which is exactly the
+ * evidence an audit trail exists to preserve.
+ *
+ * Returns one sentence per fault, so a refusal says what was wrong rather than
+ * that something was.
+ */
+export function workstreamFaults(
+  workstreams: readonly { route: string }[],
+  plan: SitePlan,
+): string[] {
+  const sitemap = new Set(plan.sitemap.pages.map((p) => p.route));
+  const expected = [...sitemap].filter((route) => route !== HOME_ROUTE);
+  const named = workstreams.map((w) => w.route);
+
+  const faults: string[] = [];
+
+  const unknown = named.filter((route) => !sitemap.has(route));
+  if (unknown.length > 0) faults.push(`routes absent from the sitemap: ${unknown.join(', ')}.`);
+
+  if (named.includes(HOME_ROUTE)) {
+    faults.push(`the homepage is built by the anchor and must not be a workstream.`);
+  }
+
+  // `Set.add` returns the set, not whether it inserted, so this is a `has`
+  // check rather than the terser filter it looks like it wants to be.
+  const seen = new Set<string>();
+  const duplicated: string[] = [];
+  for (const route of named) {
+    if (seen.has(route) && !duplicated.includes(route)) duplicated.push(route);
+    seen.add(route);
+  }
+  if (duplicated.length > 0) faults.push(`routes named more than once: ${duplicated.join(', ')}.`);
+
+  const missing = expected.filter((route) => !named.includes(route));
+  if (missing.length > 0) {
+    faults.push(`routes the decomposition would build but did not name: ${missing.join(', ')}.`);
+  }
+
+  return faults;
+}
