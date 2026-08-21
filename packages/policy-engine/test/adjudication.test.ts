@@ -17,6 +17,9 @@ import {
   fallbackAction,
   firstBlockerId,
   legalAdjudicationActions,
+  maxRepairTargets,
+  repairCapacity,
+  repairEligibility,
   repairableDefects,
   type AdjudicationConstraints,
   type PolicyDefect,
@@ -493,5 +496,156 @@ describe('per-defect repair eligibility', () => {
       expect(auth.action).toBe('block');
       expect(auth.targetIds).toEqual([]);
     });
+  });
+});
+
+describe('the project repair allowance caps how many defects one repair may name', () => {
+  /**
+   * `spendRepairAttempt` charges one `totalRepairJobs` unit **per target**, so a
+   * repair naming three defects needs three units. Policy checked that repair
+   * was affordable at all, never that the *named set* was, so with one unit left
+   * all three were authorised: the first executed, the other two were refused
+   * inside the transaction, and the artifact still recorded three targets the
+   * harness knew it could not charge for.
+   *
+   * Same class as the per-fingerprint gap, on the other budget.
+   */
+  it('reports capacity as the project allowance, floored at zero', () => {
+    expect(repairCapacity({ repairsLeft: 3 })).toBe(3);
+    expect(repairCapacity({ repairsLeft: 0 })).toBe(0);
+    expect(repairCapacity({ repairsLeft: -1 })).toBe(0);
+  });
+
+  it('takes the smaller of the two allowances as the cycle maximum', () => {
+    // Three eligible defects and one unit left is a maximum of one, not three.
+    expect(maxRepairTargets(constraints({ repairsLeft: 1 }))).toBe(1);
+
+    // Five units left and three eligible defects is three, not five.
+    expect(maxRepairTargets(constraints({ repairsLeft: 5 }))).toBe(3);
+
+    // Per-defect exhaustion narrows it further.
+    expect(
+      maxRepairTargets(
+        constraints({ repairsLeft: 5, repairsUsedByFingerprint: { 'fp:GATE-001': 2, 'fp:GATE-002': 2 } }),
+      ),
+    ).toBe(1);
+  });
+
+  it('authorises only as many targets as the allowance can pay for', () => {
+    const c = constraints({ repairsLeft: 1 });
+    const auth = authorizeAdjudication(
+      decision({ defectIds: ['GATE-001', 'GATE-002', 'GATE-003'] }),
+      legalAdjudicationActions(c),
+      c,
+    );
+
+    expect(auth.source).toBe('sol');
+    expect(auth.targetIds).toHaveLength(1);
+    expect(auth.refusal).toContain('project repair allowance');
+    expect(auth.refusal).toContain('GATE-002');
+    expect(auth.refusal).toContain('GATE-003');
+  });
+
+  it('keeps the most severe of the named defects, then breaks ties by id', () => {
+    // The harness has no judgement about which of Sol's targets matter most, so
+    // it uses the one ordering it can defend and reproduce: severity first, and
+    // among equal severities the id — not the order Sol happened to list them.
+    const c = constraints({
+      blockingDefects: [defect('b-second', 'P1'), defect('a-worst', 'P0'), defect('c-third', 'P1')],
+      repairsLeft: 2,
+    });
+    const auth = authorizeAdjudication(
+      decision({ defectIds: ['c-third', 'b-second', 'a-worst'] }),
+      legalAdjudicationActions(c),
+      c,
+    );
+
+    expect(auth.targetIds).toEqual(['a-worst', 'b-second']);
+  });
+
+  it('is stable regardless of the order Sol listed them in', () => {
+    const c = constraints({
+      blockingDefects: [defect('LOW', 'P1'), defect('HIGH', 'P0')],
+      repairsLeft: 1,
+    });
+    const forwards = authorizeAdjudication(
+      decision({ defectIds: ['LOW', 'HIGH'] }),
+      legalAdjudicationActions(c),
+      c,
+    );
+    const backwards = authorizeAdjudication(
+      decision({ defectIds: ['HIGH', 'LOW'] }),
+      legalAdjudicationActions(c),
+      c,
+    );
+
+    expect(forwards.targetIds).toEqual(['HIGH']);
+    expect(backwards.targetIds).toEqual(['HIGH']);
+  });
+
+  it('never authorises more targets than the allowance, for any combination', () => {
+    // The property the cases above are instances of.
+    const ids = ['GATE-001', 'GATE-002', 'GATE-003'];
+    for (const repairsLeft of [0, 1, 2, 3, 4]) {
+      const c = constraints({ repairsLeft });
+      const auth = authorizeAdjudication(
+        decision({ defectIds: ids }),
+        legalAdjudicationActions(c),
+        c,
+      );
+      expect(auth.targetIds.length, `repairsLeft=${repairsLeft}`).toBeLessThanOrEqual(repairsLeft);
+    }
+  });
+
+  it('does not narrow a repair the allowance can already cover', () => {
+    const c = constraints({ repairsLeft: 5 });
+    const auth = authorizeAdjudication(
+      decision({ defectIds: ['GATE-001', 'GATE-002', 'GATE-003'] }),
+      legalAdjudicationActions(c),
+      c,
+    );
+
+    expect(auth.targetIds).toHaveLength(3);
+    expect(auth.refusal).toBeNull();
+  });
+});
+
+describe('the eligibility facts Sol is given', () => {
+  it('reports attempts remaining per open blocking defect', () => {
+    const facts = repairEligibility(
+      constraints({ repairsUsedByFingerprint: { 'fp:GATE-001': 1, 'fp:GATE-002': 2 } }),
+    );
+
+    expect(facts).toEqual([
+      { defectId: 'GATE-001', attemptsRemaining: 1, eligible: true },
+      { defectId: 'GATE-002', attemptsRemaining: 0, eligible: false },
+      { defectId: 'GATE-003', attemptsRemaining: 2, eligible: true },
+    ]);
+  });
+
+  it('never reports a negative remainder', () => {
+    // A limit lowered mid-project must read as "exhausted", not as a negative.
+    const facts = repairEligibility(
+      constraints({ repairsPerDefect: 1, repairsUsedByFingerprint: { 'fp:GATE-001': 3 } }),
+    );
+    expect(facts[0]).toEqual({ defectId: 'GATE-001', attemptsRemaining: 0, eligible: false });
+  });
+
+  it('agrees with what the harness will actually authorise', () => {
+    // The point of showing Sol these facts is that acting on them succeeds. If
+    // the two ever disagreed, Sol would be reasoning from a fiction.
+    const c = constraints({ repairsUsedByFingerprint: { 'fp:GATE-002': 2 } });
+    const eligibleIds = repairEligibility(c).filter((e) => e.eligible).map((e) => e.defectId);
+
+    const auth = authorizeAdjudication(
+      decision({ defectIds: eligibleIds }),
+      legalAdjudicationActions(c),
+      c,
+    );
+
+    expect(auth.source).toBe('sol');
+    expect(auth.targetIds).toEqual(eligibleIds);
+    expect(auth.refusal).toBeNull();
+    expect(eligibleIds).toHaveLength(maxRepairTargets(c));
   });
 });

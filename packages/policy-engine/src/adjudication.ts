@@ -121,6 +121,19 @@ export function legalAdjudicationActions(c: AdjudicationConstraints): Adjudicati
 const SEVERITY_RANK: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
 
 /**
+ * Most severe first, then by id.
+ *
+ * Used wherever the harness has to choose *which* defects to act on without a
+ * judgement to go by — the fallback, and trimming an over-large repair to what
+ * the budget can pay for. Ties break on id so the choice is reproducible from
+ * the same inputs rather than dependent on gate ordering.
+ */
+const bySeverityThenId = (a: PolicyDefect, b: PolicyDefect): number => {
+  const bySeverity = (SEVERITY_RANK[a.severity] ?? 9) - (SEVERITY_RANK[b.severity] ?? 9);
+  return bySeverity !== 0 ? bySeverity : a.id.localeCompare(b.id);
+};
+
+/**
  * The single defect a fallback repairs.
  *
  * When Sol cannot be consulted, or its answer is refused, the harness has no
@@ -137,11 +150,57 @@ const SEVERITY_RANK: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
  * many defects as it judged belong together.
  */
 export function firstBlockerId(defects: readonly PolicyDefect[]): string[] {
-  const [first] = [...defects].sort((a, b) => {
-    const bySeverity = (SEVERITY_RANK[a.severity] ?? 9) - (SEVERITY_RANK[b.severity] ?? 9);
-    return bySeverity !== 0 ? bySeverity : a.id.localeCompare(b.id);
-  });
+  const [first] = [...defects].sort(bySeverityThenId);
   return first ? [first.id] : [];
+}
+
+/**
+ * How many repairs may be authorised this cycle.
+ *
+ * `spendRepairAttempt` charges one `totalRepairJobs` unit **per target**, so a
+ * repair naming three defects needs three units and not one. Authorising more
+ * than the project allowance can pay for produces an artifact that names
+ * targets the harness already knew it could not charge for — the same
+ * "authorisation ≠ executable set" gap the per-fingerprint fix closed, on the
+ * other budget.
+ */
+export function repairCapacity(
+  c: Pick<AdjudicationConstraints, 'repairsLeft'>,
+): number {
+  return Math.max(0, c.repairsLeft);
+}
+
+/**
+ * What Sol is told about repairability, per defect.
+ *
+ * Policy already knows which defects can still be charged for. Without handing
+ * that to the model, Sol picks from the whole open blocking list, names an
+ * exhausted defect in good faith, and the harness quietly substitutes a
+ * different one — which is the harness making the semantic choice Sol exists to
+ * make. These are read-only facts: there is no field here Sol can send back.
+ */
+export interface RepairEligibility {
+  defectId: string;
+  attemptsRemaining: number;
+  eligible: boolean;
+}
+
+export function repairEligibility(c: AdjudicationConstraints): RepairEligibility[] {
+  return c.blockingDefects.map((d) => {
+    const used = c.repairsUsedByFingerprint[d.fingerprint] ?? 0;
+    const attemptsRemaining = Math.max(0, c.repairsPerDefect - used);
+    return { defectId: d.id, attemptsRemaining, eligible: attemptsRemaining > 0 };
+  });
+}
+
+/**
+ * The most defects a repair may name this cycle, given both allowances.
+ *
+ * Naming more than this cannot be executed as decided, so it is the number Sol
+ * is given rather than one of the two budgets on its own.
+ */
+export function maxRepairTargets(c: AdjudicationConstraints): number {
+  return Math.min(repairCapacity(c), repairableDefects(c.blockingDefects, c).length);
 }
 
 /**
@@ -174,16 +233,23 @@ export interface AdjudicationAuthorization {
 /**
  * Turn a well-formed decision into an authorised action.
  *
- * Three refusals are possible and all of them fall back rather than failing the
- * run: an action the harness did not offer, a repair naming defects that are
- * not in the open blocking set, and a repair naming only defects whose own
- * fingerprint budget is spent. The last was previously invisible here — the
- * targets were handed over, and `spendRepairAttempt` refused them one at a time
- * afterwards, so a cycle could be authorised and repair nothing.
+ * Refusals fall back rather than failing the run. A decision does not survive
+ * intact when it names an action the harness did not offer, names defects that
+ * are not in the open blocking set, names only defects whose own fingerprint
+ * budget is spent, or names more defects than the project allowance can pay
+ * for.
  *
- * A partly-eligible list is honoured for the part that is eligible, matching
- * how a partly-recognised list is treated: the harness does what it can and
- * records what it would not do.
+ * The last two were previously invisible here: the targets were handed over and
+ * `spendRepairAttempt` refused them afterwards, one at a time, inside the
+ * transaction. Both budgets are charged per target — `repairsPerDefect` against
+ * the fingerprint and `totalRepairJobs` once for each defect named — so an
+ * authorisation that ignores either one describes work the harness already knew
+ * it could not do.
+ *
+ * A partly-payable list is honoured for the part that is payable, matching how
+ * a partly-recognised list is treated: the harness does what it can and records
+ * what it would not do. The transaction stays authoritative in case state has
+ * drifted since these facts were read.
  */
 export function authorizeAdjudication(
   decision: { action: AdjudicationAction; defectIds?: readonly string[] | null | undefined },
@@ -193,13 +259,17 @@ export function authorizeAdjudication(
   const blockingDefects = constraints.blockingDefects;
   const repairable = repairableDefects(blockingDefects, constraints);
 
+  const capacity = repairCapacity(constraints);
+
   const fallback = (refusal: string): AdjudicationAuthorization => {
     const action = fallbackAction(legal);
+    // One repair, and only if both allowances can pay for it. The fallback
+    // repairs a defect that can still receive one, never merely the most
+    // severe.
+    const canRepair = action === 'repair' && capacity >= 1;
     return {
-      action,
-      // The fallback repairs a defect that can still receive one, never merely
-      // the most severe.
-      targetIds: action === 'repair' ? firstBlockerId(repairable) : [],
+      action: action === 'repair' && !canRepair ? 'block' : action,
+      targetIds: canRepair ? firstBlockerId(repairable) : [],
       source: 'fallback',
       refusal,
     };
@@ -232,15 +302,37 @@ export function authorizeAdjudication(
     );
   }
 
+  /**
+   * Trim to what the project allowance can pay for, most severe first.
+   *
+   * `spendRepairAttempt` charges one `totalRepairJobs` unit per target, so a
+   * three-defect repair with one unit left executed the first and had the other
+   * two refused inside the transaction — while the artifact recorded all three
+   * as authorised.
+   */
+  const payable = [...eligible].sort(bySeverityThenId).slice(0, capacity);
+  const overCapacity = eligible.filter((d) => !payable.includes(d)).map((d) => d.id);
+
+  if (payable.length === 0) {
+    return fallback(
+      `Sol's repair named ${eligible.length} defect(s) and the project repair allowance is ${capacity}.`,
+    );
+  }
+
   const notes: string[] = [];
   if (unknown.length > 0) notes.push(`Ignored unknown defect ids: ${unknown.join(', ')}.`);
   if (exhausted.length > 0) {
     notes.push(`Dropped defects whose per-defect budget is spent: ${exhausted.join(', ')}.`);
   }
+  if (overCapacity.length > 0) {
+    notes.push(
+      `Dropped for want of project repair allowance (${capacity} left): ${overCapacity.join(', ')}.`,
+    );
+  }
 
   return {
     action: 'repair',
-    targetIds: eligible.map((d) => d.id),
+    targetIds: payable.map((d) => d.id),
     source: 'sol',
     refusal: notes.length > 0 ? notes.join(' ') : null,
   };

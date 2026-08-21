@@ -505,3 +505,82 @@ describe('a defect that has spent its own repair allowance', () => {
     expect(Object.values(last.constraints.repairsUsedByFingerprint)).toEqual([2]);
   });
 });
+
+describe('a repair naming more defects than the project allowance can pay for', () => {
+  /**
+   * `spendRepairAttempt` charges one `totalRepairJobs` unit per target, so a
+   * repair naming five defects needs five units. Policy checked that repair was
+   * affordable at all, never that the named set was — so with three units left
+   * all five were authorised, three executed, two were refused inside the
+   * transaction, and the artifact recorded five targets the harness already
+   * knew it could not charge for.
+   *
+   * Five blocking defects against the default budget (8 total, 2 per defect):
+   * cycle one spends five and leaves three, so cycle two is where the project
+   * allowance, rather than per-defect eligibility, is the binding constraint.
+   */
+  const FIVE = ['QA-101', 'QA-102', 'QA-103', 'QA-104', 'QA-105'];
+
+  const blockers = () =>
+    FIVE.map((id, i) =>
+      issue({
+        id,
+        severity: 'P1',
+        category: 'business_accuracy',
+        location: `page-${i}.html`,
+        reason: `States a guarantee the profile does not support (${id}).`,
+      }),
+    );
+
+  beforeEach(() => {
+    reviewSequence = [
+      { qualityScore: 55, blocking: true, issues: blockers() },
+      { qualityScore: 58, blocking: true, issues: blockers() },
+      { qualityScore: 61, blocking: true, issues: blockers() },
+    ];
+    adjudications = FIVE.map(() => ({
+      action: 'repair',
+      reason: 'All five are local unsupported claims.',
+      defectIds: [...FIVE],
+      objective: null,
+      scope: null,
+    }));
+    approval = { recommendation: 'accept', reason: 'unused', acknowledgedIssues: [] };
+  });
+
+  it('authorises only what the remaining allowance covers', async () => {
+    const projectId = 'proj_repair_capacity';
+    await run(projectId, 'full_autonomous');
+
+    const decisions = await store.artifacts
+      .find({ projectId, name: 'adjudication-decision' })
+      .sort({ version: 1 })
+      .toArray();
+    const targetsPerCycle = decisions.map(
+      (d) => (d.data as { targetDefectIds: string[] }).targetDefectIds,
+    );
+
+    // Cycle one: eight units available, five named, five authorised.
+    expect(targetsPerCycle[0]).toHaveLength(5);
+
+    // Cycle two: three units left, five named, three authorised — and the two
+    // it would not pay for are recorded rather than silently dropped.
+    expect(targetsPerCycle[1]).toHaveLength(3);
+    const second = decisions[1]?.data as { refusal: string | null };
+    expect(second.refusal).toContain('project repair allowance');
+  });
+
+  it('asks Luna for exactly the repairs it can charge for', async () => {
+    const projectId = 'proj_repair_capacity_spend';
+    await run(projectId, 'full_autonomous');
+
+    const budget = await store.budgets.findOne({ _id: projectId });
+    expect(budget?.used.totalRepairJobs).toBe(8);
+    expect(budget?.used.totalRepairJobs).toBe(budget?.limits.totalRepairJobs);
+
+    // Never more calls than units spent. Before the fix the extra targets were
+    // authorised, refused inside the transaction, and never reached Luna — so
+    // the artifact and the work disagreed.
+    expect(repairCalls).toHaveLength(8);
+  });
+});

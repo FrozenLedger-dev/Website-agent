@@ -50,6 +50,12 @@ Budgets are given to you as facts about what remains. They constrain what is
 possible, not what is correct: do not choose a worse action because a better one is
 cheap, and do not choose replan simply because the arithmetic allows it.
 
+Two separate allowances limit repair. Each defect has its own attempt count, and
+the project has a total. A defect that has used its own attempts is out of reach
+even when the project total is healthy — that is exactly the case where repeated
+narrow repair has already failed on it, and where replan or block is the honest
+answer.
+
 You may return ONLY an action from the legal list you are given. If the action you
 would prefer is not on that list, choose the best one that is, and say so in your
 reason.
@@ -61,8 +67,12 @@ WHAT TO RETURN
   "There are blocking defects" is not a reason. "Both remaining defects are
   unsupported claims confined to one section each, and neither has been repaired
   before" is.
-- defectIds: required for repair — the ids to fix, from the open blocking list.
-  Include every defect you want repaired this cycle.
+- defectIds: required for repair — the ids to fix. Choose only from the defects
+  marked repairable in REPAIR ELIGIBILITY, and name no more than the maximum
+  stated there. A defect with no attempts remaining cannot be repaired again
+  however local it looks; if it is the one that matters, that is evidence for
+  replan or block, not for naming it anyway. Include every defect you want
+  repaired this cycle, up to the maximum.
 - scope: required for replan — "page", "design" or "site".
 - objective: leave null for these actions.`;
 
@@ -80,6 +90,17 @@ export interface AdjudicationEvidence {
     acceptanceTest: string;
   }[];
   previousRepairs: readonly { defectId: string; fingerprint: string; outcome: string }[];
+  /**
+   * Which of the open blocking defects can still be repaired, from the policy
+   * engine. Read-only: Sol chooses among these, and cannot change them.
+   *
+   * Without it Sol picked from the whole open list, named an exhausted defect in
+   * good faith, and the harness substituted a different target — the harness
+   * making the semantic choice Sol is here to make.
+   */
+  repairEligibility: readonly { defectId: string; attemptsRemaining: number; eligible: boolean }[];
+  /** The most defects a repair may name this cycle, given both allowances. */
+  maxRepairTargets: number;
   /** Read-only. Present so a nearly-spent run can be judged differently. */
   remainingBudgets: Readonly<Record<string, number>>;
   autonomyMode: string;
@@ -112,6 +133,18 @@ ${
         `  ${d.id} [${d.severity} ${d.category}] ${d.location}\n` +
         `      ${d.reason}\n` +
         `      proves fixed: ${d.acceptanceTest}`,
+    )
+    .join('\n') || '  (none)'
+}
+
+REPAIR ELIGIBILITY (read-only facts — repair may name at most ${evidence.maxRepairTargets})
+${
+  evidence.repairEligibility
+    .map(
+      (e) =>
+        `  ${e.defectId.padEnd(12)} ${
+          e.eligible ? `${e.attemptsRemaining} attempt(s) remaining` : 'exhausted — cannot be repaired again'
+        }`,
     )
     .join('\n') || '  (none)'
 }

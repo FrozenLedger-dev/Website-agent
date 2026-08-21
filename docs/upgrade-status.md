@@ -93,10 +93,10 @@ CI runs two jobs, so the signals stay separable:
 
 | Job | Runs | Needs |
 |---|---|---|
-| Typecheck, lint and unit tests | `pnpm test:unit` — 396 | nothing |
-| Mongo integration tests | `pnpm test:integration` — 48 | the compose replica set |
+| Typecheck, lint and unit tests | `pnpm test:unit` — 406 | nothing |
+| Mongo integration tests | `pnpm test:integration` — 50 | the compose replica set |
 
-Together they cover the whole inventory exactly once: 396 + 48 = 444, which is
+Together they cover the whole inventory exactly once: 406 + 50 = 456, which is
 what `pnpm test` runs. The integration job starts the same `docker-compose`
 service developers use, waits for the healthcheck that initiates the replica
 set, and proves the deployment accepts transactions before running anything —
@@ -113,7 +113,7 @@ Neither job holds a credential. No OpenAI key, no deployment token, no
 | End-to-end refusal regression test | Done — `refusal.integration.test.ts`, 13 tests |
 | CI covers the Mongo-backed suites | Done — a second job, so nothing is outside CI |
 | Extract scattered harness policy into a policy layer (3a) | Done — `packages/policy-engine` — both CI checks green on `70a86ba` |
-| Harden the policy the extraction froze (3b) | Per-fingerprint repair eligibility done; the routing invariant remains |
+| Harden the policy the extraction froze (3b) | Repair eligibility done, both budgets; the routing invariant remains |
 
 The regression test is the opening safety net. The last three defects in the
 approval area were all in the *result* rather than the decision — zeroed
@@ -245,6 +245,42 @@ The persisted constraint snapshot keeps `blockingDefectIds` rather than the
 defects themselves; they already live on the review outcome for the same cycle.
 It keeps `repairsUsedByFingerprint` in full, because that is the evidence for
 why an action was not offered.
+
+### Both budgets, not one
+
+The same gap existed on the *other* allowance. `spendRepairAttempt` charges one
+`totalRepairJobs` unit **per target**, so a repair naming five defects needs
+five units — but policy only checked that repair was affordable at all. With
+three units left, all five were authorised: three executed, two were refused
+inside the transaction, and the artifact recorded five targets the harness
+already knew it could not charge for.
+
+`repairCapacity` now caps the authorised set, trimming most-severe-first with
+ids breaking ties, so the choice is reproducible and does not depend on the
+order Sol listed them in. The dropped targets are recorded on the decision.
+Measured end to end on five blocking defects against the default budget: cycle
+one authorises five, cycle two authorises three rather than five.
+
+The invariant this closes, on both budgets:
+
+    authorised repair targets == targets the harness can charge for
+
+The transaction remains authoritative, in case state drifted since the facts
+were read.
+
+### Sol is told which defects are repairable
+
+Policy knew per-defect eligibility and the model did not. `sol-adjudicate`
+received the whole open blocking list and was told to choose ids from it, so
+Sol could name an exhausted defect in good faith and the harness would refuse it
+and substitute a different one — the harness making the semantic choice Sol is
+there to make.
+
+The evidence now carries `repairEligibility` (attempts remaining per defect) and
+`maxRepairTargets` (the smaller of the two allowances). Both are read-only
+facts: there is no field through which Sol could change either. A test asserts
+the facts agree with what authorisation actually does, so Sol is never reasoning
+from a fiction.
 
 ### That the two agree
 

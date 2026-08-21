@@ -59,9 +59,11 @@ import {
   decideTerminal,
   fallbackAction,
   firstBlockerId,
+  repairEligibility,
   repairableDefects,
   isReleaseBlocked,
   legalAdjudicationActions,
+  maxRepairTargets,
   permittedStrategies,
   RELEASE_POLICY_VERSION,
   terminalForRefusal,
@@ -1040,6 +1042,10 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
           acceptanceTest: d.acceptanceTest,
         })),
         previousRepairs: repairHistory,
+        // What policy already knows about repairability, handed to Sol so it
+        // chooses among defects the harness can actually act on.
+        repairEligibility: repairEligibility(constraints),
+        maxRepairTargets: maxRepairTargets(constraints),
         remainingBudgets: {
           totalRepairJobs: constraints.repairsLeft,
           replans: constraints.replansLeft,
