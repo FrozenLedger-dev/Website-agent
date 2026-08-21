@@ -145,6 +145,9 @@ importers:
       '@statxai/job-engine':
         specifier: workspace:*
         version: link:../job-engine
+      '@statxai/policy-engine':
+        specifier: workspace:*
+        version: link:../policy-engine
       '@statxai/state':
         specifier: workspace:*
         version: link:../state
@@ -154,6 +157,12 @@ importers:
       zod:
         specifier: ^3.25.76
         version: 3.25.76
+
+  packages/policy-engine:
+    dependencies:
+      '@statxai/contracts':
+        specifier: workspace:*
+        version: link:../contracts
 
   packages/state:
     dependencies:

@@ -3,8 +3,6 @@ import {
   ReviewOutcomeInput,
   defectDetailFingerprint,
   defectFingerprint,
-  isReleaseBlocked,
-  legalTerminalOutcomes,
   primaryLocation,
   reviewOutcomeJsonSchema,
 } from '../src/index.js';
@@ -103,34 +101,6 @@ describe('review outcome consistency rules', () => {
       issues: [issue()],
     });
     expect(result.success).toBe(false);
-  });
-});
-
-describe('release adjudication', () => {
-  it('blocks on P0 and P1 only', () => {
-    expect(isReleaseBlocked([{ severity: 'P0' }])).toBe(true);
-    expect(isReleaseBlocked([{ severity: 'P1' }])).toBe(true);
-    expect(isReleaseBlocked([{ severity: 'P2' }, { severity: 'P3' }])).toBe(false);
-  });
-
-  it('narrows terminal outcomes to rollback or blocked when a P1 is open', () => {
-    const outcomes = legalTerminalOutcomes([{ severity: 'P1' }], { humanReviewPermitted: false });
-    expect(outcomes).toEqual(['rollback_to_last_accepted', 'mark_blocked']);
-    expect(outcomes).not.toContain('accept_non_blocking');
-  });
-
-  it('allows accepting documented issues when nothing blocking remains', () => {
-    const outcomes = legalTerminalOutcomes([{ severity: 'P2' }], { humanReviewPermitted: false });
-    expect(outcomes).toContain('accept_non_blocking');
-  });
-
-  it('offers human review only when autonomy policy permits it', () => {
-    expect(legalTerminalOutcomes([{ severity: 'P2' }], { humanReviewPermitted: false })).not.toContain(
-      'request_human_review',
-    );
-    expect(legalTerminalOutcomes([{ severity: 'P2' }], { humanReviewPermitted: true })).toContain(
-      'request_human_review',
-    );
   });
 });
 

@@ -18,6 +18,21 @@ import { AgentTier, ArtifactRef, JobId, ProjectId } from './primitives.js';
 export const Severity = z.enum(['P0', 'P1', 'P2', 'P3']);
 export type Severity = z.infer<typeof Severity>;
 
+/**
+ * Which severities block a release.
+ *
+ * This one table stays here, against the general rule that contracts describe
+ * data and `@statxai/policy-engine` describes authority, because the
+ * `ReviewOutcome` schema below refines `blocking` against it — a reviewer must
+ * not assert a blocking flag its own issues do not support. Contracts cannot
+ * import the policy package without a cycle, and duplicating the table would
+ * leave two answers to one question.
+ *
+ * Everything *derived* from it is policy and lives there:
+ * `isReleaseBlocked`, `legalTerminalOutcomes`, and the release authorisation
+ * that consumes them. The policy package re-exports these two so consumers have
+ * a single import site for authority.
+ */
 export const SEVERITY_POLICY = Object.freeze({
   P0: { blocksRelease: true, meaning: 'Security, data integrity, broken production path' },
   P1: { blocksRelease: true, meaning: 'Required acceptance criterion fails; core flow unusable' },
@@ -25,7 +40,6 @@ export const SEVERITY_POLICY = Object.freeze({
   P3: { blocksRelease: false, meaning: 'Subjective polish or non-required enhancement' },
 } as const satisfies Record<Severity, { blocksRelease: boolean; meaning: string }>);
 
-/** Severities that must be fixed before release. */
 export function blocksRelease(severity: Severity): boolean {
   return SEVERITY_POLICY[severity].blocksRelease;
 }
@@ -251,20 +265,6 @@ export type ReviewOutcomeRecord = z.infer<typeof ReviewOutcomeRecord>;
 // Release adjudication
 // ---------------------------------------------------------------------------
 
-/** Release is permitted only when no blocking criterion is outstanding (§7). */
-export function isReleaseBlocked(issues: readonly { severity: Severity }[]): boolean {
-  return issues.some((i) => blocksRelease(i.severity));
-}
-
-/**
- * Terminal outcomes Sol may legally choose when a budget is exhausted (§7).
- *
- * The document lists these outcomes and, separately, states that P0/P1 must be
- * fixed before release. The intersection is left implicit there but is forced:
- * with a blocking issue open, "accept the documented non-blocking issues" is
- * not available, and the only lawful terminal outcomes are rollback or Blocked.
- * Encoded here rather than left to prompt guidance.
- */
 export const TerminalOutcome = z.enum([
   'accept_non_blocking',
   'switch_strategy',
@@ -275,14 +275,3 @@ export const TerminalOutcome = z.enum([
   'request_human_review',
 ]);
 export type TerminalOutcome = z.infer<typeof TerminalOutcome>;
-
-export function legalTerminalOutcomes(
-  issues: readonly { severity: Severity }[],
-  options: { humanReviewPermitted: boolean },
-): TerminalOutcome[] {
-  const all = TerminalOutcome.options.filter(
-    (o) => o !== 'request_human_review' || options.humanReviewPermitted,
-  );
-  if (!isReleaseBlocked(issues)) return all;
-  return all.filter((o) => o === 'rollback_to_last_accepted' || o === 'mark_blocked' || o === 'request_human_review');
-}

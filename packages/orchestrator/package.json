@@ -11,6 +11,7 @@
     "@statxai/contracts": "workspace:*",
     "@statxai/gates": "workspace:*",
     "@statxai/job-engine": "workspace:*",
+    "@statxai/policy-engine": "workspace:*",
     "@statxai/state": "workspace:*",
     "@statxai/workspace": "workspace:*",
     "zod": "^3.25.76"

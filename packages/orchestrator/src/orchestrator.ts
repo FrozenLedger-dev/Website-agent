@@ -18,8 +18,6 @@ import {
   routeToOutputPath,
   routeToSourcePath,
   intakeGaps,
-  isReleaseBlocked,
-  legalTerminalOutcomes,
   type AgentTier,
   type DeploymentManifest,
   type SitePlan,
@@ -55,39 +53,30 @@ import {
 import { adjudicate, recommendApproval, replanSite } from '@statxai/agents';
 import {
   authorizeAdjudication,
-  fallbackAction,
-  firstBlocker,
-  legalAdjudicationActions,
-  type AdjudicationAuthorization,
-  type AdjudicationConstraints,
-  type AdjudicationRecord,
-} from './adjudication.js';
-import {
   authorizeRelease,
+  authorizeReplanRevision,
+  authorizeRoute,
+  decideTerminal,
+  fallbackAction,
+  firstBlockerId,
+  isReleaseBlocked,
+  legalAdjudicationActions,
+  permittedStrategies,
   RELEASE_POLICY_VERSION,
   terminalForRefusal,
   verifyAcknowledged,
   type AcknowledgementCheck,
-  type ApprovalRecord,
-  type AuthorizationRecord,
+  type AdjudicationAuthorization,
+  type AdjudicationConstraints,
   type ReleaseAuthorization,
   type ReleaseEvidence,
-} from './release.js';
-import {
-  isEmptyDelta,
-  planDelta,
-  scopeViolations,
-  type ReplanRecord,
   type ReplanScope,
-} from './replanning.js';
-import {
-  authorizeRoute,
-  developerOverride,
-  executeRoute,
-  permittedStrategies,
-  type RouteDecisionRecord,
   type RoutingAuthorization,
-} from './routing.js';
+} from '@statxai/policy-engine';
+import type { AdjudicationRecord } from './adjudication.js';
+import type { ApprovalRecord, AuthorizationRecord } from './release.js';
+import { planDelta, type ReplanRecord } from './replanning.js';
+import { developerOverride, executeRoute, type RouteDecisionRecord } from './routing.js';
 import {
   blocking,
   buildFailureDefect,
@@ -344,7 +333,6 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       record.changes = replanned.value.changes;
       record.preservedAreas = replanned.value.preservedAreas;
       record.delta = planDelta(plan, revisedPlan);
-      record.scopeViolations = scopeViolations(context.scope, record.delta);
     } catch (error) {
       record.modelFailure = error instanceof Error ? error.message : String(error);
     }
@@ -364,14 +352,17 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
      * of the history — but the plan is not activated, the site is not cleared,
      * and Sol is not called again.
      */
-    if (revisedPlan && record.scopeViolations.length > 0) {
-      record.rejected = `Revision exceeded the "${record.scope}" scope it was authorised for.`;
-      revisedPlan = null;
-    } else if (revisedPlan && record.delta && isEmptyDelta(record.delta)) {
-      record.rejected =
-        `Sol reported ${record.changes.length} change(s), but the revised plan is ` +
-        'identical to the one that failed.';
-      revisedPlan = null;
+    if (revisedPlan && record.delta) {
+      const permitted = authorizeReplanRevision({
+        scope: context.scope,
+        delta: record.delta,
+        reportedChangeCount: record.changes.length,
+      });
+      record.scopeViolations = permitted.violations;
+      if (!permitted.authorized) {
+        record.rejected = permitted.reason;
+        revisedPlan = null;
+      }
     }
 
     const ref = await registry.put(projectId, 'replan-decision', record);
@@ -1063,7 +1054,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         action,
         // One blocker, not the whole set: with no adjudication there is no
         // judgement about which defects belong together.
-        targets: action === 'repair' ? firstBlocker(mustFix) : [],
+        targetIds: action === 'repair' ? firstBlockerId(mustFix) : [],
         source: 'fallback',
         refusal: `Sol could not be consulted: ${adjudicationFailure}`,
       };
@@ -1074,7 +1065,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       action: adjudication.action,
       source: adjudication.source,
       refusal: adjudication.refusal,
-      targetDefectIds: adjudication.targets.map((d) => d.id),
+      targetDefectIds: [...adjudication.targetIds],
       legalActions: legal,
       constraints,
       proposed: proposedAdjudication,
@@ -1199,13 +1190,17 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       continue;
     }
 
+    // Policy names ids; the orchestrator resolves them back to the defects it
+    // holds, because executing a repair needs the whole object.
+    const targets = mustFix.filter((d) => adjudication.targetIds.includes(d.id));
+
     say({
       phase: 'repair',
-      detail: `Cycle ${reviewCycle}/${budgetLimits.reviewRejections}: repairing ${adjudication.targets.length} of ${mustFix.length} blocking defect(s)`,
+      detail: `Cycle ${reviewCycle}/${budgetLimits.reviewRejections}: repairing ${targets.length} of ${mustFix.length} blocking defect(s)`,
     });
 
     let exhausted = false;
-    for (const defect of adjudication.targets) {
+    for (const defect of targets) {
       try {
         await store.withTransaction((session) =>
           spendRepairAttempt(store, projectId, defect.fingerprint, reviewCycle, session),
@@ -1563,18 +1558,4 @@ function firstErrors(output: string, limit = 3): string {
   const shown = lines.slice(0, limit).join(' · ');
   const rest = lines.length - limit;
   return rest > 0 ? `${shown} (+${rest} more)` : shown;
-}
-
-/**
- * §7's terminal escalation, with the constraint the document leaves implicit
- * made explicit: with a P0/P1 still open, accepting the documented non-blocking
- * issues is not among the lawful outcomes.
- */
-function decideTerminal(defects: readonly Defect[], autonomyMode: string): TerminalOutcome {
-  const legal = legalTerminalOutcomes(defects, {
-    humanReviewPermitted: autonomyMode !== 'full_autonomous',
-  });
-  if (legal.includes('accept_non_blocking')) return 'accept_non_blocking';
-  if (legal.includes('rollback_to_last_accepted')) return 'rollback_to_last_accepted';
-  return 'mark_blocked';
 }

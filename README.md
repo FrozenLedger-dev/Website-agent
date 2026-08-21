@@ -307,6 +307,7 @@ run.
 ```
 packages/
   contracts/    canonical schemas — Zod source, JSON Schema derived
+  policy-engine/ the deterministic rules: what is legal, what is authorised
   state/        collections, indexes, transactions, budgets, run records
   job-engine/   state machine, atomic claim, retry, dependency graph
   workspace/    artifact registry + per-project Git workspace

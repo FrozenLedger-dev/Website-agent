@@ -93,10 +93,10 @@ CI runs two jobs, so the signals stay separable:
 
 | Job | Runs | Needs |
 |---|---|---|
-| Typecheck, lint and unit tests | `pnpm test:unit` — 357 | nothing |
+| Typecheck, lint and unit tests | `pnpm test:unit` — 381 | nothing |
 | Mongo integration tests | `pnpm test:integration` — 45 | the compose replica set |
 
-Together they cover the whole inventory exactly once: 357 + 45 = 402, which is
+Together they cover the whole inventory exactly once: 381 + 45 = 426, which is
 what `pnpm test` runs. The integration job starts the same `docker-compose`
 service developers use, waits for the healthcheck that initiates the replica
 set, and proves the deployment accepts transactions before running anything —
@@ -112,7 +112,8 @@ Neither job holds a credential. No OpenAI key, no deployment token, no
 |---|---|
 | End-to-end refusal regression test | Done — `refusal.integration.test.ts`, 13 tests |
 | CI covers the Mongo-backed suites | Done — a second job, so nothing is outside CI |
-| Extract scattered harness policy into a policy layer | Not started |
+| Extract scattered harness policy into a policy layer (3a) | Done — `packages/policy-engine` |
+| Policy engine consulted by the job engine (3b) | Not started |
 
 The regression test is the opening safety net. The last three defects in the
 approval area were all in the *result* rather than the decision — zeroed
@@ -125,6 +126,85 @@ It runs the real orchestrator against a real store with the model and the build
 toolchain stubbed, and asserts the whole `RunResult`, the persisted project
 state, the artifacts, and that nothing deployed. Verified by mutation:
 reintroducing the `accept_non_blocking` mapping fails four of its assertions.
+
+## Phase 3a — the policy engine
+
+The deterministic rules were already written and already tested; they were just
+spread across four orchestrator modules, mixed in with the code that spends
+budgets, writes MongoDB and calls models. `packages/policy-engine` is that half
+lifted out unchanged.
+
+    @statxai/contracts  →  @statxai/policy-engine  →  @statxai/orchestrator
+
+One direction, and the package in the middle depends on nothing else. It calls
+no model, opens no database, reads no environment variable, touches no file and
+deploys nothing — which is enforced rather than asserted: a test reads its
+sources back and fails on `process.env`, `node:fs`, `fetch`, `MongoClient`,
+`Date.now` or an import of anything but the contracts.
+
+Because it never imports the layer it advises, a defect reaches it as
+`{ id, severity }` and an authorisation hands back **ids**, which the
+orchestrator resolves to its own richer objects. That is the seam that keeps the
+dependency one-way.
+
+### What moved
+
+| Area | Now authoritative in policy-engine |
+|---|---|
+| Routing | `permittedStrategies`, `authorizeRoute` |
+| Adjudication | `legalAdjudicationActions`, `authorizeAdjudication`, `fallbackAction`, `firstBlockerId` |
+| Replanning | `scopeViolations`, `isEmptyDelta`, `authorizeReplanRevision` |
+| Release | `authorizeRelease`, `verifyAcknowledged`, `terminalForRefusal`, `RELEASE_POLICY_VERSION` |
+| Severity | `isReleaseBlocked`, `legalTerminalOutcomes`, `decideTerminal`, `humanReviewPermitted` |
+
+`SEVERITY_POLICY` and `blocksRelease` stayed in the contracts, because
+`ReviewOutcome` refines its own `blocking` field against them and contracts
+cannot import the policy engine without a cycle. The policy engine re-exports
+them rather than restating them, and a test compares the two so a second table
+cannot appear without failing.
+
+### That there is only one copy
+
+The risk in an extraction is not a bad move — it is a partial one: a copy left
+behind that still compiles, still passes its own tests, and disagrees with the
+real implementation six months later. `policy-boundary.test.ts` reads the
+orchestrator's sources back and fails if any of them redeclares a policy export
+or reaches past the package boundary with a deep import. Verified by mutation:
+adding a second `isEmptyDelta` to the orchestrator fails it by name.
+
+### Residual policy audit
+
+**A — extracted.** Everything in the table above.
+
+**B — deliberately left behind**, because it is not policy or cannot be pure:
+
+| Left in the orchestrator | Why |
+|---|---|
+| `developerOverride` | Reads `process.env`. The *override* is applied by policy; collecting it is not policy's job |
+| `isTruncationFailure` | Inspects a thrown runtime error, not a decision |
+| `planDelta` | Measurement over a `SitePlan`, fed *into* policy; needs deep artifact knowledge |
+| `mergeByFingerprint`, `fromGateFinding`, `filesForDefect` | Build defects from gate output and the workspace file list |
+| `executeRoute`, `seekRelease`, `revisePlan` | Orchestration and I/O around a policy call |
+
+**C — real policy that is still implicit.** Named here, not fixed:
+
+1. **Per-fingerprint repair eligibility.** `legalAdjudicationActions` offers
+   `repair` from a *global* `repairsLeft`, but `spendRepairAttempt` charges the
+   budget **per fingerprint**. So Sol can be offered `repair`, choose defects
+   whose individual fingerprint budgets are already spent, and the harness
+   discovers it only at spend time — catching `BudgetExhausted` per defect and
+   continuing. A cycle can therefore be authorised, apply zero repairs, and fall
+   through to the exhaustion guard. Policy has no `repairableFingerprints`
+   input, so it cannot rule those defects out before offering them. Closing it
+   means threading the per-fingerprint remainders into
+   `AdjudicationConstraints`, which changes what gets offered — a behaviour
+   change, so not part of an extraction commit.
+2. `REPAIR_COMPANIONS` decides what a repair is always allowed to see. That is a
+   permission, but it is tied to the Next.js workspace layout rather than to
+   policy.
+3. `decideTerminal`'s preference order is an `if` ladder rather than a declared
+   ranking. Correct today, and pinned by a test asserting it only ever returns
+   something the legal set contained.
 
 ## Phases 4–17
 

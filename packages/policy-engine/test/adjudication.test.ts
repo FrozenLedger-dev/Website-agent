@@ -15,11 +15,11 @@ import {
 import {
   authorizeAdjudication,
   fallbackAction,
-  firstBlocker,
+  firstBlockerId,
   legalAdjudicationActions,
   type AdjudicationConstraints,
+  type PolicyDefect,
 } from '../src/adjudication.js';
-import { fromGateFinding } from '../src/defects.js';
 
 const constraints = (over: Partial<AdjudicationConstraints> = {}): AdjudicationConstraints => ({
   blockingCount: 3,
@@ -31,15 +31,12 @@ const constraints = (over: Partial<AdjudicationConstraints> = {}): AdjudicationC
   ...over,
 });
 
-const defect = (id: string, index: number) => ({
-  ...fromGateFinding(
-    { gate: 'claims', severity: 'P1', location: `p${index}.html`, message: 'm', acceptanceTest: 't' },
-    index,
-  ),
+const defect = (id: string, severity: PolicyDefect['severity'] = 'P1'): PolicyDefect => ({
   id,
+  severity,
 });
 
-const OPEN = [defect('GATE-001', 0), defect('GATE-002', 1), defect('GATE-003', 2)];
+const OPEN = [defect('GATE-001'), defect('GATE-002'), defect('GATE-003')];
 
 const decision = (over: Record<string, unknown> = {}) =>
   SolAdjudicationDecision.parse({
@@ -94,7 +91,7 @@ describe('authorising Sol', () => {
 
     expect(auth.source).toBe('sol');
     expect(auth.action).toBe('repair');
-    expect(auth.targets.map((d) => d.id)).toEqual(['GATE-001', 'GATE-003']);
+    expect(auth.targetIds).toEqual(['GATE-001', 'GATE-003']);
     expect(auth.refusal).toBeNull();
   });
 
@@ -104,7 +101,7 @@ describe('authorising Sol', () => {
       legal,
       OPEN,
     );
-    expect(auth).toMatchObject({ action: 'replan', source: 'sol', targets: [] });
+    expect(auth).toMatchObject({ action: 'replan', source: 'sol', targetIds: [] });
   });
 
   it('follows a block', () => {
@@ -142,7 +139,7 @@ describe('authorising Sol', () => {
     );
 
     expect(auth.source).toBe('sol');
-    expect(auth.targets.map((d) => d.id)).toEqual(['GATE-002']);
+    expect(auth.targetIds).toEqual(['GATE-002']);
     expect(auth.refusal).toContain('GATE-999');
   });
 
@@ -153,7 +150,7 @@ describe('authorising Sol', () => {
     const auth = authorizeAdjudication(decision({ defectIds: ['GATE-999'] }), legal, OPEN);
 
     expect(auth.source).toBe('fallback');
-    expect(auth.targets).toHaveLength(1);
+    expect(auth.targetIds).toHaveLength(1);
   });
 
   it('lets a decision Sol actually made name several defects', () => {
@@ -164,7 +161,7 @@ describe('authorising Sol', () => {
       OPEN,
     );
     expect(auth.source).toBe('sol');
-    expect(auth.targets).toHaveLength(3);
+    expect(auth.targetIds).toHaveLength(3);
   });
 });
 
@@ -221,7 +218,7 @@ describe('a lost adjudication cannot trigger a rebuild', () => {
     const action = fallbackAction(legal);
 
     expect(action).toBe('repair');
-    expect(firstBlocker(OPEN)).toHaveLength(1);
+    expect(firstBlockerId(OPEN)).toHaveLength(1);
   });
 
   it('Sol unavailable, only replan and block legal → block', () => {
@@ -238,7 +235,7 @@ describe('a lost adjudication cannot trigger a rebuild', () => {
 
     expect(auth.source).toBe('fallback');
     expect(auth.action).toBe('block');
-    expect(auth.targets).toEqual([]);
+    expect(auth.targetIds).toEqual([]);
   });
 
   it('a replan Sol actually chose still runs', () => {
@@ -269,34 +266,28 @@ describe('what adjudication cannot do', () => {
     // The authorisation names an action and its targets. Nothing about it
     // mutates a counter; that happens transactionally in the orchestrator.
     const auth = authorizeAdjudication(decision(), legalAdjudicationActions(constraints()), OPEN);
-    expect(Object.keys(auth).sort()).toEqual(['action', 'refusal', 'source', 'targets']);
+    expect(Object.keys(auth).sort()).toEqual(['action', 'refusal', 'source', 'targetIds']);
   });
 });
 
 describe('choosing the one defect a fallback repairs', () => {
-  const at = (id: string, severity: 'P0' | 'P1', index: number) => ({
-    ...fromGateFinding(
-      { gate: 'claims', severity, location: `p${index}.html`, message: 'm', acceptanceTest: 't' },
-      index,
-    ),
-    id,
-  });
+  const at = (id: string, severity: 'P0' | 'P1'): PolicyDefect => ({ id, severity });
 
   it('takes the most severe blocker', () => {
-    const picked = firstBlocker([at('B', 'P1', 0), at('A', 'P0', 1)]);
-    expect(picked.map((d) => d.id)).toEqual(['A']);
+    const picked = firstBlockerId([at('B', 'P1'), at('A', 'P0')]);
+    expect(picked).toEqual(['A']);
   });
 
   it('breaks ties by id, so the choice does not depend on gate ordering', () => {
-    const forwards = firstBlocker([at('GATE-003', 'P1', 0), at('GATE-001', 'P1', 1)]);
-    const backwards = firstBlocker([at('GATE-001', 'P1', 1), at('GATE-003', 'P1', 0)]);
+    const forwards = firstBlockerId([at('GATE-003', 'P1'), at('GATE-001', 'P1')]);
+    const backwards = firstBlockerId([at('GATE-001', 'P1'), at('GATE-003', 'P1')]);
 
-    expect(forwards.map((d) => d.id)).toEqual(['GATE-001']);
-    expect(backwards.map((d) => d.id)).toEqual(['GATE-001']);
+    expect(forwards).toEqual(['GATE-001']);
+    expect(backwards).toEqual(['GATE-001']);
   });
 
   it('returns nothing when there is nothing blocking', () => {
-    expect(firstBlocker([])).toEqual([]);
+    expect(firstBlockerId([])).toEqual([]);
   });
 });
 
