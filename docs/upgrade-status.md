@@ -112,8 +112,8 @@ Neither job holds a credential. No OpenAI key, no deployment token, no
 |---|---|
 | End-to-end refusal regression test | Done — `refusal.integration.test.ts`, 13 tests |
 | CI covers the Mongo-backed suites | Done — a second job, so nothing is outside CI |
-| Extract scattered harness policy into a policy layer (3a) | Done — `packages/policy-engine` |
-| Policy engine consulted by the job engine (3b) | Not started |
+| Extract scattered harness policy into a policy layer (3a) | Done — `packages/policy-engine` — both CI checks green on `70a86ba` |
+| Harden the policy the extraction froze (3b) | Next — the two category-C items below |
 
 The regression test is the opening safety net. The last three defects in the
 approval area were all in the *result* rather than the decision — zeroed
@@ -199,10 +199,23 @@ adding a second `isEmptyDelta` to the orchestrator fails it by name.
    means threading the per-fingerprint remainders into
    `AdjudicationConstraints`, which changes what gets offered — a behaviour
    change, so not part of an extraction commit.
-2. `REPAIR_COMPANIONS` decides what a repair is always allowed to see. That is a
+2. **A decomposition that names only the homepage.** `authorizeRoute` documents
+   three ways Sol's choice does not survive, and implements two: the third —
+   decomposing while naming no route other than the homepage, which the anchor
+   already builds — is described in the comment and absent from the code, and no
+   test covers it. On a five-page plan, `decompose` with a single `/` workstream
+   is authorised today.
+
+   It does not break a build, because `executeDecomposed` never reads
+   `decision.workstreams`: it builds the anchor, then every remaining page from
+   the sitemap. So the workstreams are recorded on the `route-decision` artifact
+   and then ignored, which makes this a contract/policy inconsistency rather
+   than an execution failure — and makes the audit trail claim a decomposition
+   plan the run did not follow. Predates the extraction.
+3. `REPAIR_COMPANIONS` decides what a repair is always allowed to see. That is a
    permission, but it is tied to the Next.js workspace layout rather than to
    policy.
-3. `decideTerminal`'s preference order is an `if` ladder rather than a declared
+4. `decideTerminal`'s preference order is an `if` ladder rather than a declared
    ranking. Correct today, and pinned by a test asserting it only ever returns
    something the legal set contained.
 
