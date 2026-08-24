@@ -3,9 +3,11 @@ import { defineConfig } from 'vitest/config';
 /**
  * The suites that need no infrastructure.
  *
- * Four files connect to a real Mongo replica set, deliberately: the properties
- * they pin are transaction semantics and end-to-end orchestration, and mocking
- * the driver would assert only that the code calls the functions it calls.
+ * The suites excluded below connect to a real Mongo replica set, deliberately:
+ * the properties they pin are transaction semantics and end-to-end
+ * orchestration, and mocking the driver would assert only that the code calls
+ * the functions it calls. Anything named `*.integration.test.ts` is one of
+ * them, plus three older suites named before that convention existed.
  *
  * They run in CI too, as a separate job driven by `vitest.integration.config.ts`.
  * The split exists so the two signals stay readable and so a developer without

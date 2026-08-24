@@ -252,11 +252,6 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   const ctx = (): RunContext => ({ deps, facts, progress: snapshot() });
 
   while (true) {
-    await store.projects.updateOne(
-      { _id: projectId },
-      { $set: { state: 'validating', updatedAt: new Date() } },
-    );
-
     const evaluation = await evaluateSite(ctx());
 
     if (evaluation.kind === 'review_unavailable') {

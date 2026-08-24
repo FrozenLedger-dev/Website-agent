@@ -93,10 +93,10 @@ CI runs two jobs, so the signals stay separable:
 
 | Job | Runs | Needs |
 |---|---|---|
-| Typecheck, lint and unit tests | `pnpm test:unit` — 415 | nothing |
+| Typecheck, lint and unit tests | `pnpm test:unit` — 418 | nothing |
 | Mongo integration tests | `pnpm test:integration` — 61 | the compose replica set |
 
-Together they cover the whole inventory exactly once: 415 + 61 = 476, which is
+Together they cover the whole inventory exactly once: 418 + 61 = 479, which is
 what `pnpm test` runs. The integration job starts the same `docker-compose`
 service developers use, waits for the healthcheck that initiates the replica
 set, and proves the deployment accepts transactions before running anything —
@@ -462,6 +462,19 @@ Fifteen source-reading tests moved with their subject: they pin ordering and
 reachability by scanning source, so an extraction relocates what they read
 without changing what they assert.
 
+### One parity regression, found in review
+
+The extraction lifted the `validating` transition into `evaluateSite` **and**
+left a copy in the loop that calls it, so every evaluation cycle performed two
+writes and two `updatedAt` bumps instead of one. The final state was identical,
+which is exactly why a suite that asserts outcomes could not see it.
+
+Fixed by letting the phase that does the work own the transition into it.
+`state-transitions.test.ts` now pins the whole surface as a count — every state
+and every file it is written from — so a duplicate fails by name. `blocked` is
+the one state written twice, from two mutually exclusive terminal exits, and the
+test says so rather than leaving the number unexplained.
+
 ### Deferred to Phase 4b
 
 - **Repair execution** is still inline in the loop — about 110 lines spending
@@ -472,6 +485,16 @@ without changing what they assert.
 - `runProject` still declares the run's mutable state as locals with a
   `snapshot()` view rather than owning a `RunProgress` object outright. That
   conversion touches ~180 references and is worth doing on its own.
+- **`snapshot()` is shallow.** `openDefects`, `repairHistory`, `gatesCertified`
+  and the telemetry objects are shared references, so the documented "a phase
+  gets a copy" is a convention rather than something the type enforces. No
+  extracted phase mutates them today. When 4b introduces a real `RunProgress`,
+  make the phase inputs `readonly` or clone the mutable collections deliberately.
+- **Artifact lineage is ordered by `createdAt` alone**, at millisecond
+  resolution, relying on the awaits between writes to separate them. Stable in
+  practice and not worth a schema change during an extraction — but if CI ever
+  shows a sporadic lineage-order failure, that is the cause, and the fix is a
+  monotonic sequence on the artifact rather than a looser assertion.
 
 Phase 4 is **not** complete. Phase 5 — mapping these boundaries onto the job
 engine — is not started, deliberately: the job engine keeps its own enqueue,
