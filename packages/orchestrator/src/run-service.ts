@@ -8,7 +8,8 @@
  * preceded it.
  */
 import { RunRecorder, type RunStatus, type StateStore } from '@statxai/state';
-import { runProject, type RunOptions, type RunResult } from './orchestrator.js';
+import { runProject, type RunOptions } from './orchestrator.js';
+import type { RunResult } from './phases/conclude.js';
 
 export interface LaunchOptions {
   store: StateStore;

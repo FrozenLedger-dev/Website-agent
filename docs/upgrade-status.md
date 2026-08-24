@@ -94,9 +94,9 @@ CI runs two jobs, so the signals stay separable:
 | Job | Runs | Needs |
 |---|---|---|
 | Typecheck, lint and unit tests | `pnpm test:unit` — 415 | nothing |
-| Mongo integration tests | `pnpm test:integration` — 53 | the compose replica set |
+| Mongo integration tests | `pnpm test:integration` — 61 | the compose replica set |
 
-Together they cover the whole inventory exactly once: 415 + 53 = 468, which is
+Together they cover the whole inventory exactly once: 415 + 61 = 476, which is
 what `pnpm test` runs. The integration job starts the same `docker-compose`
 service developers use, waits for the healthcheck that initiates the replica
 set, and proves the deployment accepts transactions before running anything —
@@ -361,6 +361,123 @@ The release-refusal branch still assigned a terminal outcome with
 `terminalForRefusal`. Removed — it was a second copy of a rule the policy engine
 owns, which is exactly what the boundary test exists to prevent.
 
-## Phases 4–17
+## Phase 4a — orchestrator phase extraction — **DONE**
+
+An extraction. No intentional behaviour change: no model, policy, budget,
+artifact, state, release, routing, repair, replan or deployment semantics move.
+
+### Before
+
+`runProject` was one function of **1,438 lines** doing everything: intake
+validation, workspace setup, planning, routing, building, compiling, gating,
+reviewing, adjudicating, repairing, replanning, approving, authorising,
+deploying and reporting. Twelve helpers were declared inside it, all closing
+over the same twenty-odd mutable locals — so a phase's inputs were whatever
+happened to be in scope, and nothing could be read or tested on its own.
+
+### After
+
+`runProject` is **530 lines** and `orchestrator.ts` is **610**, down from 1,582.
+What remains is workflow control: set up telemetry, validate intake, create the
+project, plan, build, then the convergence loop, then finalise.
+
+    orchestrator.ts   1,582 → 610
+    runProject        1,438 → 530
+
+The loop is deliberately still a loop, written out rather than hidden behind a
+framework:
+
+    evaluate
+        ↓
+    nothing blocking? ──yes──→ seek release ──→ break
+        ↓ no
+    adjudicate
+        ↓
+    block → break   replan → revise, rebuild, continue   repair → apply, continue
+
+### The phases
+
+| Module | Owns |
+|---|---|
+| `phases/planning.ts` | `producePlan`, `persistPlan`, `revisePlan` |
+| `phases/build.ts` | route decision, one-shot and decomposed execution, scaffold |
+| `phases/evaluate.ts` | compile, gates, review, defect merge, `test-report`, `visual-review` |
+| `phases/adjudicate.ts` | constraints, legal actions, Sol, authorisation, `adjudication-decision` |
+| `phases/release.ts` | recommendation, acknowledgement check, authorisation, both artifacts |
+| `phases/publish.ts` | release commit, deploy with retry, `deployment-manifest` |
+| `phases/conclude.ts` | the two exits, kept apart on purpose |
+
+### The context
+
+`run-context.ts` splits what a phase is handed three ways, because "an input"
+and "a result" should not be two fields in one bag:
+
+- **`RunDeps`** — collaborators, fixed for the run.
+- **`RunFacts`** — the canonical inputs. Nothing may revise these, the same
+  guarantee the decision contracts give.
+- **`RunProgress`** — what the run has done so far.
+
+`FixedContext` is `deps` + `facts`, for the phases that reason about no
+progress at all — planning and building take it, which is both a smaller
+surface and the reason they can run before any progress exists.
+
+`snapshot()` assembles the progress a phase may read at the moment it is called,
+as a **copy**: a phase reports what it found and the caller decides what to
+remember. `seekRelease` returning its approval provenance rather than assigning
+it is the clearest example.
+
+**No budget is cached.** `RunFacts.budgetLimits` is the ceiling and never the
+usage; what has been spent is read from the store when a decision needs it and
+spent inside a transaction in `@statxai/state`. A snapshot is evidence for a
+decision, never permission to skip the spend.
+
+### Two discriminated results
+
+Only where they made control flow clearer, per the brief:
+
+- `EvaluationOutcome` is `evaluated | review_unavailable`. The review failure
+  used to `break` out of a loop belonging to someone else; it is now a value the
+  caller reads.
+- `AdjudicationOutcome` carries the authorisation, Sol's proposal, the
+  constraints and the legal set — the phase decides and records, and the loop
+  spends the budgets and runs the action.
+
+### What did not move
+
+Authority. Policy still receives facts and returns decisions, and gained no
+persistence, model call, workspace access, environment read, timestamp or
+deployment call — `policy-boundary.test.ts` still enforces that. Budget spending
+stays transactional in `@statxai/state`. The model skills stay model skills:
+Sol plans, routes, adjudicates, replans and recommends; Terra builds and
+reviews; Luna repairs.
+
+### Parity
+
+`refusal.integration.test.ts` is unchanged and green. `delivery.parity.
+integration.test.ts` was added *first*, characterising the released path — which
+had no end-to-end assertion at all — plus artifact lineage, phase order, budget
+usage, the replan path and the undeployed-but-released case.
+
+Fifteen source-reading tests moved with their subject: they pin ordering and
+reachability by scanning source, so an extraction relocates what they read
+without changing what they assert.
+
+### Deferred to Phase 4b
+
+- **Repair execution** is still inline in the loop — about 110 lines spending
+  the per-defect budget, scoping files and calling Luna. It is the one phase
+  boundary left, and the only substantial block still in `runProject`.
+- **Intake and project setup** (~45 lines) is still inline. Cohesive enough to
+  extract, small enough not to be urgent.
+- `runProject` still declares the run's mutable state as locals with a
+  `snapshot()` view rather than owning a `RunProgress` object outright. That
+  conversion touches ~180 references and is worth doing on its own.
+
+Phase 4 is **not** complete. Phase 5 — mapping these boundaries onto the job
+engine — is not started, deliberately: the job engine keeps its own enqueue,
+claim, transition, retry, lease and conflict handling, and nothing in Phase 4a
+routes a run through it.
+
+## Phases 5–17
 
 Not started.

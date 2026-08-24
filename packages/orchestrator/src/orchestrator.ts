@@ -14,88 +14,45 @@
  */
 import {
   BusinessProfile,
-  HOME_ROUTE,
-  routeToOutputPath,
-  routeToSourcePath,
   intakeGaps,
   type AgentTier,
-  type DeploymentManifest,
-  type SitePlan,
-  type SolApprovalRecommendation,
   type TerminalOutcome,
 } from '@statxai/contracts';
 import {
-  buildAnchor,
-  buildPage,
-  buildSite,
   ModelClient,
-  planSite,
   repairDefect,
-  routeBuild,
-  reviewSite,
   type UsageByTier,
 } from '@statxai/agents';
-import { isFrameworkPage, runGates } from '@statxai/gates';
 import { BudgetExhausted, createBudget, spend, spendRepairAttempt, type StateStore } from '@statxai/state';
 import {
   ArtifactRegistry,
   ProjectWorkspace,
-  buildSite as compileSite,
-  deploySite,
-  deploymentConfigured,
-  readBuiltFiles,
-  readExportFiles,
-  readSourceFiles,
-  scaffoldSite,
-  type BuildResult,
-  type DeployResult,
 } from '@statxai/workspace';
-import { adjudicate, recommendApproval, replanSite } from '@statxai/agents';
 import {
-  authorizeAdjudication,
-  authorizeRelease,
-  authorizeReplanRevision,
-  authorizeRoute,
   decideTerminal,
-  fallbackAction,
-  firstBlockerId,
-  repairEligibility,
-  repairableDefects,
   isReleaseBlocked,
-  legalAdjudicationActions,
-  maxRepairTargets,
-  permittedStrategies,
-  RELEASE_POLICY_VERSION,
   terminalForRefusal,
-  verifyAcknowledged,
-  type AcknowledgementCheck,
-  type AdjudicationAuthorization,
-  type AdjudicationConstraints,
   type ReleaseAuthorization,
-  type ReleaseEvidence,
   type ReplanScope,
-  type RoutingAuthorization,
 } from '@statxai/policy-engine';
-import { recordedConstraints, type AdjudicationRecord } from './adjudication.js';
-import type { ApprovalRecord, AuthorizationRecord } from './release.js';
-import { planDelta, type ReplanRecord } from './replanning.js';
-import { developerOverride, executeRoute, type RouteDecisionRecord } from './routing.js';
+import { concluded, withoutDelivery, type RunResult } from './phases/conclude.js';
+import { buildFromPlan } from './phases/build.js';
+import { adjudicateDefects } from './phases/adjudicate.js';
+import { evaluateSite } from './phases/evaluate.js';
+import { producePlan, revisePlan } from './phases/planning.js';
+import { publishRelease } from './phases/publish.js';
+import { seekRelease } from './phases/release.js';
+import type { Progress, RunContext, RunDeps, RunFacts, RunProgress } from './run-context.js';
+
+export type { RunResult } from './phases/conclude.js';
+export type { Progress } from './run-context.js';
 import {
   blocking,
-  buildFailureDefect,
   filesForDefect,
-  fromGateFinding,
-  fromReviewIssue,
-  mergeByFingerprint,
   REPAIR_COMPANIONS,
   type Defect,
 } from './defects.js';
 
-export type Progress = (event: {
-  phase: string;
-  detail: string;
-  level?: 'info' | 'warn' | 'ok' | 'fail';
-}) => void;
 
 export interface RunOptions {
   projectId: string;
@@ -104,22 +61,6 @@ export interface RunOptions {
   workspacesRoot: string;
   autonomyMode?: 'full_autonomous' | 'supervised_autonomous' | 'human_in_the_loop';
   onProgress?: Progress;
-}
-
-export interface RunResult {
-  projectId: string;
-  outcome: 'released' | 'blocked' | 'intake_insufficient';
-  terminalDecision?: TerminalOutcome;
-  qualityScore: number;
-  reviewCycles: number;
-  repairsApplied: number;
-  openDefects: Defect[];
-  commit: string | null;
-  siteRoot: string;
-  manifest?: DeploymentManifest;
-  usage: { inputTokens: number; outputTokens: number; calls: number };
-  usageByTier: UsageByTier;
-  phaseMs: Record<string, number>;
 }
 
 export async function runProject(options: RunOptions): Promise<RunResult> {
@@ -176,7 +117,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   const parsed = BusinessProfile.safeParse(options.intake);
   if (!parsed.success) {
     say({ phase: 'discover', detail: `Intake rejected: ${parsed.error.issues[0]?.message}`, level: 'fail' });
-    return terminal('intake_insufficient');
+    return withoutDelivery(projectId, 'intake_insufficient', { usage, usageByTier, phaseMs });
   }
   const profile = parsed.data;
 
@@ -185,7 +126,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   const gaps = intakeGaps(profile);
   if (gaps.length > 0) {
     say({ phase: 'discover', detail: `Intake insufficient: ${gaps.join('; ')}`, level: 'fail' });
-    return terminal('intake_insufficient');
+    return withoutDelivery(projectId, 'intake_insufficient', { usage, usageByTier, phaseMs });
   }
   say({ phase: 'discover', detail: `${profile.businessName} — ${profile.services.length} services`, level: 'ok' });
 
@@ -208,207 +149,30 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   await registry.accept(projectId, profileRef);
   await workspace.materialiseArtifact('client/business-profile.json', profile);
 
+  /**
+   * What a phase is handed.
+   *
+   * `deps` and `facts` are fixed for the run, so they are assembled before
+   * anything happens. `snapshot()` — defined once the run has progress to
+   * report — assembles what a phase may read at the moment it is called, and
+   * deliberately as a copy: a phase reports what it found, and the caller
+   * decides what to remember.
+   *
+   * Nothing here caches a budget. `budgetLimits` is the ceiling and never the
+   * usage; what has been spent is read from the store when a decision needs it
+   * and spent inside a transaction, because a snapshot is evidence for a
+   * decision and never permission to skip the spend.
+   */
+  const deps: RunDeps = { store, registry, workspace, model, say, track };
+  const facts: RunFacts = {
+    projectId,
+    profile,
+    autonomyMode,
+    budgetLimits: (await store.budgets.findOne({ _id: projectId }))!.limits,
+  };
+
   // -- Phase 2: Plan --------------------------------------------------------
-  async function producePlan(attempt: number): Promise<SitePlan> {
-    say({
-      phase: 'plan',
-      detail: attempt === 0 ? 'Sol is producing the specification' : 'Sol is revising the specification',
-    });
-    const planned = await planSite(model, profile);
-    track('sol', planned);
-    const produced = planned.value;
-
-    say({
-      phase: 'plan',
-      detail: `${produced.sitemap.pages.length} pages, ${produced.acceptanceCriteria.length} acceptance criteria (${planned.model}, ${(planned.ms / 1000).toFixed(1)}s)`,
-      level: 'ok',
-    });
-
-    await persistPlan(produced);
-    return produced;
-  }
-
-  /**
-   * Store a plan as the next version of `site-plan`.
-   *
-   * Shared by the initial plan and by every revision, so a replan appends to
-   * the history rather than overwriting it: the plan that failed stays readable
-   * next to the one that replaced it, which is what makes the audit trail —
-   * plan v1 → evidence → adjudication → replan decision → plan v2 —
-   * reconstructable.
-   */
-  async function persistPlan(produced: SitePlan): Promise<void> {
-    const ref = await registry.put(projectId, 'site-plan', produced);
-    await registry.accept(projectId, ref);
-    await workspace.materialiseArtifact('design/brand-system.json', produced.brandSystem);
-    await workspace.materialiseArtifact('specs/sitemap.json', produced.sitemap);
-    for (const page of produced.sitemap.pages) {
-      const slug = page.route === HOME_ROUTE ? 'home' : page.route.replace(/^\//, '').replace(/\//g, '_');
-      await workspace.materialiseArtifact(`specs/pages/${slug}.json`, page);
-    }
-  }
-
-  let plan = await producePlan(0);
-
-  /**
-   * Revise the failed specification, or return null.
-   *
-   * Everything the revision needs is passed as a structured runtime value —
-   * the plan object itself, the open defects, the gate findings, the repair
-   * outcomes — rather than reconstructed from progress prose after the fact.
-   *
-   * Returns null when Sol cannot be consulted or its answer does not satisfy
-   * its contract. The caller stops rather than regenerating: falling back to
-   * the planner would reinstate the defect this replaces.
-   */
-  async function revisePlan(context: {
-    scope: ReplanScope;
-    adjudicationReason: string;
-    unresolvedDefects: readonly Defect[];
-    gateFindings: readonly string[];
-    reviewSummary: string | null;
-  }): Promise<SitePlan | null> {
-    const budget = (await store.budgets.findOne({ _id: projectId }))!;
-
-    // Versions are read before the new ones are written, so the record points
-    // at what this revision actually came from.
-    const previousPlanDoc = await store.artifacts.findOne(
-      { projectId, name: 'site-plan' },
-      { sort: { version: -1 } },
-    );
-    const adjudicationDoc = await store.artifacts.findOne(
-      { projectId, name: 'adjudication-decision' },
-      { sort: { version: -1 } },
-    );
-
-    say({
-      phase: 'replan',
-      detail: `Sol is revising the specification (scope ${context.scope}, ${context.unresolvedDefects.length} unresolved)`,
-    });
-
-    const record: ReplanRecord = {
-      reviewCycle,
-      previousPlanVersion: previousPlanDoc?.version ?? null,
-      adjudicationVersion: adjudicationDoc?.version ?? null,
-      adjudicationReason: context.adjudicationReason,
-      scope: context.scope,
-      failureDiagnosis: null,
-      changes: [],
-      preservedAreas: [],
-      delta: null,
-      scopeViolations: [],
-      rejected: null,
-      model: null,
-      modelFailure: null,
-      decidedAt: new Date(),
-    };
-
-    let revisedPlan: SitePlan | null = null;
-
-    try {
-      const replanned = await replanSite(model, {
-        profile,
-        reviewCycle,
-        previousPlan: plan,
-        adjudicationReason: context.adjudicationReason,
-        scope: context.scope,
-        unresolvedDefects: context.unresolvedDefects.map((d) => ({
-          id: d.id,
-          category: d.category,
-          severity: d.severity,
-          location: d.location,
-          reason: d.reason,
-        })),
-        gateFindings: [...context.gateFindings],
-        reviewSummary: context.reviewSummary,
-        repairHistory: [...repairHistory],
-        remainingBudgets: {
-          totalRepairJobs: budget.limits.totalRepairJobs - budget.used.totalRepairJobs,
-          replans: budget.limits.replans - budget.used.replans,
-          reviewRejections: budget.limits.reviewRejections - budget.used.reviewRejections,
-        },
-      });
-      track('sol', replanned);
-
-      revisedPlan = replanned.value.revisedPlan;
-      record.model = replanned.model;
-      record.failureDiagnosis = replanned.value.failureDiagnosis;
-      record.changes = replanned.value.changes;
-      record.preservedAreas = replanned.value.preservedAreas;
-      record.delta = planDelta(plan, revisedPlan);
-    } catch (error) {
-      record.modelFailure = error instanceof Error ? error.message : String(error);
-    }
-
-    /**
-     * Two objective reasons to refuse a revision that parsed cleanly.
-     *
-     * A scope violation is not a narrow revision that went slightly wide: it is
-     * a different decision from the one adjudication authorised, and executing
-     * it would let the requested scope mean nothing.
-     *
-     * An empty delta means Sol reported changes the plan does not contain.
-     * Rebuilding from it would reproduce the site that just failed, spend the
-     * cycle, and arrive at the same defects.
-     *
-     * Either way the decision is still persisted — a refused revision is part
-     * of the history — but the plan is not activated, the site is not cleared,
-     * and Sol is not called again.
-     */
-    if (revisedPlan && record.delta) {
-      const permitted = authorizeReplanRevision({
-        scope: context.scope,
-        delta: record.delta,
-        reportedChangeCount: record.changes.length,
-      });
-      record.scopeViolations = permitted.violations;
-      if (!permitted.authorized) {
-        record.rejected = permitted.reason;
-        revisedPlan = null;
-      }
-    }
-
-    const ref = await registry.put(projectId, 'replan-decision', record);
-    await registry.accept(projectId, ref);
-    await workspace.materialiseArtifact(
-      `decisions/replan-${String(reviewCycle).padStart(2, '0')}.json`,
-      record,
-    );
-
-    if (record.modelFailure) {
-      say({
-        phase: 'replan',
-        detail: `Sol could not revise the specification: ${record.modelFailure}`,
-        level: 'fail',
-      });
-      return null;
-    }
-
-    if (record.rejected) {
-      for (const violation of record.scopeViolations) {
-        say({ phase: 'replan', detail: `Scope exceeded — ${violation}`, level: 'fail' });
-      }
-      say({ phase: 'replan', detail: `Revision refused: ${record.rejected}`, level: 'fail' });
-      return null;
-    }
-
-    // A new version of site-plan, never an overwrite: the plan that failed
-    // stays readable next to the one that replaced it. Reached only by a
-    // revision the harness accepted.
-    await persistPlan(revisedPlan!);
-
-    const d = record.delta!;
-    say({
-      phase: 'replan',
-      detail:
-        `${record.changes.length} change(s): ` +
-        `+${d.routesAdded.length}/-${d.routesRemoved.length}/~${d.routesRevised.length} routes` +
-        `${d.brandChanged ? ', brand revised' : ''} — ${record.failureDiagnosis}`,
-      level: 'ok',
-    });
-
-    return revisedPlan;
-  }
+  let plan = await producePlan({ deps, facts }, 0);
 
   // -- Phase 3: Build (one-shot first) --------------------------------------
   /**
@@ -425,347 +189,8 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
    * same lineage and a reader can see that one-shot was chosen and then had to
    * be abandoned — rather than seeing only the strategy that finally ran.
    */
-  async function recordRoute(
-    authorization: RoutingAuthorization,
-    proposed: RouteDecisionRecord['proposed'],
-    modelFailure: string | null,
-  ): Promise<void> {
-    const record: RouteDecisionRecord = {
-      strategy: authorization.strategy,
-      source: authorization.source,
-      refusal: authorization.refusal,
-      proposed,
-      modelFailure,
-      decidedAt: new Date(),
-    };
-    const ref = await registry.put(projectId, 'route-decision', record);
-    await registry.accept(projectId, ref);
-    await workspace.materialiseArtifact('decisions/route-decision.json', record);
-  }
 
-  /** Persist an adjudication outcome as a versioned artifact. */
-  async function recordAdjudication(record: AdjudicationRecord): Promise<void> {
-    const ref = await registry.put(projectId, 'adjudication-decision', record);
-    await registry.accept(projectId, ref);
-    await workspace.materialiseArtifact(
-      `decisions/adjudication-${String(record.reviewCycle).padStart(2, '0')}.json`,
-      record,
-    );
-  }
-
-  async function decideStrategy(current: SitePlan): Promise<RoutingAuthorization> {
-    const override = developerOverride();
-    const permitted = permittedStrategies(current);
-
-    let authorization: RoutingAuthorization;
-    let proposed: RouteDecisionRecord['proposed'] = null;
-    let modelFailure: string | null = null;
-
-    try {
-      const routed = await routeBuild(model, profile, current, {
-        pageCount: current.sitemap.pages.length,
-        sectionCount: current.sitemap.pages.reduce((n, p) => n + p.sections.length, 0),
-        serviceCount: profile.services.length,
-        permittedStrategies: permitted,
-      });
-      track('sol', routed);
-
-      proposed = {
-        action: routed.value.action,
-        reason: routed.value.reason,
-        confidence: routed.value.confidence,
-        workstreams: routed.value.workstreams ?? [],
-      };
-      authorization = authorizeRoute(routed.value, current, override);
-    } catch (error) {
-      /**
-       * Routing is a preference between two working paths, so a model failure
-       * must not end a delivery. The run falls back to the documented default
-       * and says so; it does not silently behave as though Sol had chosen.
-       */
-      modelFailure = error instanceof Error ? error.message : String(error);
-      authorization = {
-        strategy: override ?? 'one_shot',
-        source: override ? 'developer-override' : 'fallback',
-        refusal: `Sol could not be consulted: ${modelFailure}`,
-      };
-    }
-
-    await recordRoute(authorization, proposed, modelFailure);
-
-    say({
-      phase: 'build',
-      detail:
-        authorization.source === 'sol'
-          ? `Sol routed to ${authorization.strategy} (confidence ${proposed?.confidence.toFixed(2) ?? '—'}): ${proposed?.reason ?? ''}`
-          : `${authorization.strategy} by ${authorization.source} — ${authorization.refusal ?? ''}`,
-      level: authorization.source === 'sol' ? 'ok' : 'warn',
-    });
-
-    return authorization;
-  }
-
-  /**
-   * One call writes the whole site.
-   *
-   * Coherent by construction: the layout, the brand tokens and every page come
-   * out of one response, so the navigation, spacing and component vocabulary
-   * cannot drift between pages. It fails when the site does not fit the output
-   * ceiling, which is a genuine runtime failure and is handled as one.
-   */
-  async function executeOneShot(current: SitePlan): Promise<void> {
-    say({ phase: 'build', detail: 'Terra is attempting the complete site in one pass' });
-
-    const built = await buildSite(model, profile, current);
-    track('terra', built);
-    await workspace.writeSiteFiles(built.value.files);
-
-    say({
-      phase: 'build',
-      detail: `One-shot succeeded: ${built.value.files.length} files (${built.model}, ${(built.ms / 1000).toFixed(1)}s, ${built.outputTokens} out)`,
-      level: 'ok',
-    });
-  }
-
-  /**
-   * An anchor, then the remaining pages in parallel against it.
-   *
-   * Each call stays well below the output ceiling, at the cost of later pages
-   * being built to match a reference rather than written alongside it.
-   */
-  async function executeDecomposed(current: SitePlan): Promise<void> {
-    const anchor = await buildAnchor(model, profile, current);
-    track('terra', anchor);
-    await workspace.writeSiteFiles(anchor.value.files);
-
-    // The homepage anchors the design system. Selecting by array order once put
-    // a nested FAQ page in this role.
-    const home = current.sitemap.pages.find((p) => p.route === HOME_ROUTE) ?? current.sitemap.pages[0]!;
-    const homeSource = routeToSourcePath(home.route);
-    const anchorSource = anchor.value.files.find((f) => f.path === homeSource)?.contents ?? '';
-    const layoutSource = anchor.value.files.find((f) => f.path === 'app/layout.tsx')?.contents ?? '';
-    say({ phase: 'build', detail: `Anchor: layout + ${homeSource}`, level: 'ok' });
-
-    // Pages are independent given the anchor, and each writes a distinct file,
-    // so there is no output conflict to serialise — they can run concurrently.
-    const rest = current.sitemap.pages.filter((p) => p.route !== home.route);
-    const pages = await Promise.all(
-      rest.map((page) => buildPage(model, profile, current, page, anchorSource, layoutSource)),
-    );
-    for (const page of pages) {
-      track('terra', page);
-      await workspace.writeSiteFiles(page.value.files);
-    }
-    say({ phase: 'build', detail: `${rest.length} further pages built in parallel`, level: 'ok' });
-  }
-
-  async function buildFromPlan(current: SitePlan): Promise<void> {
-    await store.projects.updateOne({ _id: projectId }, { $set: { state: 'building', updatedAt: new Date() } });
-
-    // The scaffold carries the toolchain, the dependency set and the shadcn
-    // primitives. Terra writes pages against it and never installs anything, so
-    // a build failure is always about the site rather than the toolchain.
-    await scaffoldSite(workspace.siteRoot);
-
-    /**
-     * The accepted route is executed directly.
-     *
-     * Decomposition used to be reached by throwing
-     * `MalformedModelOutput('forced: output truncated')` so the truncation
-     * handler would catch it. That made a deliberate strategy and a runtime
-     * failure the same code path, and indistinguishable afterwards. Each
-     * strategy now has its own function and its own call.
-     */
-    const route = await decideStrategy(current);
-
-    await executeRoute(route, current, {
-      oneShot: () => executeOneShot(current),
-      decomposed: async () => {
-        say({
-          phase: 'build',
-          detail: 'Building by decomposition: anchor first, then pages in parallel',
-        });
-        await executeDecomposed(current);
-      },
-      onRecovery: async (error) => {
-        say({
-          phase: 'build',
-          detail: 'One-shot exceeded the output ceiling — recovering by decomposition',
-          level: 'warn',
-        });
-        // A further version of the same artifact, so the trail reads "Sol chose
-        // one-shot, then the harness recovered" rather than implying that
-        // decomposition had been chosen.
-        await recordRoute(
-          {
-            strategy: 'decompose',
-            source: 'truncation-recovery',
-            refusal: `One-shot exceeded the output ceiling: ${error instanceof Error ? error.message : String(error)}`,
-          },
-          null,
-          null,
-        );
-      },
-    });
-
-    await workspace.commit('Terra: build');
-  }
-
-  await buildFromPlan(plan);
-
-  /**
-   * Sol judges the release; the harness decides it.
-   *
-   * Two artifacts, in that order, because the trail has to be able to show a
-   * recommendation and an authorisation that disagree. Deployment is reachable
-   * only through the authorisation this returns.
-   */
-  async function seekRelease(context: {
-    gateRun: { passed: boolean; findings: { severity: string; gate: string; location: string; message: string }[]; gatesRun: string[] };
-    buildOk: boolean;
-    buildSummary: string;
-    reviewSummary: string | null;
-    openNonBlocking: readonly Defect[];
-  }): Promise<ReleaseAuthorization> {
-    const planDoc = await store.artifacts.findOne({ projectId, name: 'site-plan' }, { sort: { version: -1 } });
-    const reportDoc = await store.artifacts.findOne({ projectId, name: 'test-report' }, { sort: { version: -1 } });
-    const reviewDoc = await store.artifacts.findOne({ projectId, name: 'visual-review' }, { sort: { version: -1 } });
-
-    const evidence: ReleaseEvidence = {
-      blockingDefects: 0,
-      buildSucceeded: context.buildOk,
-      gatesPassed: context.gateRun.passed,
-      autonomyMode,
-      deploymentConfigured: deploymentConfigured(),
-    };
-
-    const record: ApprovalRecord = {
-      reviewCycle,
-      sitePlanVersion: planDoc?.version ?? null,
-      testReportVersion: reportDoc?.version ?? null,
-      visualReviewVersion: reviewDoc?.version ?? null,
-      recommendation: null,
-      reason: null,
-      acknowledgedIssues: [],
-      unverifiableIssues: [],
-      model: null,
-      modelFailure: null,
-      decidedAt: new Date(),
-    };
-
-    let recommendation: SolApprovalRecommendation | null = null;
-    let checked: AcknowledgementCheck | undefined;
-
-    try {
-      const recommended = await recommendApproval(model, {
-        reviewCycle,
-        plan,
-        profile,
-        qualityScore,
-        blockingCount: 0,
-        gatesRun: context.gateRun.gatesRun,
-        gateFindings: context.gateRun.findings.map(
-          (f) => `${f.severity} ${f.gate} ${f.location} — ${f.message}`,
-        ),
-        buildSummary: context.buildSummary,
-        reviewSummary: context.reviewSummary,
-        openNonBlocking: context.openNonBlocking.map((d) => ({
-          id: d.id,
-          severity: d.severity,
-          category: d.category,
-          location: d.location,
-          reason: d.reason,
-        })),
-        repairHistory: repairHistory.map((r) => ({ defectId: r.defectId, outcome: r.outcome })),
-        replanCount: replansUsed,
-        autonomyMode,
-        releasePolicy: {
-          'blocking defects permitted': '0, not waivable',
-          'gates must pass': 'yes',
-          'autonomy mode': autonomyMode,
-          'deployment configured': String(deploymentConfigured()),
-          'authorised by': RELEASE_POLICY_VERSION,
-        },
-      });
-      track('sol', recommended);
-
-      recommendation = recommended.value;
-      checked = verifyAcknowledged(recommended.value.acknowledgedIssues, context.openNonBlocking);
-
-      record.model = recommended.model;
-      record.recommendation = recommended.value.recommendation;
-      record.reason = recommended.value.reason;
-      record.acknowledgedIssues = checked.known;
-      record.unverifiableIssues = checked.unknown;
-
-      say({
-        phase: 'approve',
-        detail: `Sol recommends ${recommended.value.recommendation}: ${recommended.value.reason}`,
-        level: recommended.value.recommendation === 'accept' ? 'ok' : 'warn',
-      });
-
-      if (checked.unknown.length > 0) {
-        // Recorded rather than treated as considered: an id nothing matches may
-        // be a stale reference or an invention, and either way it is not
-        // evidence that an issue was seen and judged acceptable.
-        say({
-          phase: 'approve',
-          detail: `Acknowledged issues that match nothing open: ${checked.unknown.join(', ')}`,
-          level: 'warn',
-        });
-      }
-    } catch (error) {
-      // A missing recommendation is not an approval, and the harness does not
-      // write one on Sol's behalf.
-      record.modelFailure = error instanceof Error ? error.message : String(error);
-      say({
-        phase: 'approve',
-        detail: `Sol could not be consulted on release: ${record.modelFailure}`,
-        level: 'fail',
-      });
-    }
-
-    const approvalRef = await registry.put(projectId, 'approval-recommendation', record);
-    await registry.accept(projectId, approvalRef);
-    await workspace.materialiseArtifact(
-      `decisions/approval-${String(reviewCycle).padStart(2, '0')}.json`,
-      record,
-    );
-
-    const approvalDoc = await store.artifacts.findOne(
-      { projectId, name: 'approval-recommendation' },
-      { sort: { version: -1 } },
-    );
-
-    // The harness decides, having read the recommendation as one input among
-    // the deterministic facts it checked for itself.
-    const decision = authorizeRelease({ recommendation, evidence, acknowledgement: checked });
-
-    const authorizationRecord: AuthorizationRecord = {
-      reviewCycle,
-      recommendationVersion: approvalDoc?.version ?? null,
-      recommendation: record.recommendation,
-      evidence,
-      authorized: decision.authorized,
-      action: decision.action,
-      reason: decision.reason,
-      policyVersion: decision.policyVersion,
-      authorizedBy: 'harness-policy',
-      authorizedAt: new Date(),
-    };
-    const authRef = await registry.put(projectId, 'release-authorization', authorizationRecord);
-    await registry.accept(projectId, authRef);
-    await workspace.materialiseArtifact(
-      `decisions/release-authorization-${String(reviewCycle).padStart(2, '0')}.json`,
-      authorizationRecord,
-    );
-
-    approvalArtifactVersion = approvalDoc?.version ?? null;
-    approvalModel = record.model;
-    approvalDecision = record.recommendation;
-
-    return decision;
-  }
+  await buildFromPlan({ deps, facts }, plan);
 
   // -- Phases 4/5: Evaluate, repair, escalate -------------------------------
   let reviewCycle = 0;
@@ -802,158 +227,52 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   /** Set when the review could not be obtained at all, as opposed to rejecting. */
   let reviewUnavailable: string | null = null;
 
-  const budgetLimits = (await store.budgets.findOne({ _id: projectId }))!.limits;
+  /** What the run has done so far, as of now. */
+  const snapshot = (): RunProgress => ({
+    plan,
+    reviewCycle,
+    repairsApplied,
+    replansUsed,
+    qualityScore,
+    gatesCertified,
+    openDefects,
+    repairedSinceReview,
+    repairHistory,
+    terminalDecision,
+    authorization,
+    approvalArtifactVersion,
+    approvalModel,
+    approvalDecision,
+    reviewUnavailable,
+    usage,
+    usageByTier,
+    phaseMs,
+  });
+
+  const ctx = (): RunContext => ({ deps, facts, progress: snapshot() });
 
   while (true) {
-    await store.projects.updateOne({ _id: projectId }, { $set: { state: 'validating', updatedAt: new Date() } });
-
-    /**
-     * §7's first deterministic gate: the application must build.
-     *
-     * This runs before every evaluation, not once, because repairs change
-     * source. A site that does not compile has no output to inspect, so there
-     * is nothing for the other gates or the reviewer to look at — the build
-     * failure is the only finding worth reporting.
-     */
-    say({ phase: 'evaluate', detail: 'Compiling the site' });
-    const compiled: BuildResult = await compileSite(workspace.siteRoot);
-
-    if (!compiled.ok) {
-      /**
-       * The compiler's own words, not just "it failed".
-       *
-       * Everything else a run decides is reconstructable from the persisted
-       * record afterwards; a build failure was the exception, because the
-       * output only ever reached Luna's prompt. Diagnosing one meant rebuilding
-       * the workspace by hand — and a live run had usually overwritten it.
-       */
-      const reason = firstErrors(compiled.output);
-      say({
-        phase: 'evaluate',
-        detail: `Build failed after ${(compiled.durationMs / 1000).toFixed(1)}s${reason ? `: ${reason}` : ''}`,
-        level: 'fail',
-      });
-    } else {
-      say({
-        phase: 'evaluate',
-        detail: `Build succeeded in ${(compiled.durationMs / 1000).toFixed(1)}s`,
-        level: 'ok',
-      });
-    }
-
-    // Gates read the static export — the markup a visitor and a crawler
-    // actually receive — rather than the TSX that produced it.
-    const files = compiled.ok ? await readBuiltFiles(workspace.siteRoot) : [];
-
-    // Every path in the export, so existence checks see the assets no gate
-    // parses — scripts, fonts, icons — instead of reporting them missing.
-    const assets = compiled.ok
-      ? (await readExportFiles(workspace.siteRoot)).map((f) => f.path)
-      : [];
-
-    /**
-     * Repairs edit source, never the export.
-     *
-     * Read separately and unconditionally: when the build fails there is no
-     * export at all, and a repair handed an empty file list silently does
-     * nothing while still spending the cycle that authorised it.
-     */
-    const sources = await readSourceFiles(workspace.siteRoot);
-
-    // Every path a gate or a reviewer could cite, mapped to the file that
-    // produced it. Rebuilt each cycle because a re-plan changes the routes.
-    const sourceOf = Object.fromEntries(
-      plan.sitemap.pages.map((page) => [routeToOutputPath(page.route), routeToSourcePath(page.route)]),
+    await store.projects.updateOne(
+      { _id: projectId },
+      { $set: { state: 'validating', updatedAt: new Date() } },
     );
 
-    const gateRun = compiled.ok
-      ? runGates({ files, profile, plan, assets })
-      : { passed: false, findings: [], gatesRun: ['build'] };
+    const evaluation = await evaluateSite(ctx());
 
-    gatesCertified = compiled.ok ? ['build', ...gateRun.gatesRun] : ['build'];
-
-    // Carried into adjudication so Sol sees the reviewer's verdict, not just
-    // the defects it produced.
-    let reviewSummary: string | null = null;
-
-    const gateDefects = compiled.ok
-      ? gateRun.findings.map(fromGateFinding)
-      : [buildFailureDefect(compiled.output)];
-    const blockingGates = blocking(gateDefects);
-
-    if (compiled.ok) {
-      say({
-        phase: 'evaluate',
-        detail: `Gates: ${gateRun.findings.length} findings, ${blockingGates.length} blocking`,
-        level: blockingGates.length === 0 ? 'ok' : 'warn',
-      });
+    if (evaluation.kind === 'review_unavailable') {
+      // An unobtainable review never counts as approval, so the run stops here
+      // with the reason recorded rather than proceeding on a missing verdict.
+      reviewUnavailable = evaluation.reason;
+      terminalDecision = 'mark_blocked';
+      break;
     }
 
-    await registry.put(projectId, 'test-report', {
-      passed: compiled.ok && gateRun.passed,
-      ranAt: new Date().toISOString(),
-      findings: gateRun.findings,
-      gatesRun: compiled.ok ? ['build', ...gateRun.gatesRun] : ['build'],
-      buildOutput: compiled.ok ? null : compiled.output,
-    });
+    const { compiled, gateRun, sources, sourceOf, reviewSummary } = evaluation;
+    qualityScore = evaluation.qualityScore;
+    gatesCertified = evaluation.gatesCertified;
+    openDefects = evaluation.openDefects;
+    if (evaluation.reviewRan) repairedSinceReview = [];
 
-    let defects: Defect[] = gateDefects;
-
-    if (blockingGates.length === 0) {
-      say({
-        phase: 'evaluate',
-        detail:
-          repairedSinceReview.length === 0
-            ? 'Independent Terra review'
-            : `Independent Terra review, re-verifying ${repairedSinceReview.length} repaired defect(s)`,
-      });
-      let reviewed;
-      try {
-        // The reviewer judges the same pages the gates judge. Handing it the
-        // framework's own error pages invites a rejection nothing can repair.
-        const reviewable = files.filter((f) => !isFrameworkPage(f.path));
-        reviewed = await reviewSite(model, profile, plan, reviewable, reviewCycle, repairedSinceReview);
-      } catch (error) {
-        // A review that cannot run is not an accepted review. Repairs already
-        // degrade gracefully; this did not, so an API outage mid-review took
-        // down a delivery whose build and gates had both passed. The project is
-        // marked blocked with the reason recorded, and the accepted artifacts
-        // and workspace are left intact for a resumed run.
-        const message = error instanceof Error ? error.message : String(error);
-        say({ phase: 'evaluate', detail: `Review could not complete: ${message}`, level: 'fail' });
-        reviewUnavailable = message;
-        terminalDecision = 'mark_blocked';
-        break;
-      }
-      repairedSinceReview = [];
-      track('terra', reviewed);
-      qualityScore = reviewed.value.qualityScore;
-
-      const reviewDefects = reviewed.value.issues.map(fromReviewIssue);
-      defects = [...gateDefects, ...reviewDefects];
-
-      await registry.put(projectId, 'visual-review', {
-        ...reviewed.value,
-        reviewer: { tier: 'terra', model: reviewed.model, skillVersion: 'terra-review@1' },
-        reviewCycle,
-      });
-
-      reviewSummary =
-        `  decision ${reviewed.value.decision}, quality ${qualityScore}, blocking=${reviewed.value.blocking}\n` +
-        reviewed.value.issues
-          .map((i) => `  ${i.severity} ${i.category} ${i.location} — ${i.reason}`)
-          .join('\n');
-
-      say({
-        phase: 'evaluate',
-        detail: `Review: ${reviewed.value.decision}, score ${qualityScore}, ${reviewed.value.issues.length} issues, blocking=${reviewed.value.blocking}`,
-        level: reviewed.value.blocking ? 'warn' : 'ok',
-      });
-    }
-
-    // Collapsed before anything acts on them: the repair budget is charged per
-    // fingerprint, so the unit of work has to be the fingerprint too.
-    openDefects = mergeByFingerprint(defects);
     const mustFix = blocking(openDefects);
 
     if (mustFix.length === 0) {
@@ -963,7 +282,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
        */
       say({ phase: 'approve', detail: 'No blocking criteria outstanding — asking Sol to judge release' });
 
-      authorization = await seekRelease({
+      const release = await seekRelease(ctx(), {
         gateRun,
         buildOk: compiled.ok,
         buildSummary: compiled.ok
@@ -972,6 +291,11 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         reviewSummary,
         openNonBlocking: openDefects.filter((d) => d.severity !== 'P0' && d.severity !== 'P1'),
       });
+
+      authorization = release.decision;
+      approvalArtifactVersion = release.provenance.approvalArtifactVersion;
+      approvalModel = release.provenance.approvalModel;
+      approvalDecision = release.provenance.approvalDecision;
 
       if (!authorization.authorized) {
         // The harness refused. `human_review` is a real outcome rather than a
@@ -991,117 +315,9 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       break;
     }
 
-    /**
-     * §7's escalation ladder, decided by Sol rather than by arithmetic.
-     *
-     * The harness computes what is affordable and executable; Sol reasons about
-     * which of those is appropriate; the harness authorises and acts. Two rules
-     * used to do all of it: `mustFix.length > repairsLeft` triggered a replan,
-     * and everything else went to Luna. Neither asked what kind of defect it
-     * was looking at.
-     */
-    const currentBudget = (await store.budgets.findOne({ _id: projectId }))!;
-
-    // What each fingerprint has already spent. Policy decides eligibility from
-    // this; it cannot read the collection itself, and counting open defects is
-    // not the same question — the per-defect allowance outlives a cycle.
-    const spentPerDefect = await store.defectBudgets.find({ projectId }).toArray();
-    const repairsUsedByFingerprint = Object.fromEntries(
-      spentPerDefect.map((d) => [d.fingerprint, d.repairsUsed]),
-    );
-
-    const constraints: AdjudicationConstraints = {
-      blockingDefects: mustFix,
-      repairsLeft: currentBudget.limits.totalRepairJobs - currentBudget.used.totalRepairJobs,
-      repairsPerDefect: currentBudget.limits.repairsPerDefect,
-      repairsUsedByFingerprint,
-      replansLeft: currentBudget.limits.replans - currentBudget.used.replans,
-      reviewRejectionsLeft:
-        currentBudget.limits.reviewRejections - currentBudget.used.reviewRejections,
-      previousRepairs: repairHistory,
-      autonomyMode,
-    };
-    const legal = legalAdjudicationActions(constraints);
-
-    let adjudication: AdjudicationAuthorization;
-    let proposedAdjudication: AdjudicationRecord['proposed'] = null;
-    let adjudicationFailure: string | null = null;
-
-    try {
-      const decided = await adjudicate(model, {
-        reviewCycle,
-        legalActions: legal,
-        gateFindings: gateRun.findings.map(
-          (f) => `${f.severity} ${f.gate} ${f.location} — ${f.message}`,
-        ),
-        reviewSummary: reviewSummary,
-        openBlockingDefects: mustFix.map((d) => ({
-          id: d.id,
-          category: d.category,
-          severity: d.severity,
-          location: d.location,
-          reason: d.reason,
-          acceptanceTest: d.acceptanceTest,
-        })),
-        previousRepairs: repairHistory,
-        // What policy already knows about repairability, handed to Sol so it
-        // chooses among defects the harness can actually act on.
-        repairEligibility: repairEligibility(constraints),
-        maxRepairTargets: maxRepairTargets(constraints),
-        remainingBudgets: {
-          totalRepairJobs: constraints.repairsLeft,
-          replans: constraints.replansLeft,
-          reviewRejections: constraints.reviewRejectionsLeft,
-        },
-        autonomyMode,
-      });
-      track('sol', decided);
-
-      proposedAdjudication = {
-        action: decided.value.action,
-        reason: decided.value.reason,
-        defectIds: decided.value.defectIds ?? [],
-        objective: decided.value.objective ?? null,
-        scope: decided.value.scope ?? null,
-      };
-      adjudication = authorizeAdjudication(decided.value, legal, constraints);
-    } catch (error) {
-      // An adjudication that cannot be obtained must not end a delivery: the
-      // harness takes the cheapest legal action and records that Sol was absent.
-      adjudicationFailure = error instanceof Error ? error.message : String(error);
-      const action = fallbackAction(legal);
-      adjudication = {
-        action,
-        // One blocker, not the whole set: with no adjudication there is no
-        // judgement about which defects belong together — and one that can
-        // still be charged for, or the cycle would repair nothing.
-        targetIds: action === 'repair' ? firstBlockerId(repairableDefects(mustFix, constraints)) : [],
-        source: 'fallback',
-        refusal: `Sol could not be consulted: ${adjudicationFailure}`,
-      };
-    }
-
-    await recordAdjudication({
-      reviewCycle,
-      action: adjudication.action,
-      source: adjudication.source,
-      refusal: adjudication.refusal,
-      targetDefectIds: [...adjudication.targetIds],
-      legalActions: legal,
-      constraints: recordedConstraints(constraints),
-      proposed: proposedAdjudication,
-      modelFailure: adjudicationFailure,
-      decidedAt: new Date(),
-    });
-
-    say({
-      phase: 'adjudicate',
-      detail:
-        adjudication.source === 'sol'
-          ? `Sol chose ${adjudication.action}: ${proposedAdjudication?.reason ?? ''}`
-          : `${adjudication.action} by fallback — ${adjudication.refusal ?? ''}`,
-      level: adjudication.source === 'sol' ? 'ok' : 'warn',
-    });
+    const decided = await adjudicateDefects(ctx(), mustFix, { gateRun, reviewSummary });
+    const adjudication = decided.authorization;
+    const proposedAdjudication = decided.proposed;
 
     if (adjudication.action === 'block') {
       terminalDecision = decideTerminal(openDefects, autonomyMode);
@@ -1174,7 +390,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
        * drawn from the same inputs as the first.
        */
       const scope = (proposedAdjudication?.scope ?? 'site') as ReplanScope;
-      const revised = await revisePlan({
+      const revised = await revisePlan(ctx(), {
         scope,
         adjudicationReason: proposedAdjudication?.reason ?? adjudication.refusal ?? 'unspecified',
         unresolvedDefects: mustFix,
@@ -1206,7 +422,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       await workspace.clearSite();
       replansUsed += 1;
       plan = revised;
-      await buildFromPlan(plan);
+      await buildFromPlan(ctx(), plan);
       repairedSinceReview = [];
       continue;
     }
@@ -1217,7 +433,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
     say({
       phase: 'repair',
-      detail: `Cycle ${reviewCycle}/${budgetLimits.reviewRejections}: repairing ${targets.length} of ${mustFix.length} blocking defect(s)`,
+      detail: `Cycle ${reviewCycle}/${facts.budgetLimits.reviewRejections}: repairing ${targets.length} of ${mustFix.length} blocking defect(s)`,
     });
 
     let exhausted = false;
@@ -1385,198 +601,10 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     // happens with no blocking defects outstanding, which is exactly when
     // `decideTerminal` prefers `accept_non_blocking` — so borrowing it reported
     // a denied release as an acceptance.
-    return concluded('blocked', terminalForRefusal(authorization?.action ?? null));
+    return concluded(ctx(), 'blocked', terminalForRefusal(authorization?.action ?? null));
   }
 
-  await store.projects.updateOne({ _id: projectId }, { $set: { state: 'releasing', updatedAt: new Date() } });
+  const { manifest, finalCommit } = await publishRelease(ctx(), authorization);
 
-  const releaseCommit = (await workspace.commit('Harness: release-authorized revision')) ?? (await workspace.currentCommit());
-
-  /**
-   * Deploy only after machine approval (§9: "publish from a machine-accepted
-   * source revision"). What ships is the export produced by the build the gates
-   * and the reviewer both passed — no rebuild happens here, so what was
-   * approved is byte-for-byte what goes live.
-   */
-  let deployment: DeployResult | null = null;
-
-  if (deploymentConfigured()) {
-    // The previous release is the rollback target, read before this one
-    // supersedes it.
-    const previous = await store.artifacts.findOne(
-      { projectId, name: 'deployment-manifest' },
-      { sort: { version: -1 } },
-    );
-    const previousDeploymentId =
-      (previous?.data as { deploymentId?: string | null } | undefined)?.deploymentId ?? null;
-
-    // Publishing is retried, but under the `failedDeployments` budget — a host
-    // that is down stays down, and an unbounded retry would burn the run on an
-    // outage it cannot fix. Two failures and Sol stops trying.
-    while (deployment === null) {
-      say({ phase: 'publish', detail: 'Deploying the accepted export' });
-      try {
-        deployment = await deploySite(workspace.siteRoot, projectId, { previousDeploymentId });
-        say({
-          phase: 'publish',
-          detail: `Live at ${deployment.url} (${deployment.fileCount} files, ${(deployment.durationMs / 1000).toFixed(1)}s)`,
-          level: 'ok',
-        });
-      } catch (error) {
-        // A failed deploy is a release failure, not a silent one: the site was
-        // approved but is not live, and the manifest must not claim otherwise.
-        say({
-          phase: 'publish',
-          detail: `Deployment failed: ${error instanceof Error ? error.message : String(error)}`,
-          level: 'fail',
-        });
-        try {
-          await spend(store, projectId, 'failedDeployments');
-        } catch (budgetError) {
-          if (!(budgetError instanceof BudgetExhausted)) throw budgetError;
-          say({
-            phase: 'publish',
-            detail: 'Deployment budget exhausted — the approved site stays on local preview',
-            level: 'fail',
-          });
-          break;
-        }
-      }
-    }
-  } else {
-    say({ phase: 'publish', detail: 'No deployment configured — released to local preview only', level: 'warn' });
-  }
-
-  const manifest: DeploymentManifest = {
-    projectId,
-    commit: releaseCommit ?? 'uncommitted',
-    environment: deployment ? 'production' : 'preview',
-    autonomyMode,
-    /**
-     * Who judged, and who authorised — separately, and neither standing in for
-     * the other. The single `approvedBy: 'sol:machine-approval'` this replaces
-     * named a model for a decision the harness made alone.
-     *
-     * The recommendation is the one Sol actually gave, read from the persisted
-     * record rather than inferred from the authorisation. Deriving it from
-     * `action === 'release'` happens to agree today, because a manifest exists
-     * only after an authorised release — but it would report the harness's
-     * conclusion under Sol's name the moment those two could differ, which is
-     * the exact confusion this field was split to end.
-     */
-    recommendation: {
-      by: 'sol' as const,
-      model: approvalModel,
-      artifactVersion: approvalArtifactVersion,
-      decision: approvalDecision,
-    },
-    authorization: {
-      by: 'harness-policy' as const,
-      policyVersion: authorization.policyVersion,
-      action: authorization.action,
-      reason: authorization.reason,
-    },
-    qualityScore,
-    // The gates that actually certified this revision, not a fresh run against
-    // a tree that may have moved on. Re-running them here would also mean
-    // reporting a different result from the one the release was granted on.
-    checks: gatesCertified,
-    url: deployment?.url ?? null,
-    deploymentId: deployment?.deploymentId ?? null,
-    rollbackRef: deployment?.rollbackRef ?? null,
-    releasedAt: new Date(),
-  };
-  await registry.put(projectId, 'deployment-manifest', manifest);
-  await workspace.materialiseArtifact('deployment/deployment-manifest.json', manifest);
-  const finalCommit = (await workspace.commit('Harness: release manifest')) ?? releaseCommit;
-
-  await store.projects.updateOne({ _id: projectId }, { $set: { state: 'released', updatedAt: new Date() } });
-  say({ phase: 'publish', detail: `Released at ${finalCommit?.slice(0, 8) ?? 'HEAD'}`, level: 'ok' });
-
-  return {
-    projectId,
-    outcome: 'released',
-    qualityScore,
-    reviewCycles: reviewCycle,
-    repairsApplied,
-    openDefects,
-    commit: finalCommit,
-    siteRoot: workspace.siteRoot,
-    manifest,
-    usage,
-    usageByTier,
-    phaseMs: { ...phaseMs },
-  };
-
-  /**
-   * An exit before there is a delivery to describe.
-   *
-   * Only for intake failures, which happen before a workspace exists, a plan is
-   * made or a token is spent — so the zeroes are accurate rather than missing.
-   * Anything that ends after the build has real values to report and must use
-   * {@link concluded}.
-   */
-  function terminal(outcome: RunResult['outcome']): RunResult {
-    return {
-      projectId,
-      outcome,
-      qualityScore: 0,
-      reviewCycles: 0,
-      repairsApplied: 0,
-      openDefects: [],
-      commit: null,
-      siteRoot: '',
-      usage,
-      usageByTier,
-      phaseMs: { ...phaseMs },
-    };
-  }
-
-  /**
-   * An exit after a delivery has happened, reporting what it actually did.
-   *
-   * The late release refusal used `terminal()`, so a run that built a site,
-   * scored 92 over three review cycles and two repairs, and was then correctly
-   * refused a release, reported a quality score of 0, no cycles, no repairs, no
-   * open defects, no commit and no site root. The decision was right and the
-   * telemetry described a different run.
-   */
-  async function concluded(
-    outcome: RunResult['outcome'],
-    decision: TerminalOutcome | undefined,
-  ): Promise<RunResult> {
-    return {
-      projectId,
-      outcome,
-      ...(decision ? { terminalDecision: decision } : {}),
-      qualityScore,
-      reviewCycles: reviewCycle,
-      repairsApplied,
-      openDefects,
-      commit: await workspace.currentCommit(),
-      siteRoot: workspace.siteRoot,
-      usage,
-      usageByTier,
-      phaseMs: { ...phaseMs },
-    };
-  }
-}
-
-/**
- * The compiler lines from a build transcript, for the progress record.
- *
- * A failed `next build` emits install noise, a bundler banner and then the
- * errors. Only the last part identifies the defect, and the timeline needs it
- * short enough to read at a glance.
- */
-function firstErrors(output: string, limit = 3): string {
-  const lines = output
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => /\berror\b|\bError:/i.test(line) && !/^ELIFECYCLE/.test(line));
-
-  if (lines.length === 0) return '';
-  const shown = lines.slice(0, limit).join(' · ');
-  const rest = lines.length - limit;
-  return rest > 0 ? `${shown} (+${rest} more)` : shown;
+  return { ...(await concluded(ctx(), 'released', undefined)), commit: finalCommit, manifest };
 }

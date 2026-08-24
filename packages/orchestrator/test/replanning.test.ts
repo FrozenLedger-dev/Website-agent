@@ -354,14 +354,12 @@ describe('a replan that cannot be produced', () => {
     const { dirname, join } = await import('node:path');
 
     const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
-    const code = (await readFile(join(src, 'orchestrator.ts'), 'utf8'))
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/\/\/.*$/gm, '');
+    const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+    const code = strip(await readFile(join(src, 'orchestrator.ts'), 'utf8'));
 
-    // Exactly one call survives: the initial plan, from intake.
-    const calls = code.match(/producePlan\(/g) ?? [];
-    expect(calls).toHaveLength(2); // the declaration and the initial call
-    expect(code).toContain('let plan = await producePlan(0)');
+    // Exactly one call survives in the delivery loop: the initial plan.
+    expect(code.match(/producePlan\(/g) ?? []).toHaveLength(1);
+    expect(code).toContain('let plan = await producePlan({ deps, facts }, 0)');
 
     // And the replan branch reaches revisePlan, not the planner.
     const replanBranch = code.slice(code.indexOf("adjudication.action === 'replan'"));
@@ -402,10 +400,11 @@ describe('what a refused revision leaves behind', () => {
     const { dirname, join } = await import('node:path');
 
     const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
-    const code = await readFile(join(src, 'orchestrator.ts'), 'utf8');
+    const code = await readFile(join(src, 'phases/planning.ts'), 'utf8');
+    const loop = await readFile(join(src, 'orchestrator.ts'), 'utf8');
 
-    const revise = code.slice(code.indexOf('async function revisePlan'));
-    const body = revise.slice(0, revise.indexOf('\n  }\n'));
+    // `revisePlan` is the last export in the module, so its body runs to the end.
+    const body = code.slice(code.indexOf('export async function revisePlan'));
 
     // The refusal returns before the plan is persisted.
     expect(body.indexOf('if (record.rejected)')).toBeLessThan(body.indexOf('await persistPlan'));
@@ -418,7 +417,7 @@ describe('what a refused revision leaves behind', () => {
     );
 
     // And the caller clears the site only after a non-null revision.
-    const caller = code.slice(code.indexOf('const revised = await revisePlan'));
+    const caller = loop.slice(loop.indexOf('const revised = await revisePlan'));
     expect(caller.indexOf('if (!revised)')).toBeLessThan(caller.indexOf('clearSite()'));
   });
 
@@ -430,11 +429,11 @@ describe('what a refused revision leaves behind', () => {
     const { dirname, join } = await import('node:path');
 
     const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
-    const code = await readFile(join(src, 'orchestrator.ts'), 'utf8');
-    const revise = code.slice(code.indexOf('async function revisePlan'));
+    const code = await readFile(join(src, 'phases/planning.ts'), 'utf8');
+    const revise = code.slice(code.indexOf('export async function revisePlan'));
 
     expect(revise.indexOf('record.rejected =')).toBeLessThan(
-      revise.indexOf("registry.put(projectId, 'replan-decision'"),
+      revise.indexOf("registry.put(facts.projectId, 'replan-decision'"),
     );
   });
 
@@ -444,18 +443,17 @@ describe('what a refused revision leaves behind', () => {
     const { dirname, join } = await import('node:path');
 
     const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
-    const code = (await readFile(join(src, 'orchestrator.ts'), 'utf8'))
+    const code = (await readFile(join(src, 'phases/planning.ts'), 'utf8'))
       .replace(/\/\*[\s\S]*?\*\//g, '')
       .replace(/\/\/.*$/gm, '');
 
-    // One call site in the whole module, and one inside revisePlan's own body:
-    // a refusal returns, it does not ask Sol for a different answer.
+    // One call site in the whole module, inside revisePlan's own body: a
+    // refusal returns, it does not ask Sol for a different answer.
     expect(code.match(/replanSite\(/g) ?? []).toHaveLength(1);
 
-    const revise = code.slice(code.indexOf('async function revisePlan'));
-    const body = revise.slice(0, revise.indexOf('\n  }\n'));
-    expect(body.match(/replanSite\(/g) ?? []).toHaveLength(1);
-    expect(body).toContain('return null;');
+    const revise = code.slice(code.indexOf('export async function revisePlan'));
+    expect(revise.match(/replanSite\(/g) ?? []).toHaveLength(1);
+    expect(revise).toContain('return null;');
   });
 });
 

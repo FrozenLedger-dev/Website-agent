@@ -85,34 +85,41 @@ describe('provenance: who judged and who authorised', () => {
 });
 
 describe('ordering and reachability in the delivery loop', () => {
-  const source = async () => {
+  const read = async (file: string) => {
     const { readFile } = await import('node:fs/promises');
     const { fileURLToPath } = await import('node:url');
     const { dirname, join } = await import('node:path');
     const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
-    return readFile(join(src, 'orchestrator.ts'), 'utf8');
+    return readFile(join(src, file), 'utf8');
   };
+
+  /** The delivery loop, which decides *when* release is asked about. */
+  const source = () => read('orchestrator.ts');
+  /** The release phase, which decides what asking involves. */
+  const releasePhase = () => read('phases/release.ts');
 
   it('asks Sol only once nothing blocking remains', async () => {
     const code = await source();
     const gate = code.indexOf('if (mustFix.length === 0) {');
-    const call = code.indexOf('seekRelease({');
+    const call = code.indexOf('seekRelease(ctx()');
 
     expect(gate).toBeGreaterThan(-1);
+    expect(call).toBeGreaterThan(-1);
     expect(gate).toBeLessThan(call);
   });
 
   it('records the recommendation before authorising, and the authorisation before deploying', async () => {
     // Never: deploy, then write down that it was approved.
-    const code = await source();
-    const seek = code.slice(code.indexOf('async function seekRelease'));
-    const body = seek.slice(0, seek.indexOf('\n  }\n'));
+    const body = await releasePhase();
 
     const recommend = body.indexOf('recommendApproval(');
-    const persistRec = body.indexOf("registry.put(projectId, 'approval-recommendation'");
+    const persistRec = body.indexOf("registry.put(facts.projectId, 'approval-recommendation'");
     const authorize = body.indexOf('authorizeRelease({');
-    const persistAuth = body.indexOf("registry.put(projectId, 'release-authorization'");
+    const persistAuth = body.indexOf("registry.put(facts.projectId, 'release-authorization'");
 
+    for (const [name, at] of Object.entries({ recommend, persistRec, authorize, persistAuth })) {
+      expect(at, name).toBeGreaterThan(-1);
+    }
     expect(recommend).toBeLessThan(persistRec);
     expect(persistRec).toBeLessThan(authorize);
     expect(authorize).toBeLessThan(persistAuth);
@@ -122,12 +129,21 @@ describe('ordering and reachability in the delivery loop', () => {
     // `authorization` is null on every path that skipped approval — a terminal
     // escalation, an exhausted budget, a refused revision — so the guard covers
     // them all rather than each needing its own check.
+    //
+    // The guard now lives in the delivery loop and the deploy in the publish
+    // phase, which is the stronger arrangement: publishing is not reachable
+    // without going through the call the guard sits in front of.
     const code = await source();
     const guard = code.indexOf('if (!authorization?.authorized)');
-    const deploy = code.indexOf('await deploySite(');
+    const publish = code.indexOf('publishRelease(ctx()');
 
     expect(guard).toBeGreaterThan(-1);
-    expect(guard).toBeLessThan(deploy);
+    expect(publish).toBeGreaterThan(-1);
+    expect(guard).toBeLessThan(publish);
+
+    // And the loop itself never deploys.
+    expect(code).not.toContain('await deploySite(');
+    expect(await read('phases/publish.ts')).toContain('await deploySite(');
   });
 
   it('no longer attributes approval to a model in the manifest', async () => {
@@ -137,7 +153,7 @@ describe('ordering and reachability in the delivery loop', () => {
   });
 
   it('fixes the authoriser as the harness at the point the manifest is written', async () => {
-    const code = await source();
+    const code = await read('phases/publish.ts');
     expect(code).toContain("by: 'harness-policy' as const");
     expect(code).toContain("by: 'sol' as const");
   });
@@ -150,7 +166,7 @@ describe('git provenance', () => {
     const { dirname, join } = await import('node:path');
 
     const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
-    const code = await readFile(join(src, 'orchestrator.ts'), 'utf8');
+    const code = await readFile(join(src, 'phases/publish.ts'), 'utf8');
 
     expect(code).not.toContain("commit('Sol: accepted revision')");
     expect(code).not.toContain("commit('Sol: release manifest')");
@@ -167,9 +183,9 @@ describe('git provenance', () => {
     const { dirname, join } = await import('node:path');
 
     const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
-    const code = await readFile(join(src, 'orchestrator.ts'), 'utf8');
+    const code = await readFile(join(src, 'phases/publish.ts'), 'utf8');
 
-    expect(code).toContain('decision: approvalDecision');
+    expect(code).toContain('decision: progress.approvalDecision');
     expect(code).not.toContain("authorization.action === 'release' ? 'accept' : null");
   });
 
@@ -185,13 +201,14 @@ describe('git provenance', () => {
 });
 
 describe('what a refused release reports to its caller', () => {
-  const source = async () => {
+  const read = async (file: string) => {
     const { readFile } = await import('node:fs/promises');
     const { fileURLToPath } = await import('node:url');
     const { dirname, join } = await import('node:path');
     const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
-    return readFile(join(src, 'orchestrator.ts'), 'utf8');
+    return readFile(join(src, file), 'utf8');
   };
+  const source = () => read('orchestrator.ts');
 
   it('does not use the intake-failure helper after a delivery has happened', async () => {
     /**
@@ -206,30 +223,31 @@ describe('what a refused release reports to its caller', () => {
     const branch = late.slice(0, late.indexOf('\n  }\n'));
 
     expect(branch).toContain('concluded(');
-    expect(branch).not.toContain('terminal(');
+    expect(branch).not.toContain('withoutDelivery(');
   });
 
   it('keeps the intake helper for the exits that genuinely have nothing to report', async () => {
     const code = (await source()).replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
-    const calls = code.match(/return terminal\(/g) ?? [];
+    const calls = code.match(/return withoutDelivery\(/g) ?? [];
 
     // Both remaining uses are intake failures, before a workspace exists.
     expect(calls).toHaveLength(2);
-    expect(code.match(/return terminal\('intake_insufficient'\)/g) ?? []).toHaveLength(2);
+    expect(code.match(/withoutDelivery\(projectId, 'intake_insufficient'/g) ?? []).toHaveLength(2);
   });
 
   it('reports the delivery that actually happened', async () => {
-    const code = await source();
-    const concluded = code.slice(code.indexOf('async function concluded'));
-    const body = concluded.slice(0, concluded.indexOf('\n  }\n'));
+    // The two exits live in `phases/conclude.ts` now, and the distinction
+    // between them is the reason that file exists.
+    const code = await read('phases/conclude.ts');
+    const body = code.slice(code.indexOf('export async function concluded'));
 
     for (const field of [
-      'qualityScore,',
-      'reviewCycles: reviewCycle,',
-      'repairsApplied,',
-      'openDefects,',
+      'qualityScore: progress.qualityScore,',
+      'reviewCycles: progress.reviewCycle,',
+      'repairsApplied: progress.repairsApplied,',
+      'openDefects: progress.openDefects,',
       'workspace.currentCommit()',
-      'siteRoot: workspace.siteRoot,',
+      'siteRoot: deps.workspace.siteRoot,',
     ]) {
       expect(body, field).toContain(field);
     }
