@@ -106,14 +106,38 @@ look identical to one that passed.
 Neither job holds a credential. No OpenAI key, no deployment token, no
 `.env.local`.
 
-## Phase 3 — Policy engine — **IN PROGRESS**
+## Phase 3 — Policy engine — **COMPLETE**
 
 | Item | Status |
 |---|---|
 | End-to-end refusal regression test | Done — `refusal.integration.test.ts`, 13 tests |
 | CI covers the Mongo-backed suites | Done — a second job, so nothing is outside CI |
-| Extract scattered harness policy into a policy layer (3a) | Done — `packages/policy-engine` — both CI checks green on `70a86ba` |
+| Extract scattered harness policy into a policy layer (3a) | Done — `packages/policy-engine` |
 | Harden the policy the extraction froze (3b) | Done — repair eligibility on both budgets, and the routing workstream set |
+| Adjudication artifacts replay through the policy engine | Done — the snapshot carries every input a rule reads |
+
+Phase 3 lineage, oldest first — each commit one capability, each green in CI:
+
+| SHA | What it closed |
+|---|---|
+| `af17db5` | Extracted the deterministic policy into `@statxai/policy-engine` |
+| `9f0bec4` | Recorded the routing invariant the comment claimed and the code did not |
+| `fa2adf4` | Repair offered only for a defect whose own allowance can pay |
+| `4e63e1a` | Repair capped by the project allowance too, and Sol told which defects are eligible |
+| `b7fa05f` | A decomposition must describe the work it would actually do |
+| `1a68619` | Adjudication artifacts carry enough to replay the decision |
+
+**Head: `1a68619`.** Both GitHub checks green — "Typecheck, lint and unit
+tests" and "Mongo integration tests". Phase 3 closes there.
+
+Two items stay open by decision rather than by oversight:
+
+- **`REPAIR_COMPANIONS`** decides what files a repair is always allowed to see.
+  That is a permission, and it belongs with the tool gateway rather than with
+  policy — deferred to the permission/tool-gateway phase, not to Phase 4.
+- **`decideTerminal`'s preference order** is an `if` ladder rather than a
+  declared ranking. Non-blocking technical debt: it is correct today, and a test
+  pins it to only ever returning an outcome the legal set contained.
 
 The regression test is the opening safety net. The last three defects in the
 approval area were all in the *result* rather than the decision — zeroed
