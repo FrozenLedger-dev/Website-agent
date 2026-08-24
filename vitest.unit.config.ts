@@ -14,12 +14,14 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     include: ['packages/*/test/**/*.test.ts'],
+    // The exact complement of `vitest.integration.config.ts`. Keep the two in
+    // step: a suite in neither list never runs, and one in both runs twice.
     exclude: [
       '**/node_modules/**',
+      'packages/*/test/**/*.integration.test.ts',
       'packages/state/test/budgets.test.ts',
       'packages/job-engine/test/engine.test.ts',
       'packages/workspace/test/workspace.test.ts',
-      'packages/orchestrator/test/refusal.integration.test.ts',
     ],
     testTimeout: 20_000,
     hookTimeout: 30_000,

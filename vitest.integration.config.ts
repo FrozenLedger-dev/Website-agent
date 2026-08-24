@@ -14,10 +14,15 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     include: [
+      // Anything named for what it is. A new Mongo-backed suite lands in this
+      // job by its filename rather than by being remembered here — the two
+      // lists silently disagreeing would put a suite needing a replica set into
+      // the job that provisions nothing.
+      'packages/*/test/**/*.integration.test.ts',
+      // Older suites, named before the convention existed.
       'packages/state/test/budgets.test.ts',
       'packages/job-engine/test/engine.test.ts',
       'packages/workspace/test/workspace.test.ts',
-      'packages/orchestrator/test/refusal.integration.test.ts',
     ],
     // One Mongo deployment is shared, so parallel files would race on
     // collection state.
