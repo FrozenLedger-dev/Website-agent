@@ -93,10 +93,10 @@ CI runs two jobs, so the signals stay separable:
 
 | Job | Runs | Needs |
 |---|---|---|
-| Typecheck, lint and unit tests | `pnpm test:unit` — 418 | nothing |
+| Typecheck, lint and unit tests | `pnpm test:unit` — 435 | nothing |
 | Mongo integration tests | `pnpm test:integration` — 61 | the compose replica set |
 
-Together they cover the whole inventory exactly once: 418 + 61 = 479, which is
+Together they cover the whole inventory exactly once: 435 + 61 = 496, which is
 what `pnpm test` runs. The integration job starts the same `docker-compose`
 service developers use, waits for the healthcheck that initiates the replica
 set, and proves the deployment accepts transactions before running anything —
@@ -361,7 +361,9 @@ The release-refusal branch still assigned a terminal outcome with
 `terminalForRefusal`. Removed — it was a second copy of a rule the policy engine
 owns, which is exactly what the boundary test exists to prevent.
 
-## Phase 4a — orchestrator phase extraction — **DONE**
+## Phase 4a — orchestrator phase extraction — **COMPLETE**
+
+Both GitHub checks green on `647abed`.
 
 An extraction. No intentional behaviour change: no model, policy, budget,
 artifact, state, release, routing, repair, replan or deployment semantics move.
@@ -475,11 +477,9 @@ and every file it is written from — so a duplicate fails by name. `blocked` is
 the one state written twice, from two mutually exclusive terminal exits, and the
 test says so rather than leaving the number unexplained.
 
-### Deferred to Phase 4b
+### Deferred
 
-- **Repair execution** is still inline in the loop — about 110 lines spending
-  the per-defect budget, scoping files and calling Luna. It is the one phase
-  boundary left, and the only substantial block still in `runProject`.
+- **Repair execution** — done in Phase 4b, below.
 - **Intake and project setup** (~45 lines) is still inline. Cohesive enough to
   extract, small enough not to be urgent.
 - `runProject` still declares the run's mutable state as locals with a
@@ -500,6 +500,125 @@ Phase 4 is **not** complete. Phase 5 — mapping these boundaries onto the job
 engine — is not started, deliberately: the job engine keeps its own enqueue,
 claim, transition, retry, lease and conflict handling, and nothing in Phase 4a
 routes a run through it.
+
+## Phase 4b — repair execution — **DONE**
+
+The last substantial block of execution detail left in the delivery loop.
+
+### Where it lived
+
+Inline in the `repair` branch of `runProject`: about 105 lines spending the
+per-defect budget in a transaction, scoping source files, adding the repair
+companions, splitting a multi-file defect into one Luna call per file, filtering
+what came back, writing it, tolerating individual failures, and recording the
+evidence — followed by the cycle commit.
+
+`orchestrator.ts` is now **508 lines**, from 610 after 4a and 1,582 before it.
+The branch reads:
+
+    resolve authorised targets
+    → executeRepairs(...)
+    → apply the returned deltas
+    → the existing exhaustion rule
+    → continue
+
+### The boundary
+
+    executeRepairs(ctx, { targets, sources, sourceOf }) → {
+      repairsAppliedDelta,
+      exhausted,
+      repairedSinceReview,
+      repairHistoryEntries,
+    }
+
+Inputs are `readonly`; the phase appends to nothing it was handed. It returns
+**deltas** and the loop applies them, which makes "the phase reports, the caller
+remembers" real for the first time rather than a convention. This is deliberately
+scoped to the new boundary: the global `snapshot()` shallowness is still open.
+
+### Who has which authority
+
+    Sol adjudicates → policy authorises ids → the loop resolves them to defects
+    → the phase spends the budget transactionally → Luna proposes file contents
+    → the harness filters what may land → the next evaluation judges it
+
+The phase is an **execution** phase. It does not read Sol's proposal, recompute
+legal actions, call `authorizeAdjudication`, widen the target set, or substitute
+a different defect for one it cannot afford — a test reads its source back and
+fails if `decideTerminal`, `authorizeAdjudication` or `legalAdjudicationActions`
+ever appear in it.
+
+**Budget.** `store.withTransaction(spendRepairAttempt(...))` stays exactly where
+it was, charged **once per defect** — not per file, not per model call. A defect
+spanning three pages still costs one attempt. Policy eligibility remains
+pre-authorisation evidence; the transaction is the authority, immediately before
+execution. A refused spend skips that defect without calling Luna, records no
+attempt evidence for it, sets `exhausted`, and continues with the rest.
+
+**File scope.** `filesForDefect` and `REPAIR_COMPANIONS` move unchanged.
+`REPAIR_COMPANIONS` stays deferred to the tool-gateway phase: it is a permission,
+and this commit only relocated it.
+
+**Luna's authority.** What may be written is Luna's output intersected with the
+paths the harness put in that call's context:
+
+    permitted = returned ∩ context
+
+Everything else is counted as refused and recorded. Enforced in code, not asked
+for in the prompt — which is the invariant the tool gateway will generalise.
+
+**Failure.** One failed call does not abort anything: the budget is already
+spent, the file is recorded as failed, the loop continues to the next file and
+the next defect, and the defect stays open for the next evaluation to judge.
+No refund, no automatic replan, no asking Sol mid-phase.
+
+**Exhaustion is a result, not a decision.** The phase reports `exhausted`; the
+loop still owns `decideTerminal`.
+
+### Characterised, then mutation-checked
+
+Seventeen focused unit tests, made possible by the extraction itself: the phase
+takes its collaborators explicitly, so a fake workspace and a scripted Luna can
+be handed to it with no Mongo. The end-to-end repair coverage in
+`refusal.integration.test.ts` stays — it proves the loop reaches this code and
+spends real budgets, which a fake cannot.
+
+All six required mutations were applied and observed to fail:
+
+| Mutation | Tests failed |
+|---|---|
+| remove the transactional spend | 4 |
+| accept every path Luna returns | 2 |
+| one call for the whole scope | 3 |
+| count once per file written | 1 |
+| let a Luna failure escape | 3 |
+| skip the repair-cycle commit | 2 |
+
+The first attempt at mutation 1 silently did not apply — the pattern's
+indentation was wrong — and reported a clean pass. Every mutation since is run
+through a helper that fails loudly when the pattern is not found.
+
+### Characterised, not changed
+
+Two behaviours are pinned as they are, not endorsed:
+
+- The exhaustion guard reads the **cumulative** `repairsApplied`, so a cycle
+  that repairs nothing continues if an earlier cycle repaired something. Left
+  exactly as it was; 4b is extraction, not policy cleanup.
+- The cycle commit is attempted unconditionally, including when nothing was
+  written. The workspace decides whether there is anything to record.
+
+No new artifact, no `repair-decision`, no new project state. `adjudication-
+decision` is still written before repair runs; the phase executes an already
+persisted decision.
+
+## Remaining Phase 4 work
+
+- Global `RunProgress` ownership: the run still keeps mutable state as locals
+  behind a shallow `snapshot()`. ~180 references; its own commit.
+- Intake and project setup extraction (~45 lines).
+- Artifact lineage ordered on millisecond `createdAt`.
+- `REPAIR_COMPANIONS` → the later permission/tool-gateway phase.
 
 ## Phases 5–17
 

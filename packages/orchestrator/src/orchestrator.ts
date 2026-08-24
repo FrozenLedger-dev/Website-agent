@@ -20,10 +20,9 @@ import {
 } from '@statxai/contracts';
 import {
   ModelClient,
-  repairDefect,
   type UsageByTier,
 } from '@statxai/agents';
-import { BudgetExhausted, createBudget, spend, spendRepairAttempt, type StateStore } from '@statxai/state';
+import { BudgetExhausted, createBudget, spend, type StateStore } from '@statxai/state';
 import {
   ArtifactRegistry,
   ProjectWorkspace,
@@ -40,6 +39,7 @@ import { buildFromPlan } from './phases/build.js';
 import { adjudicateDefects } from './phases/adjudicate.js';
 import { evaluateSite } from './phases/evaluate.js';
 import { producePlan, revisePlan } from './phases/planning.js';
+import { executeRepairs } from './phases/repair.js';
 import { publishRelease } from './phases/publish.js';
 import { seekRelease } from './phases/release.js';
 import type { Progress, RunContext, RunDeps, RunFacts, RunProgress } from './run-context.js';
@@ -48,8 +48,6 @@ export type { RunResult } from './phases/conclude.js';
 export type { Progress } from './run-context.js';
 import {
   blocking,
-  filesForDefect,
-  REPAIR_COMPANIONS,
   type Defect,
 } from './defects.js';
 
@@ -431,109 +429,14 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       detail: `Cycle ${reviewCycle}/${facts.budgetLimits.reviewRejections}: repairing ${targets.length} of ${mustFix.length} blocking defect(s)`,
     });
 
-    let exhausted = false;
-    for (const defect of targets) {
-      try {
-        await store.withTransaction((session) =>
-          spendRepairAttempt(store, projectId, defect.fingerprint, reviewCycle, session),
-        );
-      } catch (error) {
-        if (!(error instanceof BudgetExhausted)) throw error;
-        say({
-          phase: 'repair',
-          detail: `${defect.id} skipped — ${error.budget} exhausted`,
-          level: 'warn',
-        });
-        exhausted = true;
-        continue;
-      }
+    const repair = await executeRepairs(ctx(), { targets, sources, sourceOf });
 
-      const scope = filesForDefect(
-        defect.location,
-        sources.map((f) => f.path),
-        defect.reason,
-        sourceOf,
-      );
-      const companions = sources.filter((f) => (REPAIR_COMPANIONS as readonly string[]).includes(f.path));
+    // The phase reports; the run remembers. Nothing it was handed was mutated.
+    repairsApplied += repair.repairsAppliedDelta;
+    repairedSinceReview.push(...repair.repairedSinceReview);
+    repairHistory.push(...repair.repairHistoryEntries);
 
-      /**
-       * One call per file rather than one call for the whole scope.
-       *
-       * A defect can legitimately span several pages, but asking a single call
-       * to return four complete pages exceeds the output ceiling and truncates
-       * — the repair then fails wholesale. Per-file calls keep each response
-       * small, and they are a better reading of §3's "smallest reasonable
-       * scope" anyway. The budget is still spent once for the defect, because
-       * it is one defect however many files it touches.
-       */
-      const targets = scope.filter((p) => !(REPAIR_COMPANIONS as readonly string[]).includes(p));
-      const units = targets.length > 0 ? targets : scope;
-
-      let written = 0;
-      let refused = 0;
-      let failed = 0;
-
-      for (const target of units) {
-        const context = [
-          ...sources.filter((f) => f.path === target),
-          ...companions.filter((f) => f.path !== target),
-        ];
-        try {
-          const repaired = await repairDefect(model, profile, defect, context);
-          track('luna', repaired);
-
-          // Luna may only rewrite files it was given. Enforced here rather than
-          // trusted to the prompt.
-          const allowed = new Set(context.map((f) => f.path));
-          const permitted = repaired.value.files.filter((f) => allowed.has(f.path));
-          refused += repaired.value.files.length - permitted.length;
-          await workspace.writeSiteFiles(permitted);
-          written += permitted.length;
-        } catch (error) {
-          // A failed repair must not kill the delivery. The budget is already
-          // spent, the defect stays open, and Sol escalates through the normal
-          // path when the rejection budget runs out.
-          failed += 1;
-          say({
-            phase: 'repair',
-            detail: `${defect.id} on ${target} failed: ${error instanceof Error ? error.message : String(error)}`,
-            level: 'warn',
-          });
-        }
-      }
-
-      // Queued for explicit re-verification in the next review, so a repair is
-      // never assumed to have worked just because it was attempted.
-      repairedSinceReview.push({
-        id: defect.id,
-        reason: defect.reason,
-        acceptanceTest: defect.acceptanceTest,
-      });
-      if (written > 0) repairsApplied += 1;
-
-      // Recorded so the next adjudication can tell a first attempt from a
-      // defect that narrow repair has already failed to clear.
-      repairHistory.push({
-        defectId: defect.id,
-        fingerprint: defect.fingerprint,
-        outcome:
-          failed > 0 && written === 0
-            ? `failed (${failed} file(s))`
-            : `${written} file(s) rewritten${refused > 0 ? `, ${refused} refused` : ''}`,
-      });
-
-      say({
-        phase: 'repair',
-        detail:
-          `${defect.id} [${defect.severity} ${defect.category}] across ${units.length} file(s) → ${written} written` +
-          `${refused > 0 ? `, ${refused} out-of-scope refused` : ''}${failed > 0 ? `, ${failed} failed` : ''}`,
-        level: failed > 0 ? 'warn' : 'info',
-      });
-    }
-
-    await workspace.commit(`Luna: repair cycle ${reviewCycle}`);
-
-    if (exhausted && repairsApplied === 0) {
+    if (repair.exhausted && repairsApplied === 0) {
       terminalDecision = decideTerminal(openDefects, autonomyMode);
       say({ phase: 'escalate', detail: `Repair budget exhausted → ${terminalDecision}`, level: 'fail' });
       break;

@@ -22,6 +22,9 @@ import {
 import { blocking, buildFailureDefect, fromGateFinding, fromReviewIssue, mergeByFingerprint, type Defect } from '../defects.js';
 import type { RunContext } from '../run-context.js';
 
+/** The source files a repair may edit, as the workspace reports them. */
+export type SourceFiles = Awaited<ReturnType<typeof readSourceFiles>>;
+
 export interface GateRun {
   passed: boolean;
   findings: { severity: string; gate: string; location: string; message: string }[];
@@ -33,7 +36,7 @@ export interface Evaluation {
   compiled: BuildResult;
   gateRun: GateRun;
   /** Source files a repair may edit. Read even when the build failed. */
-  sources: Awaited<ReturnType<typeof readSourceFiles>>;
+  sources: SourceFiles;
   /** Export path → the source file that produced it, for scoping a repair. */
   sourceOf: Record<string, string>;
   reviewSummary: string | null;
