@@ -16,11 +16,9 @@ import {
   BusinessProfile,
   intakeGaps,
   type AgentTier,
-  type TerminalOutcome,
 } from '@statxai/contracts';
 import {
   ModelClient,
-  type UsageByTier,
 } from '@statxai/agents';
 import { BudgetExhausted, createBudget, spend, type StateStore } from '@statxai/state';
 import {
@@ -31,7 +29,6 @@ import {
   decideTerminal,
   isReleaseBlocked,
   terminalForRefusal,
-  type ReleaseAuthorization,
   type ReplanScope,
 } from '@statxai/policy-engine';
 import { concluded, withoutDelivery, type RunResult } from './phases/conclude.js';
@@ -42,13 +39,19 @@ import { producePlan, revisePlan } from './phases/planning.js';
 import { executeRepairs } from './phases/repair.js';
 import { publishRelease } from './phases/publish.js';
 import { seekRelease } from './phases/release.js';
-import type { Progress, RunContext, RunDeps, RunFacts, RunProgress } from './run-context.js';
+import {
+  createRunProgress,
+  snapshotProgress,
+  type Progress,
+  type RunContext,
+  type RunDeps,
+  type RunFacts,
+} from './run-context.js';
 
 export type { RunResult } from './phases/conclude.js';
 export type { Progress } from './run-context.js';
 import {
   blocking,
-  type Defect,
 } from './defects.js';
 
 
@@ -72,19 +75,34 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
   const model = new ModelClient();
   const registry = new ArtifactRegistry(store);
-  const usage = { inputTokens: 0, outputTokens: 0, calls: 0 };
 
   /**
-   * Usage split by tier, because that is the only split that can be priced:
+   * Every fact the run accumulates about itself, in one place.
+   *
+   * These were eighteen parallel locals with a `snapshot()` that rebuilt an
+   * object from them — two writable representations of the same facts, and a
+   * copy only one level deep. The owner is here; phases are handed
+   * `snapshotProgress(progress)`, which is detached and read-only.
+   *
+   * Created before anything else because telemetry starts accumulating
+   * immediately, which is also why its `plan` is nullable while a phase's is
+   * not.
+   *
+   * Deliberately absent: anything durable. Budget remainders, artifact versions
+   * and release permission are read from the store, the registry and the policy
+   * engine when a decision needs them. This is working state for one
+   * invocation, never a cache of the database.
+   *
+   * Usage is split by tier because that is the only split that can be priced:
    * Sol, Terra and Luna map to different models and therefore different rates.
    */
-  const usageByTier: UsageByTier = {};
+  const progress = createRunProgress();
   const track = (tier: AgentTier, r: { inputTokens: number; outputTokens: number; ms: number }) => {
-    usage.inputTokens += r.inputTokens;
-    usage.outputTokens += r.outputTokens;
-    usage.calls += 1;
+    progress.usage.inputTokens += r.inputTokens;
+    progress.usage.outputTokens += r.outputTokens;
+    progress.usage.calls += 1;
 
-    const bucket = (usageByTier[tier] ??= { inputTokens: 0, outputTokens: 0, calls: 0, ms: 0 });
+    const bucket = (progress.usageByTier[tier] ??= { inputTokens: 0, outputTokens: 0, calls: 0, ms: 0 });
     bucket.inputTokens += r.inputTokens;
     bucket.outputTokens += r.outputTokens;
     bucket.calls += 1;
@@ -99,12 +117,15 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
    * phase that was still running. Attributing it after the fact from timestamps
    * alone gets the boundaries wrong.
    */
-  const phaseMs: Record<string, number> = {};
+  // `phaseStarted` and `currentPhase` stay private locals: they are the timing
+  // machinery, not something a phase reports.
   let phaseStarted = Date.now();
   let currentPhase: string | null = null;
   const chargePhase = (next: string) => {
     const now = Date.now();
-    if (currentPhase) phaseMs[currentPhase] = (phaseMs[currentPhase] ?? 0) + (now - phaseStarted);
+    if (currentPhase) {
+      progress.phaseMs[currentPhase] = (progress.phaseMs[currentPhase] ?? 0) + (now - phaseStarted);
+    }
     currentPhase = next;
     phaseStarted = now;
   };
@@ -115,7 +136,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   const parsed = BusinessProfile.safeParse(options.intake);
   if (!parsed.success) {
     say({ phase: 'discover', detail: `Intake rejected: ${parsed.error.issues[0]?.message}`, level: 'fail' });
-    return withoutDelivery(projectId, 'intake_insufficient', { usage, usageByTier, phaseMs });
+    return withoutDelivery(projectId, 'intake_insufficient', { usage: progress.usage, usageByTier: progress.usageByTier, phaseMs: progress.phaseMs });
   }
   const profile = parsed.data;
 
@@ -124,7 +145,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   const gaps = intakeGaps(profile);
   if (gaps.length > 0) {
     say({ phase: 'discover', detail: `Intake insufficient: ${gaps.join('; ')}`, level: 'fail' });
-    return withoutDelivery(projectId, 'intake_insufficient', { usage, usageByTier, phaseMs });
+    return withoutDelivery(projectId, 'intake_insufficient', { usage: progress.usage, usageByTier: progress.usageByTier, phaseMs: progress.phaseMs });
   }
   say({ phase: 'discover', detail: `${profile.businessName} — ${profile.services.length} services`, level: 'ok' });
 
@@ -170,7 +191,8 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   };
 
   // -- Phase 2: Plan --------------------------------------------------------
-  let plan = await producePlan({ deps, facts }, 0);
+  const initialPlan = await producePlan({ deps, facts }, 0);
+  progress.plan = initialPlan;
 
   // -- Phase 3: Build (one-shot first) --------------------------------------
   /**
@@ -188,66 +210,10 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
    * be abandoned — rather than seeing only the strategy that finally ran.
    */
 
-  await buildFromPlan({ deps, facts }, plan);
+  await buildFromPlan({ deps, facts }, initialPlan);
 
   // -- Phases 4/5: Evaluate, repair, escalate -------------------------------
-  let reviewCycle = 0;
-  let repairsApplied = 0;
-  let qualityScore = 0;
-  /** Which gates certified the released revision, recorded in the manifest. */
-  let gatesCertified: string[] = [];
-  let openDefects: Defect[] = [];
-  let terminalDecision: TerminalOutcome | undefined;
-  /** Repaired but not yet re-verified — carried into the next review. */
-  let repairedSinceReview: { id: string; reason: string; acceptanceTest: string }[] = [];
-
-  /**
-   * Every repair attempted so far, with what became of it.
-   *
-   * Sol needs this to tell a first-time defect from one that narrow repair has
-   * already failed on — which is the evidence that distinguishes "repair again"
-   * from "the plan is the problem".
-   */
-  const repairHistory: { defectId: string; fingerprint: string; outcome: string }[] = [];
-
-  /** Replans actually executed, for the approval evidence. */
-  let replansUsed = 0;
-
-  /**
-   * The harness's own release decision, and the provenance of the
-   * recommendation it considered. Null until the approval path runs, which is
-   * what keeps deployment unreachable before then.
-   */
-  let authorization: ReleaseAuthorization | null = null;
-  let approvalArtifactVersion: number | null = null;
-  let approvalModel: string | null = null;
-  let approvalDecision: 'accept' | 'reject' | 'human_review' | null = null;
-  /** Set when the review could not be obtained at all, as opposed to rejecting. */
-  let reviewUnavailable: string | null = null;
-
-  /** What the run has done so far, as of now. */
-  const snapshot = (): RunProgress => ({
-    plan,
-    reviewCycle,
-    repairsApplied,
-    replansUsed,
-    qualityScore,
-    gatesCertified,
-    openDefects,
-    repairedSinceReview,
-    repairHistory,
-    terminalDecision,
-    authorization,
-    approvalArtifactVersion,
-    approvalModel,
-    approvalDecision,
-    reviewUnavailable,
-    usage,
-    usageByTier,
-    phaseMs,
-  });
-
-  const ctx = (): RunContext => ({ deps, facts, progress: snapshot() });
+  const ctx = (): RunContext => ({ deps, facts, progress: snapshotProgress(progress) });
 
   while (true) {
     const evaluation = await evaluateSite(ctx());
@@ -255,18 +221,18 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     if (evaluation.kind === 'review_unavailable') {
       // An unobtainable review never counts as approval, so the run stops here
       // with the reason recorded rather than proceeding on a missing verdict.
-      reviewUnavailable = evaluation.reason;
-      terminalDecision = 'mark_blocked';
+      progress.reviewUnavailable = evaluation.reason;
+      progress.terminalDecision = 'mark_blocked';
       break;
     }
 
     const { compiled, gateRun, sources, sourceOf, reviewSummary } = evaluation;
-    qualityScore = evaluation.qualityScore;
-    gatesCertified = evaluation.gatesCertified;
-    openDefects = evaluation.openDefects;
-    if (evaluation.reviewRan) repairedSinceReview = [];
+    progress.qualityScore = evaluation.qualityScore;
+    progress.gatesCertified = evaluation.gatesCertified;
+    progress.openDefects = evaluation.openDefects;
+    if (evaluation.reviewRan) progress.repairedSinceReview = [];
 
-    const mustFix = blocking(openDefects);
+    const mustFix = blocking(progress.openDefects);
 
     if (mustFix.length === 0) {
       /**
@@ -282,26 +248,26 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
           ? `succeeded in ${(compiled.durationMs / 1000).toFixed(1)}s`
           : 'failed',
         reviewSummary,
-        openNonBlocking: openDefects.filter((d) => d.severity !== 'P0' && d.severity !== 'P1'),
+        openNonBlocking: progress.openDefects.filter((d) => d.severity !== 'P0' && d.severity !== 'P1'),
       });
 
-      authorization = release.decision;
-      approvalArtifactVersion = release.provenance.approvalArtifactVersion;
-      approvalModel = release.provenance.approvalModel;
-      approvalDecision = release.provenance.approvalDecision;
+      progress.authorization = release.decision;
+      progress.approvalArtifactVersion = release.provenance.approvalArtifactVersion;
+      progress.approvalModel = release.provenance.approvalModel;
+      progress.approvalDecision = release.provenance.approvalDecision;
 
-      if (!authorization.authorized) {
+      if (!progress.authorization.authorized) {
         // The harness refused. `human_review` is a real outcome rather than a
         // failure, but neither reaches deployment.
         //
         // No terminal outcome is chosen here: the refusal path exits through
-        // `terminalForRefusal(authorization.action)` below, which is the only
+        // `terminalForRefusal(progress.authorization.action)` below, which is the only
         // mapping that holds when nothing blocking remains. This branch used to
         // assign one too — dead since the refusal semantics were fixed, and a
         // second copy of a rule the policy engine owns.
         say({
           phase: 'approve',
-          detail: `Release not authorised (${authorization.action}): ${authorization.reason}`,
+          detail: `Release not authorised (${progress.authorization.action}): ${progress.authorization.reason}`,
           level: 'fail',
         });
       }
@@ -313,10 +279,10 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     const proposedAdjudication = decided.proposed;
 
     if (adjudication.action === 'block') {
-      terminalDecision = decideTerminal(openDefects, autonomyMode);
+      progress.terminalDecision = decideTerminal(progress.openDefects, autonomyMode);
       say({
         phase: 'escalate',
-        detail: `Adjudicated as unrecoverable → ${terminalDecision}`,
+        detail: `Adjudicated as unrecoverable → ${progress.terminalDecision}`,
         level: 'fail',
       });
       break;
@@ -341,11 +307,11 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       // computed from the same budget a moment earlier, so this should not
       // fail — but under concurrent execution or state drift it can, and the
       // counter must not report a cycle the budget refused.
-      reviewCycle += 1;
+      progress.reviewCycle += 1;
     } catch (error) {
       if (!(error instanceof BudgetExhausted)) throw error;
-      terminalDecision = decideTerminal(openDefects, autonomyMode);
-      say({ phase: 'escalate', detail: `Rejection budget exhausted → ${terminalDecision}`, level: 'fail' });
+      progress.terminalDecision = decideTerminal(progress.openDefects, autonomyMode);
+      say({ phase: 'escalate', detail: `Rejection budget exhausted → ${progress.terminalDecision}`, level: 'fail' });
       break;
     }
 
@@ -359,10 +325,10 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         await spend(store, projectId, 'replans');
       } catch (error) {
         if (!(error instanceof BudgetExhausted)) throw error;
-        terminalDecision = decideTerminal(openDefects, autonomyMode);
+        progress.terminalDecision = decideTerminal(progress.openDefects, autonomyMode);
         say({
           phase: 'escalate',
-          detail: `Re-plan budget exhausted with ${mustFix.length} blocking defects → ${terminalDecision}`,
+          detail: `Re-plan budget exhausted with ${mustFix.length} blocking defects → ${progress.terminalDecision}`,
           level: 'fail',
         });
         break;
@@ -403,20 +369,20 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
          * The budget is already spent, so the run stops with the reason
          * recorded.
          */
-        terminalDecision = decideTerminal(openDefects, autonomyMode);
+        progress.terminalDecision = decideTerminal(progress.openDefects, autonomyMode);
         say({
           phase: 'escalate',
-          detail: `Replan could not be produced → ${terminalDecision}`,
+          detail: `Replan could not be produced → ${progress.terminalDecision}`,
           level: 'fail',
         });
         break;
       }
 
       await workspace.clearSite();
-      replansUsed += 1;
-      plan = revised;
-      await buildFromPlan(ctx(), plan);
-      repairedSinceReview = [];
+      progress.replansUsed += 1;
+      progress.plan = revised;
+      await buildFromPlan(ctx(), revised);
+      progress.repairedSinceReview = [];
       continue;
     }
 
@@ -426,20 +392,20 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
     say({
       phase: 'repair',
-      detail: `Cycle ${reviewCycle}/${facts.budgetLimits.reviewRejections}: repairing ${targets.length} of ${mustFix.length} blocking defect(s)`,
+      detail: `Cycle ${progress.reviewCycle}/${facts.budgetLimits.reviewRejections}: repairing ${targets.length} of ${mustFix.length} blocking defect(s)`,
     });
 
     const repair = await executeRepairs(ctx(), { targets, sources, sourceOf });
 
     // The phase reports; the run remembers. Nothing it was handed was mutated.
-    repairsApplied += repair.repairsAppliedDelta;
-    repairedSinceReview.push(...repair.repairedSinceReview);
-    repairHistory.push(...repair.repairHistoryEntries);
+    progress.repairsApplied += repair.repairsAppliedDelta;
+    progress.repairedSinceReview.push(...repair.repairedSinceReview);
+    progress.repairHistory.push(...repair.repairHistoryEntries);
 
     /**
      * Did *this* cycle hit exhaustion and achieve nothing?
      *
-     * This read `repairsApplied`, the cumulative count for the whole run, so a
+     * This read `progress.repairsApplied`, the cumulative count for the whole run, so a
      * cycle that was refused every spend and repaired nothing still continued
      * as long as some earlier cycle had succeeded — evaluating again, spending
      * a rejection, and arriving at the same defects. The question is about the
@@ -452,8 +418,8 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
      * exactly the case worth getting right.
      */
     if (repair.exhausted && repair.repairsAppliedDelta === 0) {
-      terminalDecision = decideTerminal(openDefects, autonomyMode);
-      say({ phase: 'escalate', detail: `Repair budget exhausted → ${terminalDecision}`, level: 'fail' });
+      progress.terminalDecision = decideTerminal(progress.openDefects, autonomyMode);
+      say({ phase: 'escalate', detail: `Repair budget exhausted → ${progress.terminalDecision}`, level: 'fail' });
       break;
     }
   }
@@ -462,36 +428,29 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   //
   // An unobtainable review never counts as approval. §7 forbids accepting "the
   // builder says it is done", and "nobody checked" is a weaker claim than that.
-  const stillBlocked = isReleaseBlocked(openDefects) || reviewUnavailable !== null;
+  const stillBlocked = isReleaseBlocked(progress.openDefects) || progress.reviewUnavailable !== null;
 
   if (stillBlocked) {
     await store.projects.updateOne({ _id: projectId }, { $set: { state: 'blocked', updatedAt: new Date() } });
-    const commit = await workspace.currentCommit();
-    return {
-      projectId,
-      outcome: 'blocked',
-      terminalDecision: terminalDecision ?? decideTerminal(openDefects, autonomyMode),
-      qualityScore,
-      reviewCycles: reviewCycle,
-      repairsApplied,
-      openDefects,
-      commit,
-      siteRoot: workspace.siteRoot,
-      usage,
-      usageByTier,
-      phaseMs: { ...phaseMs },
-    };
+    // The same exit every other post-delivery return uses, rather than a second
+    // hand-built result: the telemetry bugs this file has already had all came
+    // from one exit path reporting a different run from the one that happened.
+    return concluded(
+      ctx(),
+      'blocked',
+      progress.terminalDecision ?? decideTerminal(progress.openDefects, autonomyMode),
+    );
   }
 
   /**
    * Deployment is reachable only through a harness authorisation.
    *
-   * `authorization` is null unless the approval path ran and returned one, so
+   * `progress.authorization` is null unless the approval path ran and returned one, so
    * every route to this point that skipped it — a terminal escalation, an
    * exhausted budget, a refused revision — stops here rather than publishing.
    */
-  if (!authorization?.authorized) {
-    const awaitingHuman = authorization?.action === 'human_review';
+  if (!progress.authorization?.authorized) {
+    const awaitingHuman = progress.authorization?.action === 'human_review';
 
     if (awaitingHuman) {
       await store.projects.updateOne(
@@ -500,7 +459,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       );
       say({
         phase: 'approve',
-        detail: `Awaiting human review before release: ${authorization?.reason ?? ''}`,
+        detail: `Awaiting human review before release: ${progress.authorization?.reason ?? ''}`,
         level: 'warn',
       });
     } else {
@@ -514,10 +473,10 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     // happens with no blocking defects outstanding, which is exactly when
     // `decideTerminal` prefers `accept_non_blocking` — so borrowing it reported
     // a denied release as an acceptance.
-    return concluded(ctx(), 'blocked', terminalForRefusal(authorization?.action ?? null));
+    return concluded(ctx(), 'blocked', terminalForRefusal(progress.authorization?.action ?? null));
   }
 
-  const { manifest, finalCommit } = await publishRelease(ctx(), authorization);
+  const { manifest, finalCommit } = await publishRelease(ctx(), progress.authorization);
 
   return { ...(await concluded(ctx(), 'released', undefined)), commit: finalCommit, manifest };
 }

@@ -70,29 +70,122 @@ export interface RunFacts {
   budgetLimits: BudgetLimits;
 }
 
-/** What the run has done so far. */
+/**
+ * What the run has done so far, as a phase sees it.
+ *
+ * Read-only, and detached: {@link snapshotProgress} hands out a deep copy, so a
+ * phase cannot reach back into the run through a nested array, and a value it
+ * read cannot change underneath it while it works. The `readonly` markers say
+ * the same thing at compile time; the clone is what enforces it.
+ *
+ * A phase reports what it found and the caller decides what to remember. That
+ * was already the convention — this makes it the mechanism.
+ */
 export interface RunProgress {
-  plan: SitePlan;
+  /** Never null here: a phase is only handed progress once a plan exists. */
+  readonly plan: SitePlan;
+  readonly reviewCycle: number;
+  readonly repairsApplied: number;
+  readonly replansUsed: number;
+  readonly qualityScore: number;
+  readonly gatesCertified: readonly string[];
+  readonly openDefects: readonly Defect[];
+  /** Repairs applied since the last review, as evidence for the next one. */
+  readonly repairedSinceReview: readonly { id: string; reason: string; acceptanceTest: string }[];
+  readonly repairHistory: readonly { defectId: string; fingerprint: string; outcome: string }[];
+  readonly terminalDecision: TerminalOutcome | undefined;
+  readonly authorization: ReleaseAuthorization | null;
+  /** Provenance for the manifest: who recommended, and on which artifact. */
+  readonly approvalArtifactVersion: number | null;
+  readonly approvalModel: string | null;
+  readonly approvalDecision: 'accept' | 'reject' | 'human_review' | null;
+  /** Set when the reviewer could not be consulted, which fails closed. */
+  readonly reviewUnavailable: string | null;
+  readonly usage: Readonly<UsageTotals>;
+  readonly usageByTier: Readonly<UsageByTier>;
+  readonly phaseMs: Readonly<Record<string, number>>;
+}
+
+/**
+ * The single owner of run-local delivery progress, held by `runProject`.
+ *
+ * This is *in-process working state for one invocation*, and nothing more. It
+ * is not the authority for anything durable: project state, budgets, defect
+ * budget counters, artifact versions and release permission all live in the
+ * store, the registry and the policy engine, and are read from there when a
+ * decision needs them. Notably absent are budget *remainders* — a cached
+ * remainder would be a second authority disagreeing with the transaction.
+ *
+ * `plan` is nullable only here. Telemetry starts accumulating before a plan
+ * exists, so the owner outlives the gap; a phase never sees it.
+ */
+export interface MutableRunProgress {
+  plan: SitePlan | null;
   reviewCycle: number;
   repairsApplied: number;
   replansUsed: number;
   qualityScore: number;
   gatesCertified: string[];
   openDefects: Defect[];
-  /** Repairs applied since the last review, as evidence for the next one. */
   repairedSinceReview: { id: string; reason: string; acceptanceTest: string }[];
   repairHistory: { defectId: string; fingerprint: string; outcome: string }[];
   terminalDecision: TerminalOutcome | undefined;
   authorization: ReleaseAuthorization | null;
-  /** Provenance for the manifest: who recommended, and on which artifact. */
   approvalArtifactVersion: number | null;
   approvalModel: string | null;
   approvalDecision: 'accept' | 'reject' | 'human_review' | null;
-  /** Set when the reviewer could not be consulted, which fails closed. */
   reviewUnavailable: string | null;
   usage: UsageTotals;
   usageByTier: UsageByTier;
   phaseMs: Record<string, number>;
+}
+
+export function createRunProgress(): MutableRunProgress {
+  return {
+    plan: null,
+    reviewCycle: 0,
+    repairsApplied: 0,
+    replansUsed: 0,
+    qualityScore: 0,
+    gatesCertified: [],
+    openDefects: [],
+    repairedSinceReview: [],
+    repairHistory: [],
+    terminalDecision: undefined,
+    authorization: null,
+    approvalArtifactVersion: null,
+    approvalModel: null,
+    approvalDecision: null,
+    reviewUnavailable: null,
+    usage: { inputTokens: 0, outputTokens: 0, calls: 0 },
+    usageByTier: {},
+    phaseMs: {},
+  };
+}
+
+/**
+ * A phase's view of the owner: a deep copy, taken now.
+ *
+ * The previous version rebuilt an object from the run's locals, which copied
+ * the top level and left every array and telemetry bucket pointing at the
+ * owner's live data. A phase could therefore have mutated the run through
+ * `openDefects.push(...)`, and a value it read early could differ from the same
+ * value read later in the same call. Neither happened, but neither was
+ * prevented.
+ *
+ * `structuredClone` rather than a hand-written copy: every field is plain
+ * cloneable data, and an explicit clone would silently go shallow again the
+ * next time the shape grows. Not `JSON.parse(JSON.stringify(...))`, which would
+ * quietly turn `undefined` into a missing key and any future date into a
+ * string.
+ */
+export function snapshotProgress(owner: MutableRunProgress): RunProgress {
+  if (owner.plan === null) {
+    // Reaching here would mean a phase was called before planning, which is a
+    // wiring mistake rather than a runtime condition worth handling.
+    throw new Error('snapshotProgress: no plan yet — a phase was called before planning ran.');
+  }
+  return structuredClone({ ...owner, plan: owner.plan });
 }
 
 /** Everything a phase may be handed. */

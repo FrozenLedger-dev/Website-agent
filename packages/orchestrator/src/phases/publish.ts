@@ -122,7 +122,7 @@ export async function publishRelease(
   // The gates that actually certified this revision, not a fresh run against
   // a tree that may have moved on. Re-running them here would also mean
   // reporting a different result from the one the release was granted on.
-  checks: progress.gatesCertified,
+  checks: [...progress.gatesCertified],
   url: deployment?.url ?? null,
   deploymentId: deployment?.deploymentId ?? null,
   rollbackRef: deployment?.rollbackRef ?? null,

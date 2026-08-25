@@ -506,6 +506,37 @@ describe('a defect that has spent its own repair allowance', () => {
     expect(budget?.used.reviewRejections).toBe(2);
   });
 
+  it('carries what was already attempted into the next adjudication', async () => {
+    /**
+     * The repair history is evidence for the *next* decision — it is how Sol
+     * tells a first attempt from a defect narrow repair has already failed on.
+     * It is produced by the repair phase, applied to the run by the loop, and
+     * read back out through the adjudication constraints, so nothing else
+     * notices if the middle step is dropped: the run still repairs, still
+     * blocks, still reports the same totals, and quietly asks every later
+     * adjudication to decide as though nothing had been tried.
+     */
+    const projectId = 'proj_repair_history_flows';
+    await run(projectId, 'full_autonomous');
+
+    const decisions = await store.artifacts
+      .find({ projectId, name: 'adjudication-decision' })
+      .sort({ version: 1 })
+      .toArray();
+
+    const previousRepairs = decisions.map(
+      (d) => (d.data as { constraints: { previousRepairs: { defectId: string; outcome: string }[] } })
+        .constraints.previousRepairs,
+    );
+
+    // Nothing attempted before the first decision; one attempt by the second.
+    expect(previousRepairs[0]).toEqual([]);
+    expect(previousRepairs[1]).toEqual([
+      { defectId: 'QA-001', fingerprint: expect.any(String), outcome: '1 file(s) rewritten' },
+    ]);
+    expect(previousRepairs[2]).toHaveLength(2);
+  });
+
   it('records what it refused, and why, on the last decision', async () => {
     const projectId = 'proj_repair_allowance_record';
     await run(projectId, 'full_autonomous');

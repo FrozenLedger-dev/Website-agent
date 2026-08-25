@@ -22,8 +22,16 @@ import {
 import { blocking, buildFailureDefect, fromGateFinding, fromReviewIssue, mergeByFingerprint, type Defect } from '../defects.js';
 import type { RunContext } from '../run-context.js';
 
-/** The source files a repair may edit, as the workspace reports them. */
-export type SourceFiles = Awaited<ReturnType<typeof readSourceFiles>>;
+/**
+ * The source files a repair may edit, as the workspace reports them.
+ *
+ * Readonly at this boundary, not at the workspace's: `readSourceFiles` returns
+ * a fresh array it no longer owns, and nothing downstream needs to write to it.
+ * Saying so in the type is what makes the repair phase's "reads, never
+ * mutates" claim checkable rather than a comment.
+ */
+export type SourceFile = Awaited<ReturnType<typeof readSourceFiles>>[number];
+export type SourceFiles = readonly SourceFile[];
 
 export interface GateRun {
   passed: boolean;

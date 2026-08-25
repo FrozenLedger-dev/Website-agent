@@ -78,7 +78,7 @@ export async function concluded(
     qualityScore: progress.qualityScore,
     reviewCycles: progress.reviewCycle,
     repairsApplied: progress.repairsApplied,
-    openDefects: progress.openDefects,
+    openDefects: [...progress.openDefects],
     commit: await deps.workspace.currentCommit(),
     siteRoot: deps.workspace.siteRoot,
     usage: progress.usage,

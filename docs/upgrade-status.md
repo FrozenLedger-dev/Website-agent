@@ -93,10 +93,10 @@ CI runs two jobs, so the signals stay separable:
 
 | Job | Runs | Needs |
 |---|---|---|
-| Typecheck, lint and unit tests | `pnpm test:unit` — 436 | nothing |
-| Mongo integration tests | `pnpm test:integration` — 62 | the compose replica set |
+| Typecheck, lint and unit tests | `pnpm test:unit` — 447 | nothing |
+| Mongo integration tests | `pnpm test:integration` — 63 | the compose replica set |
 
-Together they cover the whole inventory exactly once: 436 + 62 = 498, which is
+Together they cover the whole inventory exactly once: 447 + 63 = 510, which is
 what `pnpm test` runs. The integration job starts the same `docker-compose`
 service developers use, waits for the healthcheck that initiates the replica
 set, and proves the deployment accepts transactions before running anything —
@@ -485,11 +485,8 @@ test says so rather than leaving the number unexplained.
 - `runProject` still declares the run's mutable state as locals with a
   `snapshot()` view rather than owning a `RunProgress` object outright. That
   conversion touches ~180 references and is worth doing on its own.
-- **`snapshot()` is shallow.** `openDefects`, `repairHistory`, `gatesCertified`
-  and the telemetry objects are shared references, so the documented "a phase
-  gets a copy" is a convention rather than something the type enforces. No
-  extracted phase mutates them today. When 4b introduces a real `RunProgress`,
-  make the phase inputs `readonly` or clone the mutable collections deliberately.
+- ~~**`snapshot()` is shallow.**~~ Closed in 4c: the view is a deep clone and
+  the phase-facing type is readonly throughout.
 - **Artifact lineage is ordered by `createdAt` alone**, at millisecond
   resolution, relying on the awaits between writes to separate them. Stable in
   practice and not worth a schema change during an extraction — but if CI ever
@@ -651,16 +648,113 @@ it. Split into two tests, since ordering and atomicity are different claims.
 
 ### Still open from 4b review
 
-`RepairInput.sources` is `SourceFiles`, the mutable array type `readSourceFiles`
-returns, while `targets` and `sourceOf` are properly readonly. No mutation bug —
-the phase only maps and filters it — but the type does not enforce what the
-boundary claims. Left for the readonly work that comes with `RunProgress`
-ownership rather than reopened here.
+`RepairInput.sources` was the mutable array type — closed in 4c.
+
+## Phase 4c — one owner for run progress — **DONE**
+
+### Before
+
+`run-context.ts` described `RunProgress` correctly, and `runProject` did not
+have one: it kept **eighteen parallel mutable locals** and a `snapshot()` that
+rebuilt an object from them on every phase call.
+
+    plan · reviewCycle · repairsApplied · replansUsed · qualityScore
+    gatesCertified · openDefects · repairedSinceReview · repairHistory
+    terminalDecision · authorization · approvalArtifactVersion
+    approvalModel · approvalDecision · reviewUnavailable
+    usage · usageByTier · phaseMs
+
+Two writable representations of the same facts, and the copy went one level
+deep — every array and telemetry bucket in a "snapshot" still pointed at the
+run's live data.
+
+### After
+
+    createRunProgress()   → the one mutable owner, held by runProject
+    snapshotProgress(...) → a detached, read-only view, per phase call
+
+`runProject` is **416 lines** (from 442). The number barely moved, and that is
+fine: the point was ownership, not size. What changed is that there is now
+exactly one writable representation of each fact.
+
+**Telemetry moved onto the owner.** `track()` writes `progress.usage` and
+`progress.usageByTier`; the phase timer writes `progress.phaseMs`. There is no
+second telemetry object to keep in step. `phaseStarted` and `currentPhase` stay
+private locals — timing machinery, not something a phase reports.
+
+**`plan` is nullable on the owner and never on a phase's view.** Telemetry
+starts accumulating before planning, so the owner outlives the gap;
+`snapshotProgress` throws rather than handing a phase progress with no plan,
+because that would be a wiring mistake rather than a runtime condition. Intake
+failure still returns through `withoutDelivery` with the telemetry accumulated
+so far, and never calls `snapshotProgress`.
+
+### The detachment
+
+`structuredClone`, not a hand-written copy — every field is plain cloneable
+data, and an explicit clone would silently go shallow again the next time the
+shape grows. Not `JSON.parse(JSON.stringify(...))`, which would turn `undefined`
+into a missing key.
+
+Both directions are tested, and the nesting with them: the owner advancing does
+not alter a view already handed out, and writes forced through an unsafe cast
+into a view — including `view.plan.sitemap.pages[0].title` — leave the owner
+untouched.
+
+### The readonly boundary
+
+Phase-facing `RunProgress` is readonly throughout, including its collections.
+`run-progress-readonly.ts` is a compile-time fixture: every line is an expected
+error under `@ts-expect-error`, so *removing* a readonly marker fails the build
+on the unused directive rather than passing quietly.
+
+Turning it on immediately found three places passing a readonly array where a
+mutable one was expected — the adjudication constraints, the concluded result,
+and the manifest's checks. All three now copy at the point ownership changes
+hands.
+
+`RepairInput.sources` is closed too: `SourceFiles` is `readonly SourceFile[]`,
+tightened at the orchestrator boundary rather than in the workspace's API.
+
+### What the owner is not
+
+It is in-process working state for one invocation. It is **not** authority for
+project state, budgets, defect budget counters, artifact versions or release
+permission — those stay in the store, the registry and the policy engine. A test
+asserts the owner holds no budget remainder and no artifact-version cache, with
+the one exception the manifest genuinely needs: `approvalArtifactVersion`.
+
+### Phases still cannot write to the run
+
+Audited before changing anything: no phase assigns to `ctx.progress` or pushes
+into its collections, and none depends on a value becoming live-updated during
+its own call. `conclude.ts` is the only phase reading telemetry, once, at the
+exit — and nothing mutates it between the snapshot and that read.
+
+The still-blocked exit was hand-building a `RunResult` from locals; it now goes
+through `concluded()` like every other post-delivery return. Every telemetry bug
+this file has had came from one exit path reporting a different run from the one
+that happened.
+
+### Mutation checks
+
+| Mutation | Result |
+|---|---|
+| return the owner instead of a clone | 4 isolation tests fail |
+| copy only the top level | the same 4 fail |
+| reintroduce `let reviewCycle` beside the owner | single-owner guard fails |
+| drop a readonly marker | typecheck fails on the unused directive |
+| report telemetry from a stale object | parity test fails |
+| stop applying repair history to the owner | **nothing failed** |
+
+The last one was a real gap, not a passing grade. Repair history is evidence for
+the *next* adjudication, and dropping it changed no total, no outcome and no
+artifact anyone was checking — every later decision would simply have been made
+as though nothing had been tried. Closed by asserting the history reaches the
+next adjudication's recorded constraints; the mutation now fails.
 
 ## Remaining Phase 4 work
 
-- Global `RunProgress` ownership: the run still keeps mutable state as locals
-  behind a shallow `snapshot()`. ~180 references; its own commit.
 - Intake and project setup extraction (~45 lines).
 - Artifact lineage ordered on millisecond `createdAt`.
 - `REPAIR_COMPANIONS` → the later permission/tool-gateway phase.

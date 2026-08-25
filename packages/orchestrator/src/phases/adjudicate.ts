@@ -87,7 +87,7 @@ export async function adjudicateDefects(
     replansLeft: currentBudget.limits.replans - currentBudget.used.replans,
     reviewRejectionsLeft:
       currentBudget.limits.reviewRejections - currentBudget.used.reviewRejections,
-    previousRepairs: progress.repairHistory,
+    previousRepairs: [...progress.repairHistory],
     autonomyMode: facts.autonomyMode,
   };
   const legal = legalAdjudicationActions(constraints);

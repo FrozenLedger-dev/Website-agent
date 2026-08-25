@@ -134,7 +134,7 @@ describe('ordering and reachability in the delivery loop', () => {
     // phase, which is the stronger arrangement: publishing is not reachable
     // without going through the call the guard sits in front of.
     const code = await source();
-    const guard = code.indexOf('if (!authorization?.authorized)');
+    const guard = code.indexOf('if (!progress.authorization?.authorized)');
     const publish = code.indexOf('publishRelease(ctx()');
 
     expect(guard).toBeGreaterThan(-1);
@@ -219,7 +219,7 @@ describe('what a refused release reports to its caller', () => {
      * decision right, the telemetry describing a different run.
      */
     const code = await source();
-    const late = code.slice(code.indexOf('if (!authorization?.authorized)'));
+    const late = code.slice(code.indexOf('if (!progress.authorization?.authorized)'));
     const branch = late.slice(0, late.indexOf('\n  }\n'));
 
     expect(branch).toContain('concluded(');
@@ -245,7 +245,7 @@ describe('what a refused release reports to its caller', () => {
       'qualityScore: progress.qualityScore,',
       'reviewCycles: progress.reviewCycle,',
       'repairsApplied: progress.repairsApplied,',
-      'openDefects: progress.openDefects,',
+      'openDefects: [...progress.openDefects],',
       'workspace.currentCommit()',
       'siteRoot: deps.workspace.siteRoot,',
     ]) {
@@ -259,7 +259,7 @@ describe('what a refused release reports to its caller', () => {
     // This branch is reached only when none remains, so borrowing it reported a
     // denied release as an acceptance.
     const code = await source();
-    const late = code.slice(code.indexOf('if (!authorization?.authorized)'));
+    const late = code.slice(code.indexOf('if (!progress.authorization?.authorized)'));
     const branch = late.slice(0, late.indexOf('\n  }\n'));
 
     expect(branch).toContain('terminalForRefusal(');
@@ -269,7 +269,7 @@ describe('what a refused release reports to its caller', () => {
 
   it('records a blocked project state when it did not route to a person', async () => {
     const code = await source();
-    const late = code.slice(code.indexOf('if (!authorization?.authorized)'));
+    const late = code.slice(code.indexOf('if (!progress.authorization?.authorized)'));
     const branch = late.slice(0, late.indexOf('\n  }\n'));
     expect(branch).toContain("state: 'blocked'");
   });

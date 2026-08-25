@@ -81,3 +81,54 @@ describe('the project state transition surface', () => {
     ]);
   });
 });
+
+/**
+ * One mutable owner per run-progress fact.
+ *
+ * The refactor these guard against is the one that was there before: eighteen
+ * parallel `let`s plus a `snapshot()` that rebuilt an object from them. Two
+ * writable representations of the same fact drift, and the drift is silent —
+ * the loop updates one, a phase reads the other.
+ */
+describe('the run has one owner for its progress', () => {
+  const runProject = async () => {
+    const code = await readFile(join(SRC, 'orchestrator.ts'), 'utf8');
+    const start = code.indexOf('export async function runProject');
+    return code.slice(start).replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+  };
+
+  /** Every field the owner holds, read from the factory rather than listed. */
+  const fields = async () => {
+    const { createRunProgress } = await import('../src/run-context.js');
+    return Object.keys(createRunProgress());
+  };
+
+  it('declares no mutable local beside the owner', async () => {
+    const body = await runProject();
+
+    for (const field of await fields()) {
+      const parallel = new RegExp(`\\blet ${field}\\b`);
+      expect(parallel.test(body), `runProject declares a second owner for ${field}`).toBe(false);
+    }
+  });
+
+  it('creates the owner exactly once', async () => {
+    const body = await runProject();
+    expect(body.match(/createRunProgress\(\)/g) ?? []).toHaveLength(1);
+  });
+
+  it('hands phases a snapshot, never the owner itself', async () => {
+    const body = await runProject();
+
+    expect(body).toContain('progress: snapshotProgress(progress)');
+    // `progress` reaching a phase directly would put the owner behind a
+    // readonly type without detaching it, which is the worst of both.
+    expect(body).not.toMatch(/progress:\s*progress\b/);
+  });
+
+  it('lets phases keep their own immutable locals', async () => {
+    // The rule is one *mutable* owner per fact, not a ban on named values.
+    const body = await runProject();
+    expect(body).toContain('const initialPlan = await producePlan');
+  });
+});
