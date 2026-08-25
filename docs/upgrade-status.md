@@ -93,10 +93,10 @@ CI runs two jobs, so the signals stay separable:
 
 | Job | Runs | Needs |
 |---|---|---|
-| Typecheck, lint and unit tests | `pnpm test:unit` — 435 | nothing |
-| Mongo integration tests | `pnpm test:integration` — 61 | the compose replica set |
+| Typecheck, lint and unit tests | `pnpm test:unit` — 436 | nothing |
+| Mongo integration tests | `pnpm test:integration` — 62 | the compose replica set |
 
-Together they cover the whole inventory exactly once: 435 + 61 = 496, which is
+Together they cover the whole inventory exactly once: 436 + 62 = 498, which is
 what `pnpm test` runs. The integration job starts the same `docker-compose`
 service developers use, waits for the healthcheck that initiates the replica
 set, and proves the deployment accepts transactions before running anything —
@@ -600,17 +600,62 @@ through a helper that fails loudly when the pattern is not found.
 
 ### Characterised, not changed
 
-Two behaviours are pinned as they are, not endorsed:
+Two behaviours were pinned as they were, not endorsed:
 
-- The exhaustion guard reads the **cumulative** `repairsApplied`, so a cycle
-  that repairs nothing continues if an earlier cycle repaired something. Left
-  exactly as it was; 4b is extraction, not policy cleanup.
+- The exhaustion guard read the **cumulative** `repairsApplied` — corrected in
+  4b.1, below.
 - The cycle commit is attempted unconditionally, including when nothing was
-  written. The workspace decides whether there is anything to record.
+  written. The workspace decides whether there is anything to record. Still
+  characterised rather than changed.
 
 No new artifact, no `repair-decision`, no new project state. `adjudication-
 decision` is still written before repair runs; the phase executes an already
 persisted decision.
+
+## Phase 4b.1 — ask the exhaustion guard about this cycle
+
+    - if (repair.exhausted && repairsApplied === 0)
+    + if (repair.exhausted && repair.repairsAppliedDelta === 0)
+
+`repairsApplied` is the run's cumulative count, so a cycle that was refused
+every spend and repaired nothing continued anyway as long as some earlier cycle
+had succeeded: another evaluation, another rejection spent, the same defects
+still open. The question the guard means to ask is about the cycle that just
+ran, and 4b's per-cycle delta is what it can be asked with.
+
+### Why nothing caught it
+
+The branch is unreachable within a single run. Since Phase 3b, targets are
+capped to the project allowance and filtered by per-fingerprint eligibility
+before they reach the repair phase, so the authoritative spend cannot refuse one
+that policy authorised. It fires only when the transaction disagrees with the
+snapshot policy read — drift, a concurrent writer, a resumed run — which is
+exactly the case worth getting right, and exactly the case no test could reach.
+
+So the refusal is now simulated. `refusal.integration.test.ts` mocks
+`spendRepairAttempt` as a pass-through with an opt-in refusal list, leaving all
+its existing budget accounting real. The new scenario repairs successfully in
+cycle one, has cycle two's only target refused, and asserts the run stops with
+two review rejections spent rather than three.
+
+Verified by reverting the condition: the old one spends the third rejection and
+the test fails on the count.
+
+### A test that was not proving what it said
+
+`spends once per defect, transactionally` asserted the spend happened before
+Luna, which left the wrapper untested — removing `withTransaction` while keeping
+the spend would have passed. The fake store now records whether each spend
+happened inside a transaction, and a mutation that drops only the wrapper fails
+it. Split into two tests, since ordering and atomicity are different claims.
+
+### Still open from 4b review
+
+`RepairInput.sources` is `SourceFiles`, the mutable array type `readSourceFiles`
+returns, while `targets` and `sourceOf` are properly readonly. No mutation bug —
+the phase only maps and filters it — but the type does not enforce what the
+boundary claims. Left for the readonly work that comes with `RunProgress`
+ownership rather than reopened here.
 
 ## Remaining Phase 4 work
 

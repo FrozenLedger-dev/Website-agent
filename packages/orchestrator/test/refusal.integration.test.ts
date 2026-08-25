@@ -24,6 +24,7 @@ import type * as Agents from '@statxai/agents';
 import type * as Gates from '@statxai/gates';
 import type * as Workspace from '@statxai/workspace';
 import { StateStore } from '@statxai/state';
+import type * as State from '@statxai/state';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -153,6 +154,30 @@ vi.mock('@statxai/workspace', async (importOriginal) => {
 
 // Gates are stubbed to pass with one P2 open, so the run reaches approval with
 // something real for Sol to acknowledge.
+/**
+ * Fingerprints whose authoritative spend is refused, simulating drift.
+ *
+ * Within one run the spend cannot refuse a target policy authorised: the
+ * targets are capped to the project allowance and filtered by per-fingerprint
+ * eligibility from a snapshot read moments earlier. So the only way to reach
+ * the exhaustion guard is for the transaction to disagree with that snapshot —
+ * another writer, or a resumed run. That is precisely the case the guard exists
+ * for, and it needs simulating to be tested at all.
+ */
+let driftRefuses: string[] = [];
+
+vi.mock('@statxai/state', async (importOriginal) => {
+  const actual = await importOriginal<typeof State>();
+  return {
+    ...actual,
+    spendRepairAttempt: vi.fn(async (...args: Parameters<typeof actual.spendRepairAttempt>) => {
+      const fingerprint = args[2];
+      if (driftRefuses.includes(fingerprint)) throw new actual.BudgetExhausted('repairsPerDefect');
+      return actual.spendRepairAttempt(...args);
+    }),
+  };
+});
+
 vi.mock('@statxai/gates', async (importOriginal) => {
   const actual = await importOriginal<typeof Gates>();
   return {
@@ -197,6 +222,7 @@ afterAll(async () => {
 beforeEach(async () => {
   deployCalls.length = 0;
   repairCalls.length = 0;
+  driftRefuses = [];
   reviewSequence = [{ qualityScore: 92, blocking: false, issues: [issue()] }];
   adjudications = [{ action: 'block', reason: 'unused by default', defectIds: null, objective: null, scope: null }];
   await store.artifacts.deleteMany({});
@@ -758,5 +784,85 @@ describe('an adjudication artifact explains its own decision', () => {
     // The reviewer's prose stays on the review outcome rather than being copied
     // into every adjudication: only what a policy rule reads goes in.
     expect(Object.keys(blocking[0]!).sort()).toEqual(['fingerprint', 'id', 'severity']);
+  });
+});
+
+describe('a repair cycle that was refused every spend', () => {
+  /**
+   * The guard asks whether *this* cycle hit exhaustion and achieved nothing.
+   *
+   * It used to read the run's cumulative repair count, so a cycle that was
+   * refused every spend still continued as long as some earlier cycle had
+   * succeeded: another evaluation, another rejection spent, the same defects.
+   *
+   * Reaching it needs the authoritative spend to disagree with the snapshot
+   * policy authorised from, which cannot happen inside one run — targets are
+   * capped to both allowances first. So the refusal is simulated, which is
+   * honest about what the branch is for: drift, or a concurrent writer.
+   */
+  const stubborn = (id: string) =>
+    issue({
+      id,
+      severity: 'P1',
+      category: 'business_accuracy',
+      location: 'index.html',
+      reason: 'States a guarantee the profile does not support.',
+    });
+
+  beforeEach(() => {
+    reviewSequence = [
+      // Cycle one repairs successfully, so the cumulative count is non-zero.
+      { qualityScore: 60, blocking: true, issues: [stubborn('QA-501')] },
+      // Cycle two: a second defect, whose every spend the store refuses.
+      { qualityScore: 62, blocking: true, issues: [stubborn('QA-502')] },
+      // Only reached if the run wrongly continues.
+      { qualityScore: 64, blocking: true, issues: [stubborn('QA-503')] },
+    ];
+    adjudications = [
+      { action: 'repair', reason: 'Narrow claim fix.', defectIds: ['QA-501'], objective: null, scope: null },
+      { action: 'repair', reason: 'Narrow claim fix.', defectIds: ['QA-502'], objective: null, scope: null },
+      { action: 'repair', reason: 'Narrow claim fix.', defectIds: ['QA-503'], objective: null, scope: null },
+    ];
+    approval = { recommendation: 'accept', reason: 'unused', acknowledgedIssues: [] };
+  });
+
+  it('stops instead of spending another rejection on the same defects', async () => {
+    const projectId = 'proj_repair_drift';
+
+    // Every fingerprint for this location and category collapses to one, so
+    // refusing it refuses cycle two's only target.
+    const { defectFingerprint } = await import('@statxai/contracts');
+    driftRefuses = [defectFingerprint({ category: 'business_accuracy', location: 'index.html' })];
+
+    // Cycle one must still succeed, so the refusal starts after it.
+    const original = [...driftRefuses];
+    driftRefuses = [];
+    let cycle = 0;
+    const armAfterFirstRepair = () => {
+      cycle += 1;
+      if (cycle === 1) driftRefuses = original;
+    };
+
+    const { runProject } = await import('../src/orchestrator.js');
+    const result = await runProject({
+      projectId,
+      intake: INTAKE,
+      store,
+      workspacesRoot: root,
+      autonomyMode: 'full_autonomous',
+      onProgress: (e) => {
+        if (e.phase === 'repair' && e.detail.includes('written')) armAfterFirstRepair();
+      },
+    });
+
+    // One repair landed, then the next cycle was refused and the run stopped.
+    expect(result.repairsApplied).toBe(1);
+    expect(result.outcome).toBe('blocked');
+    expect(result.terminalDecision).toBe('rollback_to_last_accepted');
+
+    // Two evaluations, not three: the refused cycle did not buy another one.
+    const budget = await store.budgets.findOne({ _id: projectId });
+    expect(budget?.used.reviewRejections).toBe(2);
+    expect(repairCalls).toEqual(['QA-501']);
   });
 });

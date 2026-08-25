@@ -32,6 +32,9 @@ let lunaReplies: LunaReply[];
 /** Fingerprints whose spend the transaction refuses. */
 let exhaustedFingerprints: string[];
 const spends: string[] = [];
+/** Whether each spend happened inside `withTransaction`, in call order. */
+const spendsInTransaction: boolean[] = [];
+let insideTransaction = false;
 const written: { path: string; contents: string }[] = [];
 const commits: string[] = [];
 
@@ -41,6 +44,7 @@ vi.mock('@statxai/state', async (importOriginal) => {
     ...actual,
     spendRepairAttempt: vi.fn(async (_store, _projectId, fingerprint: string) => {
       spends.push(fingerprint);
+      spendsInTransaction.push(insideTransaction);
       if (exhaustedFingerprints.includes(fingerprint)) {
         throw new actual.BudgetExhausted('repairsPerDefect');
       }
@@ -95,7 +99,16 @@ const defect = (over: Partial<Defect> = {}): Defect =>
 const context = (): RunContext =>
   ({
     deps: {
-      store: { withTransaction: async (fn: (s: unknown) => Promise<void>) => fn({}) },
+      store: {
+        withTransaction: async (fn: (s: unknown) => Promise<void>) => {
+          insideTransaction = true;
+          try {
+            return await fn({});
+          } finally {
+            insideTransaction = false;
+          }
+        },
+      },
       registry: {},
       workspace: {
         writeSiteFiles: async (files: { path: string; contents: string }[]) => {
@@ -126,6 +139,8 @@ const run = async (targets: Defect[]) => {
 beforeEach(() => {
   lunaCalls.length = 0;
   spends.length = 0;
+  spendsInTransaction.length = 0;
+  insideTransaction = false;
   written.length = 0;
   commits.length = 0;
   exhaustedFingerprints = [];
@@ -133,11 +148,22 @@ beforeEach(() => {
 });
 
 describe('the repair budget', () => {
-  it('spends once per defect, transactionally, before Luna is asked', async () => {
+  it('spends once per defect, before Luna is asked', async () => {
     await run([defect()]);
 
     expect(spends).toEqual(['fp:QA-001']);
     expect(lunaCalls).toHaveLength(1);
+  });
+
+  it('spends inside a transaction, not merely before the call', async () => {
+    // Asserting the order alone left the wrapper untested: dropping
+    // `withTransaction` while keeping the spend would have passed. The
+    // transaction is the authority — a spend outside one can be observed
+    // half-applied, and the guarded per-fingerprint increment stops being
+    // atomic with the project-wide one.
+    await run([defect(), defect({ id: 'QA-002', fingerprint: 'fp:QA-002' })]);
+
+    expect(spendsInTransaction).toEqual([true, true]);
   });
 
   it('spends once for a defect that spans several files', async () => {

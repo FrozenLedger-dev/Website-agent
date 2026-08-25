@@ -436,7 +436,22 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     repairedSinceReview.push(...repair.repairedSinceReview);
     repairHistory.push(...repair.repairHistoryEntries);
 
-    if (repair.exhausted && repairsApplied === 0) {
+    /**
+     * Did *this* cycle hit exhaustion and achieve nothing?
+     *
+     * This read `repairsApplied`, the cumulative count for the whole run, so a
+     * cycle that was refused every spend and repaired nothing still continued
+     * as long as some earlier cycle had succeeded — evaluating again, spending
+     * a rejection, and arriving at the same defects. The question is about the
+     * cycle that just ran, and the phase now returns a per-cycle delta to ask
+     * it with.
+     *
+     * Reachable only when the authoritative spend disagrees with the snapshot
+     * policy authorised from: within one run, targets are capped to both
+     * allowances before they get here. That is drift or concurrency — which is
+     * exactly the case worth getting right.
+     */
+    if (repair.exhausted && repair.repairsAppliedDelta === 0) {
       terminalDecision = decideTerminal(openDefects, autonomyMode);
       say({ phase: 'escalate', detail: `Repair budget exhausted → ${terminalDecision}`, level: 'fail' });
       break;
