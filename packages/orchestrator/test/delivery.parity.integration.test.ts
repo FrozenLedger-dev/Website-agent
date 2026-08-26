@@ -218,15 +218,18 @@ const run = async (projectId: string, autonomyMode: 'full_autonomous' | 'supervi
 /**
  * The artifact stream in the order it was written.
  *
- * Ordered by `createdAt` rather than `_id`, which is
- * `projectId:name:version` and therefore sorts alphabetically. Every write here
- * is separated by at least one await, so the millisecond resolution is enough
- * to distinguish them.
+ * Ordered by the platform-assigned per-project `lineageSeq`, read through the
+ * registry's own lineage API. `createdAt` remains observational metadata and is
+ * deliberately not used to infer workflow order: it has millisecond resolution,
+ * so two writes in the same millisecond are indistinguishable by it, and that
+ * was only ever survivable because the awaits between them happened to be slow
+ * enough.
  */
-const lineage = async (projectId: string) =>
-  (await store.artifacts.find({ projectId }).sort({ createdAt: 1 }).toArray()).map(
-    (a) => `${a.name}@${a.version}`,
-  );
+const lineage = async (projectId: string) => {
+  const { ArtifactRegistry } = await import('@statxai/workspace');
+  const docs = await new ArtifactRegistry(store).listLineage(projectId);
+  return docs.map((a) => `${a.name}@${a.version}`);
+};
 
 describe('a delivery that is released', () => {
   it('reports the run the caller is owed', async () => {

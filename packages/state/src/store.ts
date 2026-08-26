@@ -6,6 +6,7 @@ import { MongoClient } from 'mongodb';
 import type { ClientSession, Collection, Db } from 'mongodb';
 import type {
   ArtifactDocument,
+  ArtifactSequenceDocument,
   AuditEvent,
   BudgetDocument,
   DefectBudgetDocument,
@@ -58,6 +59,15 @@ export class StateStore {
   }
   get artifacts(): Collection<ArtifactDocument> {
     return this.db.collection<ArtifactDocument>('artifacts');
+  }
+  /**
+   * Per-project artifact lineage counters.
+   *
+   * Deliberately separate from `projects`: a run deletes and recreates the
+   * project record at startup, and artifact history outlives that lifecycle.
+   */
+  get artifactSequences(): Collection<ArtifactSequenceDocument> {
+    return this.db.collection<ArtifactSequenceDocument>('artifact_sequences');
   }
   get reviews(): Collection<ReviewDocument> {
     return this.db.collection<ReviewDocument>('reviews');
@@ -116,7 +126,20 @@ export class StateStore {
     await this.artifacts.createIndexes([
       { key: { projectId: 1, name: 1, version: -1 } },
       { key: { projectId: 1, name: 1, version: 1 }, unique: true },
+      // Two artifacts in one project can never claim the same position in its
+      // history. Partial because artifacts written before lineage numbers
+      // existed have no `lineageSeq`, and a plain unique index would treat
+      // every one of them as a duplicate `null` and refuse to build.
+      {
+        key: { projectId: 1, lineageSeq: 1 },
+        unique: true,
+        partialFilterExpression: { lineageSeq: { $exists: true } },
+      },
     ]);
+
+    // Touching the collection here also creates it, so an allocation running
+    // inside a caller's transaction never has to create a namespace.
+    await this.artifactSequences.createIndex({ updatedAt: -1 });
 
     await this.defectBudgets.createIndex({ projectId: 1, fingerprint: 1 }, { unique: true });
 

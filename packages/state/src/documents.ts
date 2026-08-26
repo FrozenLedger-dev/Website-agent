@@ -104,7 +104,43 @@ export interface ArtifactDocument {
   data: unknown;
   /** Set when Sol accepts this version as an input for downstream work. */
   acceptedAt: Date | null;
+  /**
+   * Where this artifact sits in the project's persisted lineage.
+   *
+   * `version` is monotonic within one *name* — `site-plan@1`, `site-plan@2` —
+   * and says nothing about whether the plan was written before or after the
+   * route decision that followed it. This is monotonic across every artifact
+   * the project has, allocated atomically by the store, and is the authority
+   * for that question.
+   *
+   * Optional only because artifacts written before it existed do not have one.
+   * Everything `ArtifactRegistry.put` writes does.
+   */
+  lineageSeq?: number;
+  /**
+   * When the artifact was recorded. Observational metadata, deliberately not
+   * the ordering authority: it has millisecond resolution, and two writes in
+   * the same millisecond are indistinguishable by it. Use {@link lineageSeq}
+   * to ask what came before what.
+   */
   createdAt: Date;
+}
+
+/**
+ * The per-project artifact lineage counter.
+ *
+ * Its own collection rather than a field on `ProjectDocument`, because a run
+ * deletes and recreates the project record at startup and artifact history
+ * outlives that: a counter living there would reset, and the second run's
+ * artifacts would claim to precede the first run's.
+ *
+ * `_id` is the project id, so Mongo's own `_id` uniqueness gives exactly one
+ * counter per project with no extra index.
+ */
+export interface ArtifactSequenceDocument {
+  _id: string;
+  lastAllocated: number;
+  updatedAt: Date;
 }
 
 export function artifactId(projectId: string, name: string, version: number): string {

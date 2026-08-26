@@ -94,9 +94,9 @@ CI runs two jobs, so the signals stay separable:
 | Job | Runs | Needs |
 |---|---|---|
 | Typecheck, lint and unit tests | `pnpm test:unit` — 447 | nothing |
-| Mongo integration tests | `pnpm test:integration` — 63 | the compose replica set |
+| Mongo integration tests | `pnpm test:integration` — 76 | the compose replica set |
 
-Together they cover the whole inventory exactly once: 447 + 63 = 510, which is
+Together they cover the whole inventory exactly once: 447 + 76 = 523, which is
 what `pnpm test` runs. The integration job starts the same `docker-compose`
 service developers use, waits for the healthcheck that initiates the replica
 set, and proves the deployment accepts transactions before running anything —
@@ -487,11 +487,9 @@ test says so rather than leaving the number unexplained.
   conversion touches ~180 references and is worth doing on its own.
 - ~~**`snapshot()` is shallow.**~~ Closed in 4c: the view is a deep clone and
   the phase-facing type is readonly throughout.
-- **Artifact lineage is ordered by `createdAt` alone**, at millisecond
-  resolution, relying on the awaits between writes to separate them. Stable in
-  practice and not worth a schema change during an extraction — but if CI ever
-  shows a sporadic lineage-order failure, that is the cause, and the fix is a
-  monotonic sequence on the artifact rather than a looser assertion.
+- ~~**Artifact lineage is ordered by `createdAt` alone.**~~ Closed in 4d: every
+  artifact carries a per-project lineage number allocated atomically by the
+  store.
 
 Phase 4 is **not** complete. Phase 5 — mapping these boundaries onto the job
 engine — is not started, deliberately: the job engine keeps its own enqueue,
@@ -777,12 +775,106 @@ handing back a reference, so the caller owns what it is given. The compile-time
 fixture asserts the mutability with no `@ts-expect-error`, which means aliasing
 it back fails the build.
 
+## Phase 4d — deterministic artifact lineage — **DONE**
+
+### The question `version` cannot answer
+
+Artifact versions are scoped to a name:
+
+    site-plan@1 · site-plan@2      route-decision@1
+
+Neither number says whether the plan was written before or after the route
+decision. That question was answered by sorting on `createdAt`, which is
+millisecond-resolution *observation*: two writes in the same millisecond are
+indistinguishable by it, and the only reason it held is that the awaits between
+artifact writes happened to be slow enough. Phase 5 introduces real job
+concurrency, so it needed replacing before then rather than after.
+
+|  | Before | After |
+|---|---|---|
+| Artifact identity | `projectId + name + version` | unchanged |
+| Cross-artifact order | `createdAt` | `projectId + lineageSeq` |
+| `createdAt` | the ordering authority | observation, informational only |
+
+### How a number is allocated
+
+`artifact_sequences`, keyed by project id, so Mongo's own `_id` uniqueness
+gives exactly one counter per project with no extra index.
+
+    findOneAndUpdate(
+      { _id: projectId },
+      { $inc: { lastAllocated: 1 }, $set: { updatedAt: now } },
+      { upsert: true, returnDocument: 'after', session },
+    )
+
+One atomic operation, never read-then-write — that version looks equivalent and
+is not: two writers reading `7` both write `8`. `ArtifactRegistry.put` allocates
+it, so no caller supplies one, no phase chooses one and no model can suggest
+one. A session passed to `put` is used for the allocation as well as the version
+lookup and the insert, so an aborting transaction takes the allocation with it.
+
+**Gaps are allowed and are not worth preventing.** The number is allocated
+before the insert, so a writer that allocates 14 and then fails leaves 13, 15,
+16 — a valid ordering with a hole in it. A sequence is an ordering token, not an
+accounting balance, and reclaiming 14 would add a failure mode to remove a
+cosmetic one.
+
+### Indexes
+
+    { projectId: 1, lineageSeq: 1 }
+      unique
+      partialFilterExpression: { lineageSeq: { $exists: true } }
+
+Partial because artifacts written before this existed have no `lineageSeq`, and
+a plain unique index would read every one of them as a duplicate `null` and
+refuse to build against an existing database. The two existing artifact indexes
+are unchanged.
+
+### Artifacts written before
+
+`listLineage` is a new method rather than a change to `list`, which groups by
+name and has callers relying on that. Sequenced artifacts order by
+`lineageSeq`; legacy ones sort first, by `createdAt` then `_id`.
+
+That fallback is for **stable presentation**, and it is worth being blunt about
+what it is not: when two legacy artifacts share a millisecond, their true write
+order was never recorded and cannot be recovered. Nothing is backfilled, because
+a backfilled number would be a confident invention.
+
+### What did not change
+
+- **`ArtifactRef`** keeps exactly `name`, `version`, `contentHash`. A worker
+  pins an artifact by identity; where it sits in the project's history is
+  platform metadata and no input should depend on it.
+- **`contentHash`** — the sequence is not hashed, and neither are the
+  timestamps. Identical data hashes identically before and after.
+- **`accept()`** allocates nothing. Creating an artifact is one event in the
+  history; accepting the version that already exists is not a second one.
+- **`RunProgress`** did not gain the counter. Reading a cached number and
+  incrementing it is precisely the concurrent-authority bug this removes — and
+  4c made `RunProgress` run-local working state on purpose.
+- **The counter is not in `ProjectDocument`.** A run deletes and recreates that
+  record at startup, so a counter living there would reset and the second run's
+  artifacts would claim to precede the first run's. A test pins that.
+
+Deferred, deliberately: which job produced an artifact (`producerJobId` and
+friends) belongs with the job-engine work, where those identities are real; and
+parent edges are a DAG, which is a different capability from a total order.
+
+### Mutation checks
+
+| Mutation | Result |
+|---|---|
+| order lineage by `createdAt` again | identical-timestamp and race tests fail |
+| read-then-write instead of `$inc` | both race tests fail — checked three times, not flaky |
+| drop the unique partial index | duplicate-lineage test fails |
+| one global counter | 5 tests fail |
+| reset the counter mid-project | 5 tests fail |
+| leak the sequence into `ArtifactRef` | public-shape test fails |
+| allocate again on `accept()` | acceptance test fails |
+
 ## Remaining Phase 4 work
 
-- **Artifact lineage ordered on millisecond `createdAt`.** Worth doing before
-  the intake extraction: ordering by wall-clock gets more dangerous once Phase 5
-  introduces real job execution and concurrency, whereas the intake work is
-  structural tidying that nothing else depends on.
 - Intake and project setup extraction (~45 lines).
 - `REPAIR_COMPANIONS` → the later permission/tool-gateway phase.
 

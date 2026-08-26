@@ -13,7 +13,12 @@
 import { createHash } from 'node:crypto';
 import type { ClientSession } from 'mongodb';
 import type { ArtifactRef } from '@statxai/contracts';
-import { artifactId, type ArtifactDocument, type StateStore } from '@statxai/state';
+import {
+  allocateArtifactLineageSeq,
+  artifactId,
+  type ArtifactDocument,
+  type StateStore,
+} from '@statxai/state';
 
 /** Stable hash of an artifact's content, independent of key order. */
 export function contentHash(data: unknown): string {
@@ -46,7 +51,16 @@ export class ArtifactNotFound extends Error {
 export class ArtifactRegistry {
   constructor(private readonly store: StateStore) {}
 
-  /** Write a new immutable version and return a pinned reference to it. */
+  /**
+   * Write a new immutable version and return a pinned reference to it.
+   *
+   * Two independent numbers are assigned here and they answer different
+   * questions. `version` is the next version of *this name*, and identifies the
+   * artifact. `lineageSeq` is the next position in the *project's* history, and
+   * is what orders this artifact against every other one — the registry
+   * allocates it, so no caller can choose or skip it, and no model can suggest
+   * it. Neither appears in the returned reference or in the hashed content.
+   */
   async put(
     projectId: string,
     name: string,
@@ -59,6 +73,7 @@ export class ArtifactRegistry {
     );
     const version = (latest?.version ?? 0) + 1;
     const hash = contentHash(data);
+    const lineageSeq = await allocateArtifactLineageSeq(this.store, projectId, session);
 
     const doc: ArtifactDocument = {
       _id: artifactId(projectId, name, version),
@@ -68,6 +83,7 @@ export class ArtifactRegistry {
       contentHash: hash,
       data,
       acceptedAt: null,
+      lineageSeq,
       createdAt: new Date(),
     };
 
@@ -100,7 +116,39 @@ export class ArtifactRegistry {
     );
   }
 
+  /** Everything the project has, grouped by name. Not a history. */
   async list(projectId: string): Promise<ArtifactDocument[]> {
     return this.store.artifacts.find({ projectId }).sort({ name: 1, version: 1 }).toArray();
+  }
+
+  /**
+   * Everything the project has, in the order it was recorded.
+   *
+   * A separate method from {@link list} rather than a change to it: `list`
+   * groups by name and callers rely on that. This answers a different question
+   * and says so in its name.
+   *
+   * Sequenced artifacts order by `lineageSeq`, which the store allocated
+   * atomically and is authoritative. Artifacts written before lineage numbers
+   * existed have none; they sort first, by `createdAt` and then `_id`.
+   *
+   * That fallback is for *stable presentation*, and it is worth being blunt
+   * about what it is not: when two legacy artifacts share a millisecond, their
+   * true write order was never recorded and cannot be recovered. The ordering
+   * is deterministic so the same history always renders the same way. It is not
+   * a reconstruction of what actually happened.
+   */
+  async listLineage(projectId: string): Promise<ArtifactDocument[]> {
+    const all = await this.store.artifacts.find({ projectId }).toArray();
+
+    const legacy = all.filter((a) => a.lineageSeq === undefined);
+    const sequenced = all.filter((a) => a.lineageSeq !== undefined);
+
+    legacy.sort(
+      (a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a._id.localeCompare(b._id),
+    );
+    sequenced.sort((a, b) => a.lineageSeq! - b.lineageSeq!);
+
+    return [...legacy, ...sequenced];
   }
 }
