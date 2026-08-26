@@ -56,3 +56,27 @@ export function aPhaseMayNotEditTelemetry(): void {
 export function aPhaseMayRead(): number {
   return progress.reviewCycle + progress.openDefects.length + progress.usage.calls;
 }
+
+/**
+ * The public result stays mutable, and stays that way by accident of nothing.
+ *
+ * `RunResult` aliased its telemetry from `RunProgress`, so tightening the
+ * internal phase boundary silently tightened the package's public contract:
+ * `result.usage.calls += 1` stopped compiling for reasons no commit had
+ * decided. These lines have no `@ts-expect-error`, so they fail the build if
+ * the result ever becomes readonly again without that being the point of the
+ * change.
+ */
+import type { RunResult } from '../src/phases/conclude.js';
+
+declare const result: RunResult;
+
+export function aCallerStillOwnsItsResult(): void {
+  result.usage.calls += 1;
+  result.usage.inputTokens = 0;
+  result.phaseMs['evaluate'] = 1;
+  result.openDefects.push(defect);
+
+  const bucket = result.usageByTier.sol;
+  if (bucket) bucket.calls += 1;
+}

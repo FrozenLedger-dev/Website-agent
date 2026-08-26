@@ -703,7 +703,13 @@ untouched.
 
 ### The readonly boundary
 
-Phase-facing `RunProgress` is readonly throughout, including its collections.
+Phase-facing `RunProgress` is readonly at its own level: every field, and every
+collection it holds directly. It is deliberately *not* deeply readonly — the
+`SitePlan`'s nested members and the inner `usageByTier` buckets are still
+mutable types, because making them otherwise would mean changing the contracts
+package for the sake of an orchestrator boundary. The runtime clone is what
+makes those safe; the types state the intent at the level where they can
+without spreading.
 `run-progress-readonly.ts` is a compile-time fixture: every line is an expected
 error under `@ts-expect-error`, so *removing* a readonly marker fails the build
 on the unused directive rather than passing quietly.
@@ -753,10 +759,31 @@ artifact anyone was checking — every later decision would simply have been mad
 as though nothing had been tried. Closed by asserting the history reaches the
 next adjudication's recorded constraints; the mutation now fails.
 
+### 4c.1 — a public contract tightened by accident
+
+`RunResult` is the package's public type and it declared its telemetry by
+aliasing the internal phase boundary:
+
+    usage: RunProgress['usage']
+
+So making the phase view readonly made the result readonly too, and a caller
+doing `result.usage.calls += 1` stopped compiling — an API change nobody
+decided on, arriving as a side effect of an internal one. Whether a result
+*should* be readonly is a fair question, and if the answer is yes it belongs in
+a commit that says so.
+
+The result now states its own telemetry types, and both exits copy rather than
+handing back a reference, so the caller owns what it is given. The compile-time
+fixture asserts the mutability with no `@ts-expect-error`, which means aliasing
+it back fails the build.
+
 ## Remaining Phase 4 work
 
+- **Artifact lineage ordered on millisecond `createdAt`.** Worth doing before
+  the intake extraction: ordering by wall-clock gets more dangerous once Phase 5
+  introduces real job execution and concurrency, whereas the intake work is
+  structural tidying that nothing else depends on.
 - Intake and project setup extraction (~45 lines).
-- Artifact lineage ordered on millisecond `createdAt`.
 - `REPAIR_COMPANIONS` → the later permission/tool-gateway phase.
 
 ## Phases 5–17

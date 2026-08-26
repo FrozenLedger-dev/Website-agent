@@ -11,7 +11,7 @@
  * So these stay separate on purpose. Collapsing them into one helper that
  * "handles both" is precisely the change that caused the bug.
  */
-import type { RunContext, RunProgress } from '../run-context.js';
+import type { RunContext, RunProgress, UsageByTier, UsageTotals } from '../run-context.js';
 import type { Defect } from '../defects.js';
 import type { DeploymentManifest, TerminalOutcome } from '@statxai/contracts';
 
@@ -26,8 +26,20 @@ export interface RunResult {
   commit: string | null;
   siteRoot: string;
   manifest?: DeploymentManifest;
-  usage: RunProgress['usage'];
-  usageByTier: RunProgress['usageByTier'];
+  /**
+   * Stated outright rather than aliased from `RunProgress`.
+   *
+   * `RunResult` is the package's public contract and `RunProgress` is an
+   * internal phase boundary. Aliasing meant tightening the second silently
+   * tightened the first: making the phase view readonly turned the result
+   * readonly too, so a caller doing `result.usage.calls += 1` stopped
+   * compiling — an API change nobody decided on, arriving as a side effect.
+   *
+   * Whether a result should be readonly is a separate question, and if the
+   * answer is yes it belongs in a commit that says so.
+   */
+  usage: UsageTotals;
+  usageByTier: UsageByTier;
   phaseMs: Record<string, number>;
 }
 
@@ -53,8 +65,8 @@ export function withoutDelivery(
     openDefects: [],
     commit: null,
     siteRoot: '',
-    usage: telemetry.usage,
-    usageByTier: telemetry.usageByTier,
+    usage: { ...telemetry.usage },
+    usageByTier: structuredClone(telemetry.usageByTier) as UsageByTier,
     phaseMs: { ...telemetry.phaseMs },
   };
 }
@@ -81,8 +93,8 @@ export async function concluded(
     openDefects: [...progress.openDefects],
     commit: await deps.workspace.currentCommit(),
     siteRoot: deps.workspace.siteRoot,
-    usage: progress.usage,
-    usageByTier: progress.usageByTier,
+    usage: { ...progress.usage },
+    usageByTier: structuredClone(progress.usageByTier) as UsageByTier,
     phaseMs: { ...progress.phaseMs },
   };
 }
