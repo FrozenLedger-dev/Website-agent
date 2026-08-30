@@ -172,16 +172,6 @@ describe('artifacts written before lineage numbers existed', () => {
     });
   };
 
-  it('do not break the unique index, however many share a missing number', async () => {
-    // A plain unique index would read every one of these as a duplicate `null`
-    // and refuse to build against an existing database.
-    await legacy('site-plan', 1, '2026-08-01T00:00:00.000Z');
-    await legacy('route-decision', 1, '2026-08-01T00:00:00.000Z');
-    await legacy('test-report', 1, '2026-08-01T00:00:00.000Z');
-
-    await expect(store.ensureIndexes()).resolves.toBeUndefined();
-  });
-
   it('sort first, and deterministically among themselves', async () => {
     await legacy('route-decision', 1, '2026-08-01T00:00:02.000Z');
     // Identical timestamps: the true order was never recorded, so `_id` breaks
@@ -270,5 +260,127 @@ describe('what lineage numbering does not touch', () => {
     await registry.put(PROJECT, 'route-decision', { b: 2 });
 
     expect(await seqs(PROJECT)).toEqual([1, 2]);
+  });
+});
+
+describe('deploying the lineage index onto a database that predates it', () => {
+  /**
+   * The migration, in the order it actually happens in production: a database
+   * full of artifacts that have no lineage number, and then the index arrives.
+   *
+   * This started out as a test that inserted legacy documents and called
+   * `ensureIndexes()` — but the shared suite already indexes in `beforeAll`, so
+   * the index existed before the legacy rows did. That proves an existing
+   * partial index tolerates missing values, which is not the question. The
+   * question is whether the index can be *built* over rows that are already
+   * there, and a plain unique index cannot: it reads every missing `lineageSeq`
+   * as the same duplicate `null` and refuses.
+   *
+   * So this uses its own database, and deliberately does not index it until the
+   * legacy rows are in place.
+   */
+  const MIGRATION_DB = 'statxai_test_lineage_migration';
+  const PROJECT_ID = 'proj_migration';
+  const URI = process.env.MONGODB_URI ?? 'mongodb://localhost:27018/statxai_test?replicaSet=rs0';
+
+  let migrated: StateStore;
+
+  const legacyRow = (name: string, version: number) => ({
+    _id: artifactId(PROJECT_ID, name, version),
+    projectId: PROJECT_ID,
+    name,
+    version,
+    contentHash: 'legacy',
+    data: { written: 'before lineage numbers existed' },
+    acceptedAt: null,
+    // Same instant for all three, which is the case that made timestamps
+    // unusable as an ordering authority in the first place.
+    createdAt: new Date('2026-08-01T00:00:00.000Z'),
+  });
+
+  beforeAll(async () => {
+    migrated = await StateStore.connect({ uri: URI, dbName: MIGRATION_DB });
+    // A previous run of this file must not be what makes it pass.
+    await migrated.db.dropDatabase();
+
+    // Legacy rows first. `ensureIndexes` has deliberately not been called.
+    await migrated.artifacts.insertMany([
+      legacyRow('site-plan', 1),
+      legacyRow('route-decision', 1),
+      legacyRow('test-report', 1),
+    ]);
+  });
+
+  afterAll(async () => {
+    await migrated?.db.dropDatabase();
+    await migrated?.close();
+  });
+
+  const lineageIndex = async () => {
+    const indexes = await migrated.artifacts.indexes();
+    return indexes.find(
+      (i) => (i.key as Record<string, number>)['projectId'] === 1 && 'lineageSeq' in i.key,
+    );
+  };
+
+  it('has no lineage index to begin with, which is the whole point', async () => {
+    // If this ever passes trivially the test below proves nothing, so the
+    // premise is asserted rather than assumed.
+    expect(await lineageIndex()).toBeUndefined();
+    expect(await migrated.artifacts.countDocuments({ projectId: PROJECT_ID })).toBe(3);
+  });
+
+  it('builds the index over the rows that were already there', async () => {
+    await expect(migrated.ensureIndexes()).resolves.toBeUndefined();
+
+    const index = await lineageIndex();
+    expect(index).toBeDefined();
+    expect(index?.key).toEqual({ projectId: 1, lineageSeq: 1 });
+    expect(index?.unique).toBe(true);
+    // The filter is what lets three missing values coexist. Asserted by its
+    // shape rather than its generated name, which is incidental.
+    expect(index?.partialFilterExpression).toEqual({ lineageSeq: { $exists: true } });
+  });
+
+  it('leaves the legacy rows exactly as they were', async () => {
+    // Creating an index is not a migration of the data. Nothing is backfilled,
+    // because a backfilled number would be an invention presented as history.
+    const rows = await migrated.artifacts.find({ projectId: PROJECT_ID }).toArray();
+
+    expect(rows).toHaveLength(3);
+    expect(rows.every((r) => r.lineageSeq === undefined)).toBe(true);
+    expect(rows.every((r) => r.contentHash === 'legacy')).toBe(true);
+    expect(rows.every((r) => r.createdAt.toISOString() === '2026-08-01T00:00:00.000Z')).toBe(true);
+  });
+
+  it('numbers everything written from here on', async () => {
+    const registryAfter = new ArtifactRegistry(migrated);
+    const ref = await registryAfter.put(PROJECT_ID, 'approval-recommendation', { a: 1 });
+
+    const doc = await migrated.artifacts.findOne({
+      _id: artifactId(PROJECT_ID, ref.name, ref.version),
+    });
+    expect(doc?.lineageSeq).toBe(1);
+
+    // And the compatibility ordering still holds: the three unnumbered rows
+    // first, then the one that has a number.
+    const lineage = await registryAfter.listLineage(PROJECT_ID);
+    expect(lineage.map((a) => a.lineageSeq)).toEqual([undefined, undefined, undefined, 1]);
+    expect(lineage.at(-1)?.name).toBe('approval-recommendation');
+  });
+
+  it('still refuses two artifacts claiming the same position', async () => {
+    // The migration must not have bought compatibility by weakening the
+    // constraint: many missing values are fine, two equal ones are not.
+    const taken = await migrated.artifacts.findOne({ projectId: PROJECT_ID, lineageSeq: 1 });
+    expect(taken).not.toBeNull();
+
+    await expect(
+      migrated.artifacts.insertOne({
+        ...taken!,
+        _id: artifactId(PROJECT_ID, 'forced-duplicate', 1),
+        name: 'forced-duplicate',
+      }),
+    ).rejects.toThrow(/duplicate key/i);
   });
 });

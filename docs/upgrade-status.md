@@ -94,9 +94,9 @@ CI runs two jobs, so the signals stay separable:
 | Job | Runs | Needs |
 |---|---|---|
 | Typecheck, lint and unit tests | `pnpm test:unit` — 447 | nothing |
-| Mongo integration tests | `pnpm test:integration` — 76 | the compose replica set |
+| Mongo integration tests | `pnpm test:integration` — 80 | the compose replica set |
 
-Together they cover the whole inventory exactly once: 447 + 76 = 523, which is
+Together they cover the whole inventory exactly once: 447 + 80 = 527, which is
 what `pnpm test` runs. The integration job starts the same `docker-compose`
 service developers use, waits for the healthcheck that initiates the replica
 set, and proves the deployment accepts transactions before running anything —
@@ -482,11 +482,13 @@ test says so rather than leaving the number unexplained.
 - **Repair execution** — done in Phase 4b, below.
 - **Intake and project setup** (~45 lines) is still inline. Cohesive enough to
   extract, small enough not to be urgent.
-- `runProject` still declares the run's mutable state as locals with a
-  `snapshot()` view rather than owning a `RunProgress` object outright. That
-  conversion touches ~180 references and is worth doing on its own.
-- ~~**`snapshot()` is shallow.**~~ Closed in 4c: the view is a deep clone and
-  the phase-facing type is readonly throughout.
+- ~~`runProject` declares the run's mutable state as locals with a `snapshot()`
+  view rather than owning a `RunProgress` object.~~ Closed in 4c: one
+  `MutableRunProgress` owner, `snapshotProgress()`, and a detached phase view.
+- ~~**`snapshot()` is shallow.**~~ Closed in 4c: the view is a deep clone, and
+  the phase-facing type is readonly for the fields and collections it holds
+  directly — not recursively deep-readonly, which 4c.1 corrected. The
+  `structuredClone` is what provides the runtime isolation.
 - ~~**Artifact lineage is ordered by `createdAt` alone.**~~ Closed in 4d: every
   artifact carries a per-project lineage number allocated atomically by the
   store.
@@ -872,6 +874,29 @@ parent edges are a DAG, which is a different capability from a total order.
 | reset the counter mid-project | 5 tests fail |
 | leak the sequence into `ArtifactRef` | public-shape test fails |
 | allocate again on `accept()` | acceptance test fails |
+
+### 4d.1 — a migration test that proved the wrong thing
+
+The legacy-index test inserted its rows and *then* called `ensureIndexes()` —
+but the suite already indexes in `beforeAll`, so the index existed before the
+rows did. It proved an existing partial index tolerates missing values, which
+was never in doubt. The question is whether the index can be **built** over rows
+already in the database, which is the deployment case, and a plain unique index
+cannot: it reads every missing `lineageSeq` as the same duplicate `null`.
+
+Corrected with its own database, dropped first and deliberately left unindexed
+until three legacy rows are in place:
+
+    legacy rows exist  →  no lineage index yet  →  ensureIndexes()
+      →  builds  →  rows untouched  →  new artifacts numbered
+      →  duplicate positions still refused
+
+The first assertion is that the index is *absent*, so the test cannot pass
+trivially again. Verified by mutation twice: removing the partial filter fails
+the build with `Index build failed`, and indexing before the inserts — the
+original flaw — fails the absence assertion by name.
+
+No runtime file changed. The Phase 4d design stands as approved.
 
 ## Remaining Phase 4 work
 
