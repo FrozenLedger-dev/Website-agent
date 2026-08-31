@@ -94,9 +94,9 @@ CI runs two jobs, so the signals stay separable:
 | Job | Runs | Needs |
 |---|---|---|
 | Typecheck, lint and unit tests | `pnpm test:unit` — 458 | nothing |
-| Mongo integration tests | `pnpm test:integration` — 80 | the compose replica set |
+| Mongo integration tests | `pnpm test:integration` — 96 | the compose replica set |
 
-Together they cover the whole inventory exactly once: 458 + 80 = 538, which is
+Together they cover the whole inventory exactly once: 458 + 96 = 554, which is
 what `pnpm test` runs. The integration job starts the same `docker-compose`
 service developers use, waits for the healthcheck that initiates the replica
 set, and proves the deployment accepts transactions before running anything —
@@ -996,17 +996,106 @@ exactly as before. No job-engine runtime was introduced.
 | catch a platform failure as `intake_insufficient` | 1 |
 | materialise the raw intake | 1 |
 
-## Phase 4 — implementation complete, awaiting closure review
+## Phase 4 — **COMPLETE**
 
-Every planned Phase 4 extraction has landed: 4a phases, 4b repair, 4b.1 the
-exhaustion guard, 4c progress ownership, 4c.1 the public result contract, 4d
-artifact lineage, 4d.1 its migration proof, and 4e discover. No Phase 4
-implementation work remains outstanding.
+Every planned extraction landed: 4a phases, 4b repair, 4b.1 the exhaustion
+guard, 4c progress ownership, 4c.1 the public result contract, 4d artifact
+lineage, 4d.1 its migration proof, and 4e discover.
 
-Phase 5 is **not** started. Nothing runs through `packages/job-engine`.
+**Closed at `141b2f1`** — 458 unit, 80 integration, 538 full, both GitHub checks
+green. Phase 5 begins after that boundary.
 
 `REPAIR_COMPANIONS` remains an implicit permission and belongs to the later
 permission/tool-gateway phase — it was never Phase 4 work.
+
+## Phase 5 — the job engine becomes the worker runtime
+
+The engine has had enqueue, dependency-aware claiming, output-conflict
+serialisation, leases, heartbeats, retry, reclamation and a transition audit
+since the beginning — and no consumers. Phase 5 gives it work to do, starting
+with the safety it needs before real model work runs through it.
+
+### Phase 5a — a lease is execution authority — **DONE**
+
+**Before.** The lease represented scheduling ownership, and only some methods
+treated it as authoritative. `submitForValidation` and the running branch of
+`fail` both filtered on state alone:
+
+    { _id: jobId, state: { $in: ['running'] } }
+
+so a worker whose lease had lapsed — and whose job had been reclaimed and handed
+to someone else — could still submit its work, or fail the job the new holder
+was in the middle of. `heartbeat` checked the holder but not the expiry, so a
+worker could revive its own dead lease in exactly the window where another
+worker was about to be given the job.
+
+**After.** A running job may be advanced only by the worker that currently owns
+it:
+
+    { _id: jobId,
+      state: 'running',
+      'lease.holder': workerId,
+      'lease.expiresAt': { $gt: now } }
+
+The ownership test is in the update filter, not in a check before it. Reading
+the lease and then writing on state alone leaves a window — short, and exactly
+long enough for the reaper and a new claim to land between them. The guard and
+its audit event stay in one transaction.
+
+`JobLeaseConflict` is a distinct error, because "the job moved on" and "you lost
+it" are different facts: the first may be retryable, the second means someone
+else is doing the work and this worker must stop. Precedence is pinned — no
+document is `JobNotFound`, wrong state is `JobStateConflict`, running-but-not-
+yours is `JobLeaseConflict`.
+
+**One definition of expiry.** Active is `expiresAt > now`, so a lease expiring
+exactly now is already gone. `reclaimExpiredLeases` moved from `$lt` to `$lte`
+to agree: the old pairing left a single instant where a lease was too dead to
+use and too alive to reclaim. A test pins both sides of that boundary.
+
+**Validation failure keeps its own authority.** A running job failing is the
+worker reporting its own broken work and needs the lease. A validating job
+failing is the harness rejecting finished work — submission already cleared the
+lease, and requiring one would make validation impossible.
+
+Sixteen tests against the real replica set, all deterministic — every method
+takes `now`, so nothing waits on a clock. The strongest is not that a stale
+worker throws but that it changes nothing: after a late failure is refused, the
+live job's state, attempt, lease holder, lease expiry and failure field are all
+compared and none has moved.
+
+| Mutation | Tests failed |
+|---|---|
+| drop the holder guard | 6 |
+| drop the expiry guard | 3 |
+| let an expired lease heartbeat | 2 |
+| fail a running job on state alone | 3 |
+| reclaim with `$lt` | 1 |
+| audit a rejected transition | 1 |
+
+The audit mutation needed two attempts: written inside the transaction it was
+rolled back by the abort, which is the design working. Written outside, the
+audit non-effect test catches it.
+
+Also corrected a misleading fixture: the engine tests called `accept(job, 'sol')`,
+implying a model accepts work. Acceptance is the harness's, and they now say
+`harness:validator`. No actor typing changed.
+
+**`runProject` still does not execute through `JobEngine`.** Nothing imports it,
+nothing is enqueued, no worker loop exists. Delivery behaviour is unchanged.
+
+### Deliberately next, not now
+
+- **5b** — role-aware claiming. `claim()` takes a worker id and does not filter
+  by the `WorkerRole` → `AgentTier` mapping, so any worker can take any job.
+  That must be closed before real Terra and Luna workers exist.
+- **5c** — an in-process execution loop.
+- **Later** — mapping Terra build work and Luna repair work onto persisted jobs,
+  the validation and acceptance lifecycle, what a replan does to jobs from the
+  old plan (`superseded` does not exist yet), and eventually a real process
+  boundary.
+
+None of these are implemented.
 
 ## Phases 5–17
 

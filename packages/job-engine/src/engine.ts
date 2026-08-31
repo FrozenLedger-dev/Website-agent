@@ -19,6 +19,49 @@ export class JobNotFound extends Error {
   }
 }
 
+/**
+ * Raised when a running job is mutated by someone who does not currently own it.
+ *
+ * Distinct from {@link JobStateConflict} on purpose. "The job moved on" and
+ * "you lost it" are different facts, and a worker that has been superseded
+ * needs to know which one happened: the first may be retryable, the second
+ * means another worker is already doing the work and this one must stop.
+ */
+export class JobLeaseConflict extends Error {
+  constructor(
+    readonly jobId: string,
+    readonly workerId: string,
+    /** Who holds it now, if anyone. Null when the lease was cleared. */
+    readonly heldBy: string | null,
+  ) {
+    super(
+      `Job ${jobId} is not leased to ${workerId}` +
+        (heldBy === null ? ' (no current lease)' : ` (held by ${heldBy})`),
+    );
+    this.name = 'JobLeaseConflict';
+  }
+}
+
+/**
+ * Whether a worker may advance a running job right now.
+ *
+ * All three conditions are required, and none of them is a worker's own
+ * assertion: a worker id is a claim, a past lease is history, and a lease that
+ * expired a millisecond ago is not authority. The document decides.
+ *
+ * Expiry is exclusive — `expiresAt > now` — so a lease expiring exactly now is
+ * already gone. `reclaimExpiredLeases` uses `<= now` for the same reason: any
+ * other pairing leaves an instant where a lease is too dead to use and too
+ * alive to reclaim.
+ */
+export function hasActiveLease(job: JobDocument, workerId: string, now: Date): boolean {
+  return (
+    job.state === 'running' &&
+    job.lease?.holder === workerId &&
+    job.lease.expiresAt.getTime() > now.getTime()
+  );
+}
+
 /** Raised when a job is not in the state the caller expected. */
 export class JobStateConflict extends Error {
   constructor(
@@ -145,9 +188,20 @@ export class JobEngine {
     return accepted === job.dependsOn.length;
   }
 
-  /** Work finished; hand off to validation. */
-  async submitForValidation(jobId: string, actor: string): Promise<JobDocument> {
-    return this.transition(jobId, ['running'], 'validating', actor, { lease: null });
+  /**
+   * Work finished; hand off to validation.
+   *
+   * Only the current lease holder may do this. A worker whose lease lapsed
+   * while it was busy has had its job handed to someone else, and submitting
+   * anyway would credit it with execution it did not perform — and overwrite a
+   * live worker's job while it is still running.
+   */
+  async submitForValidation(
+    jobId: string,
+    workerId: string,
+    options: { now?: Date } = {},
+  ): Promise<JobDocument> {
+    return this.transitionOwnedRunning(jobId, workerId, 'validating', { lease: null }, options.now);
   }
 
   /** Validation passed. Terminal. */
@@ -167,12 +221,37 @@ export class JobEngine {
    * straight back to `ready`, so the failure is durably recorded and visible in
    * the audit trail even when the retry immediately succeeds.
    */
-  async fail(jobId: string, message: string, actor: string, options: { policyViolation?: boolean } = {}): Promise<JobDocument> {
-    const now = new Date();
-    const failed = await this.transition(jobId, ['running', 'validating'], 'failed', actor, {
+  async fail(
+    jobId: string,
+    message: string,
+    actor: string,
+    options: { policyViolation?: boolean; now?: Date } = {},
+  ): Promise<JobDocument> {
+    const now = options.now ?? new Date();
+    const extra = {
       lease: null,
       failure: { message, at: now, policyViolation: options.policyViolation ?? false },
-    });
+    };
+
+    /**
+     * The two failures this method serves have different authority.
+     *
+     * A running job failing is the executing worker reporting that its own work
+     * broke, so it must still hold the job. A validating job failing is the
+     * harness rejecting finished work — the execution lease was cleared on
+     * submission, and requiring one would make validation impossible.
+     *
+     * Reading the state first is not the guard; the guarded write is. If the
+     * job moves between the two, the update filter fails and the error is
+     * classified from what is actually there.
+     */
+    const current = await this.store.jobs.findOne({ _id: jobId });
+    if (!current) throw new JobNotFound(jobId);
+
+    const failed =
+      current.state === 'running'
+        ? await this.transitionOwnedRunning(jobId, actor, 'failed', extra, now)
+        : await this.transition(jobId, ['validating'], 'failed', actor, extra);
 
     if (failed.attempt >= failed.maxAttempts) return failed;
     return this.transition(jobId, ['failed'], 'ready', actor, {});
@@ -199,14 +278,14 @@ export class JobEngine {
    */
   async reclaimExpiredLeases(now: Date = new Date()): Promise<number> {
     const expired = await this.store.jobs
-      .find({ state: 'running', 'lease.expiresAt': { $lt: now } })
+      .find({ state: 'running', 'lease.expiresAt': { $lte: now } })
       .toArray();
 
     let reclaimed = 0;
     for (const job of expired) {
       const result = await this.store.withTransaction(async (session) => {
         const updated = await this.store.jobs.findOneAndUpdate(
-          { _id: job._id, state: 'running', 'lease.expiresAt': { $lt: now } },
+          { _id: job._id, state: 'running', 'lease.expiresAt': { $lte: now } },
           { $set: { state: 'ready', lease: null, updatedAt: now } },
           { session, returnDocument: 'after' },
         );
@@ -226,14 +305,82 @@ export class JobEngine {
     return reclaimed;
   }
 
-  /** Extend a lease held by `workerId`. Fails if the lease was reclaimed. */
-  async heartbeat(jobId: string, workerId: string, leaseMs = DEFAULT_LEASE_MS): Promise<boolean> {
-    const now = new Date();
+  /**
+   * Extend a lease that is still alive.
+   *
+   * A lease can only be extended from a lease. Without the expiry condition a
+   * worker that stalled past its deadline could revive its own claim in the
+   * window before the reaper reaches it, which is the one moment another worker
+   * is about to be given the job.
+   */
+  async heartbeat(
+    jobId: string,
+    workerId: string,
+    leaseMs = DEFAULT_LEASE_MS,
+    options: { now?: Date } = {},
+  ): Promise<boolean> {
+    const now = options.now ?? new Date();
     const result = await this.store.jobs.updateOne(
-      { _id: jobId, state: 'running', 'lease.holder': workerId },
+      {
+        _id: jobId,
+        state: 'running',
+        'lease.holder': workerId,
+        'lease.expiresAt': { $gt: now },
+      },
       { $set: { 'lease.expiresAt': new Date(now.getTime() + leaseMs), updatedAt: now } },
     );
     return result.matchedCount === 1;
+  }
+
+  /**
+   * Advance a running job on behalf of the worker that owns it.
+   *
+   * The ownership test is in the update filter, not in a check before it.
+   * Reading the lease and then writing on state alone would leave a window —
+   * short, and exactly long enough for the reaper and a new claim to land
+   * between them.
+   */
+  private async transitionOwnedRunning(
+    jobId: string,
+    workerId: string,
+    to: JobState,
+    extra: Record<string, unknown>,
+    at?: Date,
+  ): Promise<JobDocument> {
+    assertTransition('running', to);
+
+    return this.store.withTransaction(async (session) => {
+      const now = at ?? new Date();
+      const updated = await this.store.jobs.findOneAndUpdate(
+        {
+          _id: jobId,
+          state: 'running',
+          'lease.holder': workerId,
+          'lease.expiresAt': { $gt: now },
+        },
+        { $set: { state: to, updatedAt: now, ...extra } },
+        { session, returnDocument: 'after' },
+      );
+
+      if (!updated) {
+        // Classified from what is actually there, so a caller learns whether it
+        // lost the job or the job moved on without it.
+        const exists = await this.store.jobs.findOne({ _id: jobId }, { session });
+        if (!exists) throw new JobNotFound(jobId);
+        if (exists.state !== 'running') throw new JobStateConflict(jobId, ['running']);
+        throw new JobLeaseConflict(jobId, workerId, exists.lease?.holder ?? null);
+      }
+
+      await this.audit(session, {
+        projectId: updated.projectId,
+        jobId,
+        kind: 'job_transition',
+        actor: workerId,
+        detail: { to, attempt: updated.attempt },
+        at: now,
+      });
+      return updated;
+    });
   }
 
   private async transition(
