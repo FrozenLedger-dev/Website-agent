@@ -227,12 +227,19 @@ describe('what a refused release reports to its caller', () => {
   });
 
   it('keeps the intake helper for the exits that genuinely have nothing to report', async () => {
-    const code = (await source()).replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
-    const calls = code.match(/return withoutDelivery\(/g) ?? [];
+    const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+    const code = strip(await source());
 
-    // Both remaining uses are intake failures, before a workspace exists.
-    expect(calls).toHaveLength(2);
-    expect(code.match(/withoutDelivery\(projectId, 'intake_insufficient'/g) ?? []).toHaveLength(2);
+    // One use, and it is the discovery guard. The two refusals it covers — a
+    // brief that fails the schema and one that passes it while saying too
+    // little — are now branches inside the discover phase rather than two
+    // exits here, so the assertion moved with them rather than being dropped.
+    expect(code.match(/return withoutDelivery\(/g) ?? []).toHaveLength(1);
+    expect(code).toContain('if (!discovery.ok)');
+    expect(code).toContain('withoutDelivery(projectId, discovery.outcome');
+
+    const discover = strip(await read('phases/discover.ts'));
+    expect(discover.match(/ok: false, outcome: 'intake_insufficient'/g) ?? []).toHaveLength(2);
   });
 
   it('reports the delivery that actually happened', async () => {

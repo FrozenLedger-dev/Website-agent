@@ -93,10 +93,10 @@ CI runs two jobs, so the signals stay separable:
 
 | Job | Runs | Needs |
 |---|---|---|
-| Typecheck, lint and unit tests | `pnpm test:unit` — 447 | nothing |
+| Typecheck, lint and unit tests | `pnpm test:unit` — 458 | nothing |
 | Mongo integration tests | `pnpm test:integration` — 80 | the compose replica set |
 
-Together they cover the whole inventory exactly once: 447 + 80 = 527, which is
+Together they cover the whole inventory exactly once: 458 + 80 = 538, which is
 what `pnpm test` runs. The integration job starts the same `docker-compose`
 service developers use, waits for the healthcheck that initiates the replica
 set, and proves the deployment accepts transactions before running anything —
@@ -898,10 +898,115 @@ original flaw — fails the absence assertion by name.
 
 No runtime file changed. The Phase 4d design stands as approved.
 
-## Remaining Phase 4 work
+## Phase 4e — discover and project setup — **DONE**
 
-- Intake and project setup extraction (~45 lines).
-- `REPAIR_COMPANIONS` → the later permission/tool-gateway phase.
+The last block of mechanics mixed into the delivery loop.
+
+### Before
+
+`runProject` opened with intake validation, then the workspace, then the
+project reset, budget creation and the canonical profile artifact — seventeen
+steps of startup before any orchestration began.
+
+### After
+
+    discoverProject({ projectId, intake, store, registry,
+                      workspacesRoot, autonomyMode, say })
+      → { ok: false, outcome: 'intake_insufficient' }
+      | { ok: true, profile, workspace, budgetLimits }
+
+`runProject` is **400 lines**, from 416, and opens with discover, plan, build,
+the loop, then release. The number barely moved because the block moved rather
+than shrank — what changed is that bootstrap mechanics are no longer interleaved
+with orchestration.
+
+### Why it is a pre-context phase
+
+`RunContext` is made of a workspace, a canonical profile and budget ceilings —
+and this is what produces them. Weakening `RunContext` with optional fields so
+discover could share the later phases' signature would have handed every phase a
+context that might be half-built. So it takes what it needs, returns what it
+made, and `runProject` assembles `RunDeps` and `RunFacts` from that.
+
+It also does not construct a `RunResult`. The phase reports; the caller decides
+what an unusable brief means, which keeps the deliberate split between the
+pre-delivery exit and the post-delivery one.
+
+### Nothing happens until the brief is accepted
+
+Two refusals, both deterministic, both leaving the project untouched:
+
+| Refusal | Detail |
+|---|---|
+| fails the schema | `Intake rejected: <first issue>` |
+| passes it, says too little | `Intake insufficient: <gaps joined by "; ">` |
+
+No workspace opened, no project or budget deleted, no artifact written. That is
+the property worth guarding hardest: startup deletes the project record, its
+budget and its per-defect counters, so validating *after* that would let a
+malformed retry destroy the previous run's work — silently, because the caller
+sees `intake_insufficient` either way.
+
+Two tests assert the side-effect log is empty on each branch, and the mutations
+that move validation later fail them.
+
+### What setup still does, in this order
+
+    workspace.open
+    projects.deleteOne · budgets.deleteOne · defectBudgets.deleteMany
+    projects.insertOne (state: planning)
+    createBudget
+    registry.put business-profile → accept → materialise
+      client/business-profile.json
+    read the budget ceilings
+
+Unchanged throughout. **Artifacts and `artifact_sequences` are deliberately not
+reset** — history outlives the project record, so a second run for the same
+project continues the lineage rather than restarting it. A test fails if either
+is cleared.
+
+The artifact and the file carry the **parsed** profile, never the raw intake:
+everything downstream measures against it, so passing on unvalidated input would
+let extra fields through as canonical fact.
+
+### Refusal is not the same as failure
+
+Only intake insufficiency returns a result. A workspace that will not open, a
+registry that will not write, a budget missing straight after creation — all
+throw. Reporting the second kind as the first would tell a customer their form
+was incomplete when the deployment was broken.
+
+The missing-budget case is the one place the wording changed: the previous `!`
+would have thrown a `TypeError`; it now throws with a message naming the
+project. Both reject, and neither invents ceilings nobody set.
+
+No model participates. No new artifact, no new project state, no transaction
+added around startup — if a later step throws, earlier side effects still exist,
+exactly as before. No job-engine runtime was introduced.
+
+### Mutation checks
+
+| Mutation | Tests failed |
+|---|---|
+| open the workspace before validating | 3 |
+| reset the project between the two checks | 2 |
+| clear artifacts and the lineage counter | 2 |
+| drop the acceptance | 1 |
+| change the materialisation path | 2 |
+| catch a platform failure as `intake_insufficient` | 1 |
+| materialise the raw intake | 1 |
+
+## Phase 4 — implementation complete, awaiting closure review
+
+Every planned Phase 4 extraction has landed: 4a phases, 4b repair, 4b.1 the
+exhaustion guard, 4c progress ownership, 4c.1 the public result contract, 4d
+artifact lineage, 4d.1 its migration proof, and 4e discover. No Phase 4
+implementation work remains outstanding.
+
+Phase 5 is **not** started. Nothing runs through `packages/job-engine`.
+
+`REPAIR_COMPANIONS` remains an implicit permission and belongs to the later
+permission/tool-gateway phase — it was never Phase 4 work.
 
 ## Phases 5–17
 

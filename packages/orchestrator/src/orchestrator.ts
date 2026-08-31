@@ -13,17 +13,14 @@
  * takes effect once the harness has authorised it.
  */
 import {
-  BusinessProfile,
-  intakeGaps,
   type AgentTier,
 } from '@statxai/contracts';
 import {
   ModelClient,
 } from '@statxai/agents';
-import { BudgetExhausted, createBudget, spend, type StateStore } from '@statxai/state';
+import { BudgetExhausted, spend, type StateStore } from '@statxai/state';
 import {
   ArtifactRegistry,
-  ProjectWorkspace,
 } from '@statxai/workspace';
 import {
   decideTerminal,
@@ -33,6 +30,7 @@ import {
 } from '@statxai/policy-engine';
 import { concluded, withoutDelivery, type RunResult } from './phases/conclude.js';
 import { buildFromPlan } from './phases/build.js';
+import { discoverProject } from './phases/discover.js';
 import { adjudicateDefects } from './phases/adjudicate.js';
 import { evaluateSite } from './phases/evaluate.js';
 import { producePlan, revisePlan } from './phases/planning.js';
@@ -131,42 +129,31 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   };
 
   // -- Phase 1: Discover ----------------------------------------------------
-  say({ phase: 'discover', detail: 'Validating intake against the canonical schema' });
-
-  const parsed = BusinessProfile.safeParse(options.intake);
-  if (!parsed.success) {
-    say({ phase: 'discover', detail: `Intake rejected: ${parsed.error.issues[0]?.message}`, level: 'fail' });
-    return withoutDelivery(projectId, 'intake_insufficient', { usage: progress.usage, usageByTier: progress.usageByTier, phaseMs: progress.phaseMs });
-  }
-  const profile = parsed.data;
-
-  // Thin intake would force the builder to invent facts, which the content gate
-  // then rejects forever. Catch it before spending a single token.
-  const gaps = intakeGaps(profile);
-  if (gaps.length > 0) {
-    say({ phase: 'discover', detail: `Intake insufficient: ${gaps.join('; ')}`, level: 'fail' });
-    return withoutDelivery(projectId, 'intake_insufficient', { usage: progress.usage, usageByTier: progress.usageByTier, phaseMs: progress.phaseMs });
-  }
-  say({ phase: 'discover', detail: `${profile.businessName} — ${profile.services.length} services`, level: 'ok' });
-
-  const workspace = await ProjectWorkspace.open(projectId, workspacesRoot);
-
-  await store.projects.deleteOne({ _id: projectId });
-  await store.budgets.deleteOne({ _id: projectId });
-  await store.defectBudgets.deleteMany({ projectId });
-  await store.projects.insertOne({
-    _id: projectId,
-    state: 'planning',
+  //
+  // Deterministic, and everything it produces is returned rather than assigned:
+  // the phase cannot report a run, so the decision about what an unusable brief
+  // means to the caller stays here.
+  const discovery = await discoverProject({
+    projectId,
+    intake: options.intake,
+    store,
+    registry,
+    workspacesRoot,
     autonomyMode,
-    reviewCycle: 0,
-    createdAt: new Date(),
-    updatedAt: new Date(),
+    say,
   });
-  await createBudget(store, projectId);
 
-  const profileRef = await registry.put(projectId, 'business-profile', profile);
-  await registry.accept(projectId, profileRef);
-  await workspace.materialiseArtifact('client/business-profile.json', profile);
+  if (!discovery.ok) {
+    // Nothing was built, so there is nothing to report but the telemetry spent
+    // deciding that — which is why this exit is separate from `concluded`.
+    return withoutDelivery(projectId, discovery.outcome, {
+      usage: progress.usage,
+      usageByTier: progress.usageByTier,
+      phaseMs: progress.phaseMs,
+    });
+  }
+
+  const { profile, workspace, budgetLimits } = discovery;
 
   /**
    * What a phase is handed.
@@ -183,12 +170,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
    * decision and never permission to skip the spend.
    */
   const deps: RunDeps = { store, registry, workspace, model, say, track };
-  const facts: RunFacts = {
-    projectId,
-    profile,
-    autonomyMode,
-    budgetLimits: (await store.budgets.findOne({ _id: projectId }))!.limits,
-  };
+  const facts: RunFacts = { projectId, profile, autonomyMode, budgetLimits };
 
   // -- Phase 2: Plan --------------------------------------------------------
   const initialPlan = await producePlan({ deps, facts }, 0);
