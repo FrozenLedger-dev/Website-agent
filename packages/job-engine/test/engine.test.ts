@@ -106,10 +106,11 @@ describe('role-aware claiming', () => {
     expect(lunaClaim?._id).toBe('job_repair');
   });
 
-  it('skips an ineligible job for the same worker rather than blocking on it', async () => {
-    // The repair job is older (claimable first by createdAt) but wrong tier for
-    // this worker; the scan must fall through to the job it can actually take,
-    // not stop at the first `ready` document.
+  it('is not blocked by an older ineligible job sorting ahead of it', async () => {
+    // The repair job is older, so it would sort first by createdAt — but it
+    // never enters the candidate set at all, because the role filter is in
+    // the query itself. Being first in the queue must not matter when it is
+    // the wrong tier's queue.
     await engine.enqueue({
       spec: spec('job_repair', ['src/a.tsx'], 'repair'),
       origin: { kind: 'repair', defectFingerprint: 'fp1', reviewCycle: 0, parentJobId: 'job_other' },
