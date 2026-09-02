@@ -59,6 +59,14 @@ export const ROLE_TIER: Readonly<Record<WorkerRole, AgentTier>> = Object.freeze(
   repair: 'luna',
 });
 
+/**
+ * The roles a worker of this tier may claim. The inverse of {@link ROLE_TIER},
+ * computed rather than declared a second time, so the two can never disagree.
+ */
+export function rolesForTier(tier: AgentTier): WorkerRole[] {
+  return (Object.keys(ROLE_TIER) as WorkerRole[]).filter((role) => ROLE_TIER[role] === tier);
+}
+
 // ---------------------------------------------------------------------------
 // Tools (v1.2 §5 / §9)
 // ---------------------------------------------------------------------------

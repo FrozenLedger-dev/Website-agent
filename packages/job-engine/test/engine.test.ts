@@ -1,17 +1,20 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import type { JobSpec } from '@statxai/contracts';
+import type { AgentTier, JobSpec, WorkerRole } from '@statxai/contracts';
 import { StateStore } from '@statxai/state';
 import { JobEngine, JobLeaseConflict, JobNotFound, JobStateConflict } from '../src/index.js';
 
 const PROJECT = 'proj_engine_test';
 
+/** Every fixture job in this file is Terra's role, unless a test says otherwise. */
+const TERRA: AgentTier = 'terra';
+
 let store: StateStore;
 let engine: JobEngine;
 
-const spec = (jobId: string, output: string[]): JobSpec => ({
+const spec = (jobId: string, output: string[], role: WorkerRole = 'frontend_backend'): JobSpec => ({
   projectId: PROJECT,
   jobId,
-  role: 'frontend_backend',
+  role,
   objective: `build ${jobId}`,
   inputs: { pageSpec: { name: 'pages/home', version: 1 } },
   acceptanceCriteria: ['renders'],
@@ -41,7 +44,7 @@ describe('claiming', () => {
   it('claims a ready job and leases it', async () => {
     await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
 
-    const claimed = await engine.claim('worker-1');
+    const claimed = await engine.claim('worker-1', TERRA);
     expect(claimed?._id).toBe('job_a');
     expect(claimed?.state).toBe('running');
     expect(claimed?.lease?.holder).toBe('worker-1');
@@ -49,15 +52,72 @@ describe('claiming', () => {
   });
 
   it('returns null when nothing is runnable', async () => {
-    expect(await engine.claim('worker-1')).toBeNull();
+    expect(await engine.claim('worker-1', TERRA)).toBeNull();
   });
 
   it('never hands the same job to two workers', async () => {
     await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
 
-    const [first, second] = await Promise.all([engine.claim('worker-1'), engine.claim('worker-2')]);
+    const [first, second] = await Promise.all([engine.claim('worker-1', TERRA), engine.claim('worker-2', TERRA)]);
     const claimed = [first, second].filter(Boolean);
     expect(claimed).toHaveLength(1);
+  });
+});
+
+/**
+ * A worker id is a claim; `tier` is what the caller actually is. `claim` must
+ * narrow the candidate pool by it rather than hand out a job and let something
+ * downstream object, because nothing downstream does — a lease is granted, an
+ * attempt is spent, and the job is `running` before any role check could fire.
+ */
+describe('role-aware claiming', () => {
+  it('will not hand a Terra job to a Luna worker', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+
+    expect(await engine.claim('luna-1', 'luna')).toBeNull();
+
+    const job = await store.jobs.findOne({ _id: 'job_a' });
+    expect(job?.state).toBe('ready');
+  });
+
+  it('will not hand a Luna repair job to a Terra worker', async () => {
+    await engine.enqueue({
+      spec: spec('job_repair', ['src/a.tsx'], 'repair'),
+      origin: { kind: 'repair', defectFingerprint: 'fp1', reviewCycle: 0, parentJobId: 'job_a' },
+    });
+
+    expect(await engine.claim('worker-1', TERRA)).toBeNull();
+
+    const job = await store.jobs.findOne({ _id: 'job_repair' });
+    expect(job?.state).toBe('ready');
+  });
+
+  it('lets each tier claim only the roles that belong to it', async () => {
+    await engine.enqueue({ spec: spec('job_build', ['src/a.tsx']), origin: { kind: 'plan' } });
+    await engine.enqueue({
+      spec: spec('job_repair', ['src/b.tsx'], 'repair'),
+      origin: { kind: 'repair', defectFingerprint: 'fp1', reviewCycle: 0, parentJobId: 'job_build' },
+    });
+
+    const terraClaim = await engine.claim('worker-1', TERRA);
+    expect(terraClaim?._id).toBe('job_build');
+
+    const lunaClaim = await engine.claim('luna-1', 'luna');
+    expect(lunaClaim?._id).toBe('job_repair');
+  });
+
+  it('skips an ineligible job for the same worker rather than blocking on it', async () => {
+    // The repair job is older (claimable first by createdAt) but wrong tier for
+    // this worker; the scan must fall through to the job it can actually take,
+    // not stop at the first `ready` document.
+    await engine.enqueue({
+      spec: spec('job_repair', ['src/a.tsx'], 'repair'),
+      origin: { kind: 'repair', defectFingerprint: 'fp1', reviewCycle: 0, parentJobId: 'job_other' },
+    });
+    await engine.enqueue({ spec: spec('job_build', ['src/b.tsx']), origin: { kind: 'plan' } });
+
+    const claimed = await engine.claim('worker-1', TERRA);
+    expect(claimed?._id).toBe('job_build');
   });
 });
 
@@ -71,14 +131,14 @@ describe('dependency graph', () => {
     });
 
     // Only the dependency-free job is claimable.
-    const first = await engine.claim('worker-1');
+    const first = await engine.claim('worker-1', TERRA);
     expect(first?._id).toBe('job_base');
-    expect(await engine.claim('worker-2')).toBeNull();
+    expect(await engine.claim('worker-2', TERRA)).toBeNull();
 
     await engine.submitForValidation('job_base', 'worker-1');
     await engine.accept('job_base', 'harness:validator');
 
-    const second = await engine.claim('worker-2');
+    const second = await engine.claim('worker-2', TERRA);
     expect(second?._id).toBe('job_dependent');
   });
 });
@@ -88,27 +148,27 @@ describe('output conflict serialisation', () => {
     await engine.enqueue({ spec: spec('job_x', ['src/shared.tsx']), origin: { kind: 'plan' } });
     await engine.enqueue({ spec: spec('job_y', ['src/shared.tsx', 'src/other.tsx']), origin: { kind: 'plan' } });
 
-    expect((await engine.claim('worker-1'))?._id).toBe('job_x');
-    expect(await engine.claim('worker-2')).toBeNull();
+    expect((await engine.claim('worker-1', TERRA))?._id).toBe('job_x');
+    expect(await engine.claim('worker-2', TERRA)).toBeNull();
 
     await engine.submitForValidation('job_x', 'worker-1');
     await engine.accept('job_x', 'harness:validator');
-    expect((await engine.claim('worker-2'))?._id).toBe('job_y');
+    expect((await engine.claim('worker-2', TERRA))?._id).toBe('job_y');
   });
 
   it('runs disjoint jobs in parallel', async () => {
     await engine.enqueue({ spec: spec('job_p', ['src/p.tsx']), origin: { kind: 'plan' } });
     await engine.enqueue({ spec: spec('job_q', ['src/q.tsx']), origin: { kind: 'plan' } });
 
-    expect((await engine.claim('worker-1'))?._id).toBe('job_p');
-    expect((await engine.claim('worker-2'))?._id).toBe('job_q');
+    expect((await engine.claim('worker-1', TERRA))?._id).toBe('job_p');
+    expect((await engine.claim('worker-2', TERRA))?._id).toBe('job_q');
   });
 });
 
 describe('lifecycle', () => {
   it('rejects an illegal transition rather than silently applying it', async () => {
     await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
-    await engine.claim('worker-1');
+    await engine.claim('worker-1', TERRA);
     // running -> accepted skips validation entirely.
     await expect(engine.accept('job_a', 'harness:validator')).rejects.toBeInstanceOf(JobStateConflict);
   });
@@ -116,11 +176,11 @@ describe('lifecycle', () => {
   it('retries a failed job while attempts remain, then gives up', async () => {
     await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' }, maxAttempts: 2 });
 
-    await engine.claim('worker-1');
+    await engine.claim('worker-1', TERRA);
     const first = await engine.fail('job_a', 'build error', 'worker-1');
     expect(first.state).toBe('ready');
 
-    await engine.claim('worker-1');
+    await engine.claim('worker-1', TERRA);
     const second = await engine.fail('job_a', 'build error again', 'worker-1');
     expect(second.state).toBe('failed');
     expect(second.attempt).toBe(2);
@@ -128,7 +188,7 @@ describe('lifecycle', () => {
 
   it('records every transition in the audit log', async () => {
     await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
-    await engine.claim('worker-1');
+    await engine.claim('worker-1', TERRA);
     await engine.submitForValidation('job_a', 'worker-1');
     await engine.accept('job_a', 'harness:validator');
 
@@ -140,25 +200,25 @@ describe('lifecycle', () => {
 describe('lease reclamation', () => {
   it('returns a crashed worker’s job to the ready pool', async () => {
     await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
-    await engine.claim('worker-1', { leaseMs: 1 });
+    await engine.claim('worker-1', TERRA, { leaseMs: 1 });
 
     const later = new Date(Date.now() + 60_000);
     expect(await engine.reclaimExpiredLeases(later)).toBe(1);
 
-    const reclaimed = await engine.claim('worker-2');
+    const reclaimed = await engine.claim('worker-2', TERRA);
     expect(reclaimed?._id).toBe('job_a');
     expect(reclaimed?.attempt).toBe(2);
   });
 
   it('leaves a live lease alone', async () => {
     await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
-    await engine.claim('worker-1', { leaseMs: 60_000 });
+    await engine.claim('worker-1', TERRA, { leaseMs: 60_000 });
     expect(await engine.reclaimExpiredLeases(new Date())).toBe(0);
   });
 
   it('refuses a heartbeat from a worker that lost its lease', async () => {
     await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
-    await engine.claim('worker-1', { leaseMs: 1 });
+    await engine.claim('worker-1', TERRA, { leaseMs: 1 });
     await engine.reclaimExpiredLeases(new Date(Date.now() + 60_000));
 
     expect(await engine.heartbeat('job_a', 'worker-1')).toBe(false);
@@ -187,7 +247,7 @@ describe('lease authority over a running job', () => {
 
   const claimed = async (jobId = 'job_a', worker = 'worker-1', now = T0) => {
     await engine.enqueue({ spec: spec(jobId, [`src/${jobId}.tsx`]), origin: { kind: 'plan' } });
-    const job = await engine.claim(worker, { leaseMs: LEASE_MS, now });
+    const job = await engine.claim(worker, TERRA, { leaseMs: LEASE_MS, now });
     expect(job?.lease?.holder).toBe(worker);
     return job!;
   };
@@ -281,7 +341,7 @@ describe('lease authority over a running job', () => {
     const superseded = async () => {
       await claimed();
       expect(await engine.reclaimExpiredLeases(AFTER)).toBe(1);
-      const second = await engine.claim('worker-2', { leaseMs: LEASE_MS, now: AFTER });
+      const second = await engine.claim('worker-2', TERRA, { leaseMs: LEASE_MS, now: AFTER });
       expect(second?.lease?.holder).toBe('worker-2');
       expect(second?.attempt).toBe(2);
       return second!;
@@ -378,7 +438,7 @@ describe('lease authority over a running job', () => {
     it('names who holds the job now', async () => {
       await claimed();
       await engine.reclaimExpiredLeases(AFTER);
-      await engine.claim('worker-2', { leaseMs: LEASE_MS, now: AFTER });
+      await engine.claim('worker-2', TERRA, { leaseMs: LEASE_MS, now: AFTER });
 
       await expect(
         engine.submitForValidation('job_a', 'worker-1', { now: AFTER }),

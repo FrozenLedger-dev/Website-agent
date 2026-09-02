@@ -1084,11 +1084,40 @@ implying a model accepts work. Acceptance is the harness's, and they now say
 **`runProject` still does not execute through `JobEngine`.** Nothing imports it,
 nothing is enqueued, no worker loop exists. Delivery behaviour is unchanged.
 
+### Phase 5b — role-aware claiming — **DONE**
+
+**Before.** `claim(workerId, options)` filtered candidates on `state: 'ready'`
+alone. `role` was already stored on every `JobDocument` — denormalised
+specifically to be a Mongo routing key — but nothing read it back. A worker id
+is just a string; any worker could claim any job regardless of what it was.
+`ROLE_TIER` (`WorkerRole` → `AgentTier`) existed in `@statxai/contracts` and
+governed nothing at claim time.
+
+**After.** `claim` takes the caller's `tier` as a required second argument and
+narrows the candidate query itself: `role: { $in: rolesForTier(tier) }`.
+`rolesForTier` is the inverse of `ROLE_TIER`, computed rather than restated, so
+the two tables cannot drift apart. A Luna worker never sees a Terra job to race
+for — the exclusion is in the same document read that finds a job runnable at
+all, alongside `state: 'ready'`, not a check layered on top of it afterward.
+
+    claim(workerId, tier, options?)
+    candidates = { ...scope, state: 'ready', role: { $in: rolesForTier(tier) } }
+
+Covered in `packages/job-engine/test/engine.test.ts` (`role-aware claiming`):
+a Luna worker gets `null` against a Terra job and the job stays `ready`; a
+Terra worker gets `null` against a `repair` job; each tier claims only its own
+role; and a worker scanning past an ineligible-but-older job still reaches the
+one it can take, rather than the scan stopping at the first `ready` document.
+`packages/contracts/test/primitives.test.ts` pins `rolesForTier` against
+`ROLE_TIER` directly — every role reachable, none double-claimed by two tiers,
+and Luna's set is exactly `['repair']`.
+
+**`runProject` still does not execute through `JobEngine`.** This closes the
+authorisation gap the doc flagged before real workers exist; it does not wire
+any worker up. Delivery behaviour is unchanged.
+
 ### Deliberately next, not now
 
-- **5b** — role-aware claiming. `claim()` takes a worker id and does not filter
-  by the `WorkerRole` → `AgentTier` mapping, so any worker can take any job.
-  That must be closed before real Terra and Luna workers exist.
 - **5c** — an in-process execution loop.
 - **Later** — mapping Terra build work and Luna repair work onto persisted jobs,
   the validation and acceptance lifecycle, what a replan does to jobs from the
@@ -1097,6 +1126,6 @@ nothing is enqueued, no worker loop exists. Delivery behaviour is unchanged.
 
 None of these are implemented.
 
-## Phases 5–17
+## Phases 6–17
 
 Not started.

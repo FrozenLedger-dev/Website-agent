@@ -7,7 +7,15 @@
  * win, and a stale view of the world cannot advance a job it no longer owns.
  */
 import type { ClientSession } from 'mongodb';
-import { assertTransition, outputsConflict, type JobOrigin, type JobSpec, type JobState } from '@statxai/contracts';
+import {
+  assertTransition,
+  outputsConflict,
+  rolesForTier,
+  type AgentTier,
+  type JobOrigin,
+  type JobSpec,
+  type JobState,
+} from '@statxai/contracts';
 import type { AuditEvent, JobDocument, StateStore } from '@statxai/state';
 
 export const DEFAULT_LEASE_MS = 5 * 60 * 1000;
@@ -107,35 +115,46 @@ export class JobEngine {
   }
 
   /**
-   * Claim one runnable job, or return null.
+   * Claim one runnable job of the caller's tier, or return null.
    *
    * Eligibility is not expressible as a single-document filter, because two of
-   * the three conditions are cross-document:
+   * the four conditions are cross-document:
    *
    *   1. the job is `ready`                        — single document
-   *   2. every dependency has been accepted        — other job documents
-   *   3. no running job writes an overlapping path — other job documents
+   *   2. the job's role belongs to `tier`           — single document
+   *   3. every dependency has been accepted        — other job documents
+   *   4. no running job writes an overlapping path — other job documents
    *
    * So the whole selection runs inside a transaction. Snapshot isolation gives
-   * a consistent view of (2) and (3), and the final guarded update makes the
+   * a consistent view of (3) and (4), and the final guarded update makes the
    * claim itself atomic: if another worker took the job first, the update
    * matches nothing and the transaction aborts and retries.
    *
-   * Condition (3) is what keeps parallel workers from corrupting a single
+   * Condition (2) is what makes claiming role-aware: `tier` is what the caller
+   * *is* (which model stands behind it), not a preference, so it narrows the
+   * candidate set rather than being checked afterward — a Luna worker cannot
+   * see a Terra job to race for it in the first place. This is what has to be
+   * true before real Terra and Luna workers can share the same queue; a repair
+   * job left open to any tier would let a Terra worker execute a Luna-priced
+   * repair, or Luna hold a judgment seat §7 reserves for Terra's reviewer.
+   *
+   * Condition (4) is what keeps parallel workers from corrupting a single
    * project repository. §2 promises parallel execution and §1 gives each
    * project one Git repo; the declared `output` list is what reconciles them.
    */
   async claim(
     workerId: string,
+    tier: AgentTier,
     options: { projectId?: string; leaseMs?: number; now?: Date } = {},
   ): Promise<JobDocument | null> {
     const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
+    const roles = rolesForTier(tier);
 
     return this.store.withTransaction(async (session) => {
       const scope = options.projectId ? { projectId: options.projectId } : {};
 
       const candidates = await this.store.jobs
-        .find({ ...scope, state: 'ready' }, { session, sort: { createdAt: 1 } })
+        .find({ ...scope, state: 'ready', role: { $in: roles } }, { session, sort: { createdAt: 1 } })
         .toArray();
       if (candidates.length === 0) return null;
 
