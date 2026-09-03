@@ -12,6 +12,7 @@ import {
   outputsConflict,
   rolesForTier,
   type AgentTier,
+  type ArtifactRef,
   type JobOrigin,
   type JobSpec,
   type JobState,
@@ -83,6 +84,32 @@ export class JobStateConflict extends Error {
 }
 
 /**
+ * Raised when a running job is mutated by the worker that currently holds the
+ * lease — but for an execution generation ("attempt") that is no longer the
+ * job's own (Phase 5f).
+ *
+ * Distinct from {@link JobLeaseConflict} on purpose: that error means someone
+ * *else* holds the job. This means the *same* workerId holds it again, on a
+ * later attempt — the job expired and was reclaimed, and this fixed-identity
+ * worker (a `JobRunner` always claims under one unchanging `workerId`) simply
+ * claimed its own job back. `lease.holder` alone cannot see that; `attempt` is
+ * what distinguishes the stale execution from the current one.
+ */
+export class JobAttemptConflict extends Error {
+  constructor(
+    readonly jobId: string,
+    readonly workerId: string,
+    readonly attempt: number,
+    readonly currentAttempt: number,
+  ) {
+    super(
+      `Job ${jobId} attempt ${attempt} is stale for worker ${workerId}; the job is now on attempt ${currentAttempt}`,
+    );
+    this.name = 'JobAttemptConflict';
+  }
+}
+
+/**
  * Raised when `claim()` is asked to narrow to a role set that is not a
  * non-empty subset of what the supplied tier may execute (Phase 5d).
  *
@@ -124,6 +151,7 @@ export class JobEngine {
       maxAttempts: params.maxAttempts ?? 3,
       lease: null,
       failure: null,
+      executionOutputs: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -257,19 +285,33 @@ export class JobEngine {
   }
 
   /**
-   * Work finished; hand off to validation.
+   * Work finished; hand off to validation — and, in the same guarded
+   * transition, attach exactly what that execution produced.
    *
-   * Only the current lease holder may do this. A worker whose lease lapsed
-   * while it was busy has had its job handed to someone else, and submitting
-   * anyway would credit it with execution it did not perform — and overwrite a
-   * live worker's job while it is still running.
+   * Only the current lease holder, on its own claimed `attempt`, may do this
+   * (Phase 5a's lease check, Phase 5f's attempt check). A worker whose lease
+   * lapsed while it was busy — or the same workerId, now on a later attempt
+   * of its own job — has had this job handed to someone else, and submitting
+   * anyway would credit it with execution it did not perform, or worse,
+   * attach its stale output as if it were the current attempt's.
+   *
+   * `options.outputs`, when given, is written by the *same* `$set` that
+   * changes `state` and clears `lease` — one atomic mutation, not a write
+   * followed by a transition. A stale attempt that loses this race attaches
+   * nothing: the guarded filter matches no document, so neither the state
+   * change nor the output write ever happens. Omitting `outputs` leaves
+   * `executionOutputs` untouched (`null` from `enqueue`), so a handler that
+   * returns nothing stays valid.
    */
   async submitForValidation(
     jobId: string,
     workerId: string,
-    options: { now?: Date } = {},
+    attempt: number,
+    options: { now?: Date; outputs?: readonly ArtifactRef[] } = {},
   ): Promise<JobDocument> {
-    return this.transitionOwnedRunning(jobId, workerId, 'validating', { lease: null }, options.now);
+    const extra: Record<string, unknown> = { lease: null };
+    if (options.outputs !== undefined) extra.executionOutputs = options.outputs;
+    return this.transitionOwnedRunning(jobId, workerId, attempt, 'validating', extra, options.now);
   }
 
   /** Validation passed. Terminal. */
@@ -288,11 +330,17 @@ export class JobEngine {
    * Note the ordering: the job always passes through `failed` rather than going
    * straight back to `ready`, so the failure is durably recorded and visible in
    * the audit trail even when the retry immediately succeeds.
+   *
+   * `attempt` fences the running branch only (Phase 5f) — see the authority
+   * note below. It is accepted unconditionally, and simply unused, when the
+   * job is actually in `validating`: that branch has no lease to fence in the
+   * first place, so there is no generation for it to be stale against.
    */
   async fail(
     jobId: string,
     message: string,
     actor: string,
+    attempt: number,
     options: { policyViolation?: boolean; now?: Date } = {},
   ): Promise<JobDocument> {
     const now = options.now ?? new Date();
@@ -305,7 +353,9 @@ export class JobEngine {
      * The two failures this method serves have different authority.
      *
      * A running job failing is the executing worker reporting that its own work
-     * broke, so it must still hold the job. A validating job failing is the
+     * broke, so it must still hold the job — on the exact attempt it claimed,
+     * not merely under its own workerId, since that same worker may since have
+     * reclaimed this job as a later attempt. A validating job failing is the
      * harness rejecting finished work — the execution lease was cleared on
      * submission, and requiring one would make validation impossible.
      *
@@ -318,7 +368,7 @@ export class JobEngine {
 
     const failed =
       current.state === 'running'
-        ? await this.transitionOwnedRunning(jobId, actor, 'failed', extra, now)
+        ? await this.transitionOwnedRunning(jobId, actor, attempt, 'failed', extra, now)
         : await this.transition(jobId, ['validating'], 'failed', actor, extra);
 
     if (failed.attempt >= failed.maxAttempts) return failed;
@@ -374,16 +424,23 @@ export class JobEngine {
   }
 
   /**
-   * Extend a lease that is still alive.
+   * Extend a lease that is still alive, on the exact attempt that claimed it.
    *
    * A lease can only be extended from a lease. Without the expiry condition a
    * worker that stalled past its deadline could revive its own claim in the
    * window before the reaper reaches it, which is the one moment another worker
    * is about to be given the job.
+   *
+   * `attempt` closes the gap `lease.holder` alone leaves (Phase 5f): a
+   * `JobRunner` always heartbeats under one fixed `workerId`, so if this same
+   * job expires and this same worker claims it back, `lease.holder` matches
+   * again on the new attempt — and a heartbeat left over from the old one,
+   * arriving late, would otherwise extend a lease it was never granted.
    */
   async heartbeat(
     jobId: string,
     workerId: string,
+    attempt: number,
     leaseMs = DEFAULT_LEASE_MS,
     options: { now?: Date } = {},
   ): Promise<boolean> {
@@ -392,6 +449,7 @@ export class JobEngine {
       {
         _id: jobId,
         state: 'running',
+        attempt,
         'lease.holder': workerId,
         'lease.expiresAt': { $gt: now },
       },
@@ -401,16 +459,20 @@ export class JobEngine {
   }
 
   /**
-   * Advance a running job on behalf of the worker that owns it.
+   * Advance a running job on behalf of the exact execution that owns it.
    *
    * The ownership test is in the update filter, not in a check before it.
    * Reading the lease and then writing on state alone would leave a window —
    * short, and exactly long enough for the reaper and a new claim to land
-   * between them.
+   * between them. `attempt` is part of that same filter (Phase 5f), for the
+   * same reason it is on `heartbeat`: `lease.holder` alone cannot tell this
+   * worker's current execution apart from an earlier one of its own that the
+   * reaper already reclaimed and this same `workerId` has since re-claimed.
    */
   private async transitionOwnedRunning(
     jobId: string,
     workerId: string,
+    attempt: number,
     to: JobState,
     extra: Record<string, unknown>,
     at?: Date,
@@ -423,6 +485,7 @@ export class JobEngine {
         {
           _id: jobId,
           state: 'running',
+          attempt,
           'lease.holder': workerId,
           'lease.expiresAt': { $gt: now },
         },
@@ -432,10 +495,19 @@ export class JobEngine {
 
       if (!updated) {
         // Classified from what is actually there, so a caller learns whether it
-        // lost the job or the job moved on without it.
+        // lost the job, the job moved on to someone else, or — same worker,
+        // stale generation — it moved on without ever leaving this workerId.
         const exists = await this.store.jobs.findOne({ _id: jobId }, { session });
         if (!exists) throw new JobNotFound(jobId);
         if (exists.state !== 'running') throw new JobStateConflict(jobId, ['running']);
+        if (exists.lease?.holder !== workerId) {
+          throw new JobLeaseConflict(jobId, workerId, exists.lease?.holder ?? null);
+        }
+        if (exists.attempt !== attempt) {
+          throw new JobAttemptConflict(jobId, workerId, attempt, exists.attempt);
+        }
+        // Holder and attempt both match; only the lease's expiry could have
+        // failed the guard.
         throw new JobLeaseConflict(jobId, workerId, exists.lease?.holder ?? null);
       }
 

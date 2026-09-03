@@ -1,36 +1,51 @@
 /**
- * The first production `JobHandler`: Terra's `frontend_backend` role.
+ * The production `JobHandler` for Terra's `frontend_backend` role.
  *
- * This adapts {@link buildFromPlan} — the same function the direct delivery
- * loop (`orchestrator.ts`) calls — to `JobRunner`'s handler contract. Nothing
- * about how Terra builds a site changes here; only how one execution of it is
- * reached: from a claimed, persisted job with pinned input `ArtifactRef`s,
- * instead of from `runProject`'s in-memory `RunContext`.
+ * This adapts {@link prepareBuildFromPlan} — the generation half of the same
+ * function the direct delivery loop calls in full — to `JobRunner`'s handler
+ * contract. Nothing about how Terra builds a site changes here; only how one
+ * execution of it is reached, and, since Phase 5f, that this handler never
+ * publishes what it generates itself.
  *
- * `job-engine` stays generic on purpose (Phase 5c/5d): it knows nothing about
- * Terra, workspaces or `ModelClient`. This module is where that knowledge
- * lives — the layer that already owns build execution and its dependencies.
+ * Publication is `publishBuildDirectly`'s job, and this handler never calls
+ * it. Instead it stages the generated {@link BuildCandidate} as an isolated,
+ * unaccepted artifact, namespaced under this exact job and attempt
+ * (`jobOutputNamespace`), and returns a reference to it as its
+ * `JobHandlerResult`. It becomes reachable only if `JobRunner`'s own guarded
+ * `running -> validating` transition — which this handler has no access to —
+ * proves this execution still owns the job when it finishes. Until then it is
+ * orphanable staging garbage: unaccepted, unreferenced by any canonical
+ * artifact name, invisible to "latest" queries against the project, and never
+ * materialised into the shared project workspace, which this handler never
+ * even opens.
  *
- * Not implemented here: `runProject` still builds directly, without going
- * through the job engine at all. Nothing enqueues a `frontend_backend` job in
- * production yet; this handler only makes one *executable* once something
- * does.
+ * `job-engine` stays generic on purpose (Phase 5c/5d/5f): it knows nothing
+ * about Terra, workspaces, `ModelClient`, or what a "build candidate" is —
+ * only that a `JobHandlerResult`'s outputs must be namespaced under the
+ * execution that produced them. This module is where the website-specific
+ * knowledge lives.
+ *
+ * Not implemented here: `runProject` still builds directly, through
+ * `buildFromPlan`'s full prepare-then-publish, without going through the job
+ * engine at all. Nothing enqueues a `frontend_backend` job in production yet.
+ * A validating job's staged candidate is not accepted, promoted or deployed
+ * by anything in this phase — that is the next slice's work.
  */
 import type { ArtifactRef, WorkerRole } from '@statxai/contracts';
-import type { BudgetLimits, JobDocument, StateStore } from '@statxai/state';
-import { ProjectWorkspace, type ArtifactRegistry } from '@statxai/workspace';
+import type { JobDocument } from '@statxai/state';
+import type { ArtifactRegistry } from '@statxai/workspace';
 import type { ModelClient } from '@statxai/agents';
-import type { JobHandler } from '@statxai/job-engine';
-import { buildFromPlan } from '../phases/build.js';
-import type { FixedContext, Progress, RunDeps } from '../run-context.js';
+import { jobOutputNamespace, type JobHandler, type JobHandlerResult } from '@statxai/job-engine';
+import { prepareBuildFromPlan, type BuildCandidate, type PrepareContext } from '../phases/build.js';
+import type { Progress, RunDeps, RunFacts } from '../run-context.js';
 
 const ROLE: WorkerRole = 'frontend_backend';
 
 /**
- * Defense in depth at the adapter boundary (§24 of the brief this shipped
- * under). `JobRunner`'s `claimableRoles` (5d) already guarantees this handler
- * is never claimed against any other role — this is what fires if it is ever
- * invoked directly, bypassing the runner, with a job that is not its own.
+ * Defense in depth at the adapter boundary. `JobRunner`'s `claimableRoles`
+ * (5d) already guarantees this handler is never claimed against any other
+ * role — this is what fires if it is ever invoked directly, bypassing the
+ * runner, with a job that is not its own.
  */
 export class FrontendBackendRoleMismatch extends Error {
   constructor(actual: string) {
@@ -39,7 +54,7 @@ export class FrontendBackendRoleMismatch extends Error {
   }
 }
 
-/** A required pinned input was absent from the job, or resolved to nothing usable. */
+/** A required pinned input was absent from the job. */
 export class FrontendBackendInputInvalid extends Error {
   constructor(message: string) {
     super(message);
@@ -57,12 +72,17 @@ export const FRONTEND_BACKEND_INPUT = {
   sitePlan: 'sitePlan',
 } as const;
 
+/** The one staged output this handler ever produces, by label. */
+export const FRONTEND_BACKEND_OUTPUT_LABEL = 'build-candidate';
+
+/** The artifact name one execution's staged candidate is written under. */
+export function frontendBackendCandidateName(jobId: string, attempt: number): string {
+  return `${jobOutputNamespace(jobId, attempt)}${FRONTEND_BACKEND_OUTPUT_LABEL}`;
+}
+
 export interface FrontendBackendHandlerDeps {
-  store: StateStore;
   registry: ArtifactRegistry;
   model: ModelClient;
-  /** Where `ProjectWorkspace.open` materialises the project's Git checkout. */
-  workspacesRoot: string;
   /** Defaults to a no-op: a job execution is not part of a `RunRecorder` run. */
   say?: Progress;
   /** Defaults to a no-op, for the same reason. */
@@ -80,88 +100,71 @@ function requiredRef(job: JobDocument, key: string): ArtifactRef {
 }
 
 /**
- * Build the harness-owned dependencies `buildFromPlan` needs from the job's
- * own pinned refs, without ever falling back to "latest" for anything the
- * job specified. `registry.resolve` reads the exact `(name, version)` pinned
- * by the ref — never `sort: version desc` — so a version accepted after this
- * job was created cannot change what it builds from.
- */
-async function resolveInputs(
-  deps: FrontendBackendHandlerDeps,
-  job: JobDocument,
-): Promise<{ profile: unknown; plan: unknown; autonomyMode: string; budgetLimits: BudgetLimits }> {
-  const profileRef = requiredRef(job, FRONTEND_BACKEND_INPUT.businessProfile);
-  const planRef = requiredRef(job, FRONTEND_BACKEND_INPUT.sitePlan);
-
-  // `registry.resolve(job.projectId, ref)` addresses the artifact document by
-  // `artifactId(job.projectId, ref.name, ref.version)` — an artifact from a
-  // different project is a different id, not a permission check that could be
-  // bypassed. A job cannot reach outside its own project's artifacts.
-  const [profile, plan, project, budget] = await Promise.all([
-    deps.registry.resolve(job.projectId, profileRef),
-    deps.registry.resolve(job.projectId, planRef),
-    deps.store.projects.findOne({ _id: job.projectId }),
-    deps.store.budgets.findOne({ _id: job.projectId }),
-  ]);
-
-  if (!project) {
-    throw new FrontendBackendInputInvalid(`frontend_backend job "${job._id}": no project record for "${job.projectId}"`);
-  }
-  if (!budget) {
-    throw new FrontendBackendInputInvalid(`frontend_backend job "${job._id}": no budget record for "${job.projectId}"`);
-  }
-
-  return { profile, plan, autonomyMode: project.autonomyMode, budgetLimits: budget.limits };
-}
-
-/**
  * The real production `frontend_backend` handler.
  *
  * `deps` are the harness-owned collaborators this handler always needs —
  * supplied once, at construction, the same way `identity` and
  * `claimableRoles` are fixed on the `JobRunner` that will run it. Per-job
- * data (which profile, which plan, which project) comes only from the
- * claimed `JobDocument`.
+ * data (which profile, which plan, which project, which attempt) comes only
+ * from the claimed `JobDocument`.
  */
 export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDeps): JobHandler {
   const say: Progress = deps.say ?? (() => {});
   const track: RunDeps['track'] = deps.track ?? (() => {});
 
-  return async (job, ctx) => {
+  return async (job, ctx): Promise<JobHandlerResult> => {
     if (job.role !== ROLE) {
       throw new FrontendBackendRoleMismatch(job.role);
     }
 
-    // Fail before any model invocation on a malformed job — a missing input
-    // must not fall back to "current profile" or "latest plan".
-    const { profile, plan, autonomyMode, budgetLimits } = await resolveInputs(deps, job);
+    const profileRef = requiredRef(job, FRONTEND_BACKEND_INPUT.businessProfile);
+    const planRef = requiredRef(job, FRONTEND_BACKEND_INPUT.sitePlan);
 
     ctx.signal.throwIfAborted();
 
-    const workspace = await ProjectWorkspace.open(job.projectId, deps.workspacesRoot);
+    // Pinned means pinned: `resolve` reads the exact (name, version) the job
+    // was given — never `sort: version desc` — so a version accepted after
+    // this job was created cannot change what it builds from. The artifact
+    // document's own id embeds `job.projectId`, so a ref cannot address
+    // another project's artifact regardless of what a job claims.
+    const [profile, plan] = await Promise.all([
+      deps.registry.resolve(job.projectId, profileRef),
+      deps.registry.resolve(job.projectId, planRef),
+    ]);
 
-    const fixedContext: FixedContext = {
-      deps: { store: deps.store, registry: deps.registry, workspace, model: deps.model, say, track },
-      facts: {
-        projectId: job.projectId,
-        // `buildFromPlan` and everything it calls read `facts.profile` as a
-        // `BusinessProfile` and its second argument as a `SitePlan` — that
-        // contract is inherited unchanged, not re-declared here.
-        profile: profile as FixedContext['facts']['profile'],
-        autonomyMode,
-        budgetLimits,
-      },
+    ctx.signal.throwIfAborted();
+
+    // No workspace, artifact acceptance, or store mutation happens here or
+    // inside prepareBuildFromPlan — generation only calls the model. The
+    // canonical project workspace is never opened by this handler at all,
+    // so there is nothing here that could materialise into it before this
+    // execution's authority is proven.
+    const prepareContext: PrepareContext = {
+      deps: { model: deps.model, say, track },
+      facts: { profile: profile as RunFacts['profile'] },
     };
+    const candidate: BuildCandidate = await prepareBuildFromPlan(
+      prepareContext,
+      plan as Parameters<typeof prepareBuildFromPlan>[1],
+      ctx.signal,
+    );
+
+    // The model call inside prepareBuildFromPlan cannot be cancelled once
+    // sent. Authority may have been lost while it was in flight; the result
+    // is checked again here, before it is even staged.
+    ctx.signal.throwIfAborted();
+
+    // Staged, not published. The name is namespaced under this exact job and
+    // attempt — job ids are unique across the whole jobs collection, so no
+    // other job or other attempt of this job can ever collide with it — and
+    // JobRunner independently enforces that same namespace before it will
+    // ever attach this ref to the job. Never accepted: acceptance is
+    // validation/promotion authority this phase does not touch.
+    const outputName = frontendBackendCandidateName(job._id, job.attempt);
+    const ref = await deps.registry.put(job.projectId, outputName, candidate);
 
     ctx.signal.throwIfAborted();
 
-    // The one call both this handler and the direct delivery loop share.
-    // `signal` is what makes this safe to run under a lease that can be lost
-    // mid-build: ModelClient cannot cancel an in-flight call, so a response
-    // that arrives after authority is gone is still tracked for telemetry but
-    // never reaches a durable write — see build.ts's own doc comment.
-    await buildFromPlan(fixedContext, plan as Parameters<typeof buildFromPlan>[1], ctx.signal);
-
-    ctx.signal.throwIfAborted();
+    return { outputs: [ref] };
   };
 }

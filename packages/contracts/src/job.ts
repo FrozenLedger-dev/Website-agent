@@ -175,6 +175,20 @@ export const JobRecord = z.object({
   lease: JobLease.nullable().default(null),
   failure: JobFailure.nullable().default(null),
 
+  /**
+   * What the exact execution that reached `validating` actually produced
+   * (Phase 5f). Attached only by the guarded `running -> validating`
+   * transition, in the same update as the state change — never written by a
+   * handler directly, and never by an execution attempt other than the one
+   * whose token the transition was guarded on. `null` until that happens;
+   * still `null` for a job whose handler returns no output (existing `void`
+   * handlers stay valid — an empty result is not an error).
+   *
+   * This is the job's *actual* output. `JobSpec` above stays what the work
+   * was *expected* to produce, and is never mutated after enqueue.
+   */
+  executionOutputs: z.array(ArtifactRef).nullable().default(null),
+
   createdAt: z.date(),
   updatedAt: z.date(),
 });

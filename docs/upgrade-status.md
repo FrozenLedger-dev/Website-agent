@@ -1454,16 +1454,179 @@ proven at 5c's). Every mutation was killed by at least one test.
 
 **No production Luna handler is wired yet.**
 
+### Phase 5f — execution-token-fenced output publication — **DONE**
+
+5e's cancellation checks (`signal.throwIfAborted()` before every durable
+write) close the case where authority is *already* known lost. They do not
+close the gap between the check and the write completing, and they do not
+close the case 5f exists for: the *same* fixed `workerId` — the shape a
+`JobRunner` always claims under — reclaiming its own job after its lease
+expired. `lease.holder` alone cannot tell that worker's new execution apart
+from the stale one it replaced.
+
+**`workerId` alone is not execution authority; execution authority is the
+exact claim generation.** `attempt` — verified monotonic: `claim()`'s own
+`$inc`, never decremented anywhere in the engine, so a later claim of the
+same job always has a strictly larger one — is reused as that generation
+token rather than inventing a second counter. `JobRunner.runOnce` captures a
+`JobExecutionToken { jobId, workerId, attempt }` exactly once, from the
+`JobDocument` `claim()` itself returned, and every authority-bearing call the
+execution makes reuses that same token — never rereading the job, never
+letting a caller supply or override it.
+
+**Every guarded running-job mutation now fences on it:**
+
+    heartbeat(jobId, workerId, attempt, leaseMs?, options?)
+    submitForValidation(jobId, workerId, attempt, options?)   // options.outputs?: readonly ArtifactRef[]
+    fail(jobId, message, actor, attempt, options?)            // attempt fences the running branch only
+
+The guarded Mongo filter (`transitionOwnedRunning`, and `heartbeat`'s own
+`updateOne`) is now `{ _id, state: 'running', attempt, 'lease.holder':
+workerId, 'lease.expiresAt': { $gt: now } }`. A same-worker stale attempt
+fails closed with a new, distinctly-classified `JobAttemptConflict` — not
+`JobLeaseConflict`, whose "held by X" message would be actively misleading
+when X is this same worker's own later self. Error precedence:
+not-found → wrong state → different holder (`JobLeaseConflict`) → same
+holder, stale attempt (`JobAttemptConflict`) → expiry alone
+(`JobLeaseConflict`, unchanged from 5a). `fail`'s validating branch accepts
+`attempt` but does not use it — that branch has no lease to fence, unchanged
+from 5c.
+
+**Output attachment is the same atomic write as the transition, not a
+second one.** `submitForValidation`'s `options.outputs`, when given, is
+folded into the identical guarded `$set` that changes `state` and clears
+`lease`. A stale submit that loses the race attaches nothing — the filter
+matches no document, so neither the state change nor the output write
+happens; there is no separate write for a mutation to make non-atomic. New
+persisted field, `JobRecord.executionOutputs: ArtifactRef[] | null` (added to
+`@statxai/contracts`, nullable/default-null like `lease`/`failure`) — what an
+execution actually produced, set only by that guarded transition, distinct
+from `JobSpec` (what work was expected, never mutated after enqueue).
+
+**`JobHandler` may now return a result.** `JobHandler = (job, context) =>
+Promise<JobHandlerResult | void>`, `JobHandlerResult = { readonly outputs?:
+readonly ArtifactRef[] }`. A `void`-returning handler (every test stub in
+5c/5d, and any future one) stays valid — output is optional on an optional
+result. Before ever reaching the guarded submit, the runner validates every
+returned ref's `name` starts with `jobOutputNamespace(jobId, attempt)` —
+`` `job-output/${jobId}/${attempt}/` `` — rejecting the whole result
+(`InvalidJobOutputRefs`, routed through the existing handler-failure path,
+not a new result kind) otherwise. This is the one namespacing rule
+`job-engine` enforces; it has no `ArtifactRegistry` dependency and no idea
+what a "build candidate" is, only that output must own the execution that
+produced it. Job ids are unique across the whole `jobs` collection, so a ref
+genuinely namespaced this way could only have been produced by this exact
+job's this exact attempt — no other job, in any project, and no other
+attempt of this same job, can collide with it.
+
+**Known limitation, stated rather than hidden:** this check validates the
+job/attempt component of a ref's name; it cannot validate which *project* an
+artifact actually lives under, because `ArtifactRef` carries no `projectId`
+and `job-engine` deliberately has no registry access to look one up (§15 of
+the brief this shipped under: "the generic job layer should understand
+references, not website internals"). A handler that staged under the
+*correct* job/attempt namespace but the *wrong* project would still pass this
+check — caught in this repo's own tests only incidentally, by a fixture that
+tries to read the candidate back under the real project and fails. Adding a
+positive check would mean giving `job-engine` `ArtifactRegistry` knowledge
+or adding `projectId` to the shared `ArtifactRef` contract, either of which
+is a real design decision, not a one-line fix — left to a later phase rather
+than done quietly here.
+
+**`frontend_backend` stages; it no longer publishes.** `buildFromPlan` split
+into `prepareBuildFromPlan` (routes, builds, decompose-recovers — every model
+call, writes nothing durable, returns a `BuildCandidate`) and
+`publishBuildDirectly` (every durable write `buildFromPlan` always made:
+route-decision artifact(s), site files, commit). `buildFromPlan` is still
+exactly project-state update → scaffold → prepare → publish, so the direct
+delivery loop is unchanged — proven by a characterisation test pinning the
+full call sequence, and unmodified by every existing `delivery.parity`/
+`refusal` integration test still passing. The one deliberate behaviour change
+for the direct path: `route-decision` now persists *after* Terra generates
+rather than before (prepare no longer persists anything mid-generation) —
+final artifacts, files and commit are identical either way. The handler now
+calls only `prepareBuildFromPlan`, stages the returned `BuildCandidate` as a
+single artifact named `frontendBackendCandidateName(jobId, attempt)`, and
+returns its ref as its `JobHandlerResult`. It never opens the canonical
+`ProjectWorkspace` at all (`FrontendBackendHandlerDeps` no longer even
+carries a `store` or `workspacesRoot`), never calls `registry.accept`, and
+never transitions the job — proven by a structural test reading its source
+back, in `policy-boundary.test.ts`'s style, for `JobEngine` references and
+lifecycle-method calls.
+
+**Staged output is deliberately orphanable, never garbage-collected here.**
+A same-worker stale attempt that finishes staging after being superseded
+leaves its candidate sitting under its own attempt's namespace, unaccepted
+and unreferenced by any job — proven end to end against the real store and
+Git-backed `ProjectWorkspace`, using the actual production handler, in
+`frontend-backend-job-handler.integration.test.ts`. Retried attempts
+(one fails, the next succeeds) stage to genuinely distinct namespaces, and an
+attempt whose staging physically completes *after* a newer attempt has
+already validated still cannot become canonical — the job's own
+`executionOutputs`, set once by the transition that actually won, decides,
+never "whichever candidate wrote last."
+
+**Files:** `packages/contracts/src/job.ts` (`executionOutputs`),
+`packages/job-engine/src/engine.ts` (`JobAttemptConflict`, attempt-fenced
+`heartbeat`/`submitForValidation`/`fail`, atomic output attachment),
+`packages/job-engine/src/runner.ts` (`JobExecutionToken`,
+`jobOutputNamespace`, `InvalidJobOutputRefs`, `JobHandlerResult`, token
+capture and reuse, output-ref validation), `packages/orchestrator/src/phases/build.ts`
+(`prepareBuildFromPlan`/`publishBuildDirectly`/`PrepareContext` split),
+`packages/orchestrator/src/job-handlers/frontend-backend.ts` (stages instead
+of publishes), plus the corresponding test files for each.
+
+**Tests, end to end:** 471 unit, 169 integration, 640 total — up from the 5e
+figure of 469 + 147 = 616. Typecheck and lint both clean. Not claiming GitHub
+CI ran on this — it did not; these are local results on an uncommitted
+working tree, per this phase's own instruction not to commit.
+
+**Mutation checks, run manually against `engine.ts`, `runner.ts`, `build.ts`
+and `frontend-backend.ts`, each reverted after** (not part of the committed
+diff): `attempt` removed from the `heartbeat` guard (3/101 across the
+engine, runner and real-handler integration suites at once); `attempt`
+removed from the shared `transitionOwnedRunning` guard — covering both the
+submit and running-fail mutations simultaneously, since they share one
+private helper (7/101); the token rechecked/rederived before the final
+submit, and output refs attached by a separate non-atomic write before the
+guarded transition — both not mechanically expressible as isolated mutations
+in the current design, since no reread path and no second write path exist
+to mutate into existence (confirmed instead by directly breaking the guarded
+write into two Mongo operations, which the atomicity-specific tests caught,
+3/101); attempt dropped from the staging namespace (4/9); job output written
+straight to the canonical workspace (0/9 until the deps plumbing was
+temporarily restored to make the mutation reachable at all — the type system
+alone blocks the naive version; 1/9 once genuinely wired, caught by a
+strengthened assertion this phase's mutation check itself motivated adding);
+canonical/`latest`-style artifact naming used for staging (4/9); staged
+output written under the wrong project entirely (3/9 — caught incidentally
+by fixture reads, not by a positive ownership check; see the limitation
+noted above); auto-accepting the staged artifact (1/9). "Newest candidate
+wins by `createdAt`" has no code path to mutate into existence — attempt-
+scoped unique names mean there is never an ambiguous "latest" to resolve
+among candidates in the first place. Every mutation that was reachable at
+all was killed by at least one test.
+
+**`runProject` still does not execute through `JobEngine`.**
+
+**No production job is automatically enqueued yet.**
+
+**Frontend/backend candidate output is not automatically accepted or
+promoted.**
+
+**No production Luna handler is wired yet.**
+
 ### Deliberately next, not now
 
-- **Phase 5f** — cut the existing frontend/backend build phase over to one
-  persisted job: construct the real `frontend_backend` `JobSpec`, pin its
-  actual input `ArtifactRef`s, enqueue/release it, execute it through the
-  specialised Terra `JobRunner`, and deterministically validate/accept or
-  surface failure — without touching Luna repair or broad replan semantics.
-- **Later still** — mapping Luna repair work onto persisted jobs, the
-  validation and acceptance lifecycle those jobs need, what a replan does to
-  jobs from the superseded plan (`superseded` does not exist yet), and
+- **Phase 5g** — validate, accept, and promote one `frontend_backend` job's
+  output: consume the `executionOutputs` refs attached to a validating job,
+  run the existing deterministic gates against the staged candidate, accept
+  the job only when they pass, and materialise/promote the accepted
+  candidate into the canonical workspace only after acceptance — still
+  without Luna or broad replan semantics.
+- **Later still** — mapping Luna repair work onto persisted jobs, what a
+  replan does to jobs from the superseded plan (`superseded` does not exist
+  yet), orphaned staging cleanup (deferred deliberately, not overlooked), and
   eventually a real process boundary (workers as separate processes, not
   in-process handlers).
 

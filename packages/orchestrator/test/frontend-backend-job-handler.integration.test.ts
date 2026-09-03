@@ -1,9 +1,10 @@
 /**
- * The first production JobHandler, exercised through the real pipeline.
+ * The production frontend_backend JobHandler, exercised through the real
+ * pipeline — and, since Phase 5f, proven to stage rather than publish.
  *
  * Only the model boundary is faked: a `Provider` implementation, not
- * `@statxai/agents` itself, so `ModelClient`, `buildSite`, `buildAnchor`,
- * `routeBuild` and the shared `buildFromPlan` primitive all run for real.
+ * `@statxai/agents` itself, so `ModelClient`, `buildSite`, `routeBuild` and
+ * the shared `prepareBuildFromPlan` primitive all run for real.
  * `createTerraFrontendBackendHandler` is the actual production handler, not a
  * stub — proving that is most of what this file exists to do.
  *
@@ -16,11 +17,13 @@ import { join } from 'node:path';
 import { StateStore } from '@statxai/state';
 import { ArtifactRegistry, ProjectWorkspace } from '@statxai/workspace';
 import { ModelClient, type Provider, type ProviderRequest, type ProviderResponse } from '@statxai/agents';
-import { JobEngine, JobLeaseConflict, JobRunner } from '@statxai/job-engine';
+import { JobEngine, JobRunner, type JobHandler } from '@statxai/job-engine';
 import type { ArtifactRef, JobSpec, SitePlan } from '@statxai/contracts';
+import type { BuildCandidate } from '../src/phases/build.js';
 import { discoverProject } from '../src/phases/discover.js';
 import {
   createTerraFrontendBackendHandler,
+  frontendBackendCandidateName,
   FRONTEND_BACKEND_INPUT,
   FrontendBackendInputInvalid,
   FrontendBackendRoleMismatch,
@@ -130,7 +133,16 @@ function jobSpec(projectId: string, jobId: string, profileRef: ArtifactRef, plan
 }
 
 function handlerDeps(model: ModelClient, overrides: Partial<FrontendBackendHandlerDeps> = {}): FrontendBackendHandlerDeps {
-  return { store, registry, model, workspacesRoot, ...overrides };
+  return { registry, model, ...overrides };
+}
+
+/** Reads back a staged candidate exactly as the handler wrote it — never "latest", the one exact name. */
+async function readCandidate(projectId: string, jobId: string, attempt: number): Promise<BuildCandidate> {
+  return registry.get<BuildCandidate>(projectId, frontendBackendCandidateName(jobId, attempt));
+}
+
+async function candidateArtifactDoc(projectId: string, jobId: string, attempt: number) {
+  return store.artifacts.findOne({ projectId, name: frontendBackendCandidateName(jobId, attempt) });
 }
 
 // ---------------------------------------------------------------------------
@@ -236,26 +248,31 @@ class ManualScheduler {
   }
 }
 
+function runnerFor(model: ModelClient, workerId = 'terra-frontend-backend-1', overrides: Partial<{ now: () => Date; sleep: ManualScheduler['sleep']; leaseMs: number; heartbeatEveryMs: number }> = {}) {
+  return new JobRunner({
+    engine,
+    identity: { workerId, tier: 'terra' },
+    claimableRoles: ['frontend_backend'],
+    handlers: new Map([['frontend_backend', createTerraFrontendBackendHandler(handlerDeps(model))]]),
+    leaseMs: LEASE_MS,
+    heartbeatEveryMs: HEARTBEAT_MS,
+    now: () => T0,
+    sleep: new ManualScheduler().sleep,
+    ...overrides,
+  });
+}
+
 // ---------------------------------------------------------------------------
 
-describe('the real handler, run through JobRunner', () => {
-  it('builds the real site through the shared production primitive, and finishes validating', async () => {
+describe('the real handler stages, it does not publish', () => {
+  it('generates through the shared production primitive, stages the candidate, and finishes validating — without touching the canonical workspace', async () => {
     const projectId = 'proj_fb_lifecycle';
     const profileRef = await setupProject(projectId);
     const planRef = await putPlan(projectId, onePagePlan('lifecycle'));
     await engine.enqueue({ spec: jobSpec(projectId, 'job_fb_1', profileRef, planRef), origin: { kind: 'plan' } });
 
     const model = routingModel(() => buildOutput([{ path: 'app/page.tsx', contents: 'export default function Home(){return null}' }]));
-    const runner = new JobRunner({
-      engine,
-      identity: { workerId: 'terra-frontend-backend-1', tier: 'terra' },
-      claimableRoles: ['frontend_backend'],
-      handlers: new Map([['frontend_backend', createTerraFrontendBackendHandler(handlerDeps(model))]]),
-      leaseMs: LEASE_MS,
-      heartbeatEveryMs: HEARTBEAT_MS,
-      now: () => T0,
-      sleep: new ManualScheduler().sleep,
-    });
+    const runner = runnerFor(model);
 
     const result = await runner.runOnce({ projectId });
     expect(result).toEqual({ kind: 'submitted', jobId: 'job_fb_1', role: 'frontend_backend', attempt: 1 });
@@ -265,19 +282,29 @@ describe('the real handler, run through JobRunner', () => {
     expect(job?.lease).toBeNull();
     expect(job?.state).not.toBe('accepted');
 
-    // The real output of the real build primitive: a file on disk, written by
-    // ProjectWorkspace.writeSiteFiles, not a value invented by this test.
-    const ws = await ProjectWorkspace.open(projectId, workspacesRoot);
-    // ProjectWorkspace.siteRoot is itself a Next.js project root (scaffolded
-    // by scaffoldSite), so a generated file's path — "app/page.tsx", exactly
-    // what routeToSourcePath('/') gives real Terra — is relative to *that*,
-    // landing at <siteRoot>/app/page.tsx.
-    expect(await ws.readSiteFile('app/page.tsx')).toBe('export default function Home(){return null}');
-    expect(await ws.currentCommit()).not.toBeNull();
+    // Real generation: the staged candidate carries Sol's actual routing
+    // decision and Terra's actual generated file, from the shared primitive —
+    // not a value this test invented directly.
+    expect(job?.executionOutputs).toMatchObject([{ name: frontendBackendCandidateName('job_fb_1', 1), version: 1 }]);
+    const candidate = await readCandidate(projectId, 'job_fb_1', 1);
+    expect(candidate.routeDecisions).toHaveLength(1);
+    expect(candidate.routeDecisions[0]!.strategy).toBe('one_shot');
+    expect(candidate.files).toEqual([{ path: 'app/page.tsx', contents: 'export default function Home(){return null}' }]);
 
-    // The route decision Sol actually made is on record too.
-    const routeDecision = await registry.get<{ strategy: string }>(projectId, 'route-decision');
-    expect(routeDecision.strategy).toBe('one_shot');
+    // Staged, not published: unaccepted, and no canonical route-decision
+    // artifact exists at all — the handler never calls persistRouteDecision.
+    const stagedDoc = await candidateArtifactDoc(projectId, 'job_fb_1', 1);
+    expect(stagedDoc?.acceptedAt).toBeNull();
+    await expect(registry.get(projectId, 'route-decision')).rejects.toThrow();
+
+    // The canonical project workspace is never opened, let alone written to,
+    // by this handler: no commit exists, and the handler never even
+    // scaffolded it (only buildFromPlan's direct path does that), so the
+    // generated file was never written there at all — not merely
+    // overwritten with different content.
+    const ws = await ProjectWorkspace.open(projectId, workspacesRoot);
+    expect(await ws.currentCommit()).toBeNull();
+    await expect(ws.readSiteFile('app/page.tsx')).rejects.toThrow();
   });
 
   it('rejects a job whose role is not frontend_backend, without touching the job', async () => {
@@ -334,16 +361,7 @@ describe('pinned means pinned', () => {
       seenPrompts.push(request.prompt);
       return buildOutput([{ path: 'app/page.tsx', contents: 'from-v1' }]);
     });
-    const runner = new JobRunner({
-      engine,
-      identity: { workerId: 'terra-frontend-backend-1', tier: 'terra' },
-      claimableRoles: ['frontend_backend'],
-      handlers: new Map([['frontend_backend', createTerraFrontendBackendHandler(handlerDeps(model))]]),
-      leaseMs: LEASE_MS,
-      heartbeatEveryMs: HEARTBEAT_MS,
-      now: () => T0,
-      sleep: new ManualScheduler().sleep,
-    });
+    const runner = runnerFor(model);
 
     const result = await runner.runOnce({ projectId });
     expect(result.kind).toBe('submitted');
@@ -356,7 +374,7 @@ describe('pinned means pinned', () => {
 });
 
 describe('a real build failure at the model boundary', () => {
-  it('reports it through fail(), preserving retry, and writes no validating transition', async () => {
+  it('reports it through fail(), preserving retry, and attaches no output', async () => {
     const projectId = 'proj_fb_build_fails';
     const profileRef = await setupProject(projectId);
     const planRef = await putPlan(projectId, onePagePlan('fails'));
@@ -369,16 +387,7 @@ describe('a real build failure at the model boundary', () => {
     const model = routingModel(() => {
       throw new Error('terra build rejected: output did not satisfy the schema');
     });
-    const runner = new JobRunner({
-      engine,
-      identity: { workerId: 'terra-frontend-backend-1', tier: 'terra' },
-      claimableRoles: ['frontend_backend'],
-      handlers: new Map([['frontend_backend', createTerraFrontendBackendHandler(handlerDeps(model))]]),
-      leaseMs: LEASE_MS,
-      heartbeatEveryMs: HEARTBEAT_MS,
-      now: () => T0,
-      sleep: new ManualScheduler().sleep,
-    });
+    const runner = runnerFor(model);
 
     const result = await runner.runOnce({ projectId });
     expect(result).toEqual({ kind: 'handler_failed', jobId: 'job_fb_fail', jobState: 'ready', attempt: 1 });
@@ -386,6 +395,7 @@ describe('a real build failure at the model boundary', () => {
     const job = await store.jobs.findOne({ _id: 'job_fb_fail' });
     expect(job?.state).toBe('ready');
     expect(job?.failure?.message).toContain('terra build rejected');
+    expect(job?.executionOutputs ?? null).toBeNull();
 
     const events = await store.auditLog.find({ jobId: 'job_fb_fail' }).sort({ at: 1 }).toArray();
     expect(events.map((e) => e.detail['to'])).not.toContain('validating');
@@ -404,16 +414,7 @@ describe('a real build failure at the model boundary', () => {
     const model = routingModel(() => {
       throw new Error('terra build rejected again');
     });
-    const runner = new JobRunner({
-      engine,
-      identity: { workerId: 'terra-frontend-backend-1', tier: 'terra' },
-      claimableRoles: ['frontend_backend'],
-      handlers: new Map([['frontend_backend', createTerraFrontendBackendHandler(handlerDeps(model))]]),
-      leaseMs: LEASE_MS,
-      heartbeatEveryMs: HEARTBEAT_MS,
-      now: () => T0,
-      sleep: new ManualScheduler().sleep,
-    });
+    const runner = runnerFor(model);
 
     const result = await runner.runOnce({ projectId });
     expect(result).toEqual({ kind: 'handler_failed', jobId: 'job_fb_fail_2', jobState: 'failed', attempt: 1 });
@@ -421,8 +422,11 @@ describe('a real build failure at the model boundary', () => {
   });
 });
 
-describe('authority loss prevents durable stale output', () => {
-  it('does not persist site files generated after the lease was lost mid-build', async () => {
+describe('authority loss prevents durable stale publication', () => {
+  it('a same-worker stale attempt that finishes staging after being superseded cannot publish', async () => {
+    // The mandatory Phase 5f scenario: not a different worker id, but the
+    // exact same fixed identity reclaiming its own job — the case workerId
+    // alone was never able to distinguish.
     const projectId = 'proj_fb_authority_loss';
     const profileRef = await setupProject(projectId);
     const planRef = await putPlan(projectId, onePagePlan('stale'));
@@ -456,51 +460,152 @@ describe('authority loss prevents durable stale output', () => {
     // "in flight", the same state a real Terra call would leave it in.
     await waitUntil(() => terraBuildCallStarted && scheduler.pendingCount() > 0);
 
-    const beforeCommit = await (await ProjectWorkspace.open(projectId, workspacesRoot)).currentCommit();
-
-    // The reaper reclaims the lease, and a second compatible worker takes the
-    // job over — exactly the window Phase 5a's guard exists for.
+    // The SAME fixed identity reclaims its own job — a restarted or
+    // reconnected worker process presenting the same workerId, exactly the
+    // shape workerId alone cannot tell apart from the execution it replaced.
     clock.advance(LEASE_MS + 1);
     expect(await engine.reclaimExpiredLeases(clock.now())).toBe(1);
-    const replacement = await engine.claim('terra-frontend-backend-2', 'terra', {
+    const replacement = await engine.claim('terra-frontend-backend-1', 'terra', {
       roles: ['frontend_backend'],
       now: clock.now(),
       leaseMs: LEASE_MS,
     });
     expect(replacement?._id).toBe('job_fb_stale');
+    expect(replacement?.attempt).toBe(2);
 
-    // Wake the heartbeat: it calls the real JobEngine.heartbeat, a genuine
-    // Mongo round trip this test cannot directly await (it happens inside
-    // JobRunner's private execute()). scheduler.tick() only releases the
-    // sleep that precedes that call; a short real wait is what lets it
-    // actually finish — and so lets the runner actually abort the handler's
-    // signal — before the "model" is allowed to answer. Resolving the gate
-    // first would race the abort and could let a stale write through on
-    // this very test's own machine, which is the failure mode this test
-    // exists to catch in production.
+    // Wake the heartbeat and let its real Mongo round trip land before the
+    // "model" is allowed to answer — see the identical comment in job-engine's
+    // own runner tests for why this matters.
     await scheduler.tick();
     await new Promise((resolve) => setTimeout(resolve, 50));
-    buildGate.resolve(buildOutput([{ path: 'app/page.tsx', contents: 'STALE — must never land' }]));
+    buildGate.resolve(buildOutput([{ path: 'app/page.tsx', contents: 'STALE — must never publish' }]));
 
     const result = await resultPromise;
     expect(result).toEqual({ kind: 'authority_lost', jobId: 'job_fb_stale', reason: 'heartbeat_lost' });
 
-    // The critical assertion: the stale generated content never reached disk.
-    // app/page.tsx exists regardless — it ships with the scaffolded Next.js
-    // template — so the proof is its *content*, not its presence.
-    const ws = await ProjectWorkspace.open(projectId, workspacesRoot);
-    expect(await ws.readSiteFile('app/page.tsx')).not.toContain('STALE');
-    expect(await ws.currentCommit()).toBe(beforeCommit);
-
-    // Runner A neither submitted nor failed; the replacement is untouched.
+    // The stale attempt's own staging namespace may hold orphan garbage —
+    // that is allowed — but it must never become this job's output.
     const job = await store.jobs.findOne({ _id: 'job_fb_stale' });
     expect(job?.state).toBe('running');
-    expect(job?.lease?.holder).toBe('terra-frontend-backend-2');
     expect(job?.attempt).toBe(2);
+    expect(job?.lease?.holder).toBe('terra-frontend-backend-1');
+    expect(job?.executionOutputs ?? null).toBeNull();
     expect(job?.failure ?? null).toBeNull();
 
-    await expect(
-      engine.submitForValidation('job_fb_stale', 'terra-frontend-backend-1', { now: clock.now() }),
-    ).rejects.toBeInstanceOf(JobLeaseConflict);
+    // Canonical resolution is untouched either way: nothing was ever staged
+    // under attempt 1 (the handler never reached that line — it was still
+    // waiting on the model when authority was lost), and nothing under
+    // attempt 2 either, since the runner never even claimed a token for a
+    // *second* execution of this handler in this test.
+    await expect(registry.get(projectId, frontendBackendCandidateName('job_fb_stale', 1))).rejects.toThrow();
+
+    const ws = await ProjectWorkspace.open(projectId, workspacesRoot);
+    expect(await ws.currentCommit()).toBeNull();
+  });
+
+  it('retried attempts stage to distinct namespaces; the failed attempt’s candidate is never attached', async () => {
+    // Attempt 1 fails at the model boundary and retries; attempt 2 succeeds.
+    // Proves candidate identity is attempt-scoped, not merely job-scoped, and
+    // that "the job's output" always means the attempt that actually validated.
+    const projectId = 'proj_fb_retry_isolation';
+    const profileRef = await setupProject(projectId);
+    const planRef = await putPlan(projectId, onePagePlan('retry'));
+    await engine.enqueue({
+      spec: jobSpec(projectId, 'job_fb_retry', profileRef, planRef),
+      origin: { kind: 'plan' },
+      maxAttempts: 2,
+    });
+
+    let call = 0;
+    const model = routingModel(() => {
+      call += 1;
+      if (call === 1) throw new Error('attempt 1: terra build rejected');
+      return buildOutput([{ path: 'app/page.tsx', contents: 'attempt-2 content' }]);
+    });
+    const runner = runnerFor(model);
+
+    const first = await runner.runOnce({ projectId });
+    expect(first).toEqual({ kind: 'handler_failed', jobId: 'job_fb_retry', jobState: 'ready', attempt: 1 });
+
+    const second = await runner.runOnce({ projectId });
+    expect(second).toEqual({ kind: 'submitted', jobId: 'job_fb_retry', role: 'frontend_backend', attempt: 2 });
+
+    const job = await store.jobs.findOne({ _id: 'job_fb_retry' });
+    expect(job?.state).toBe('validating');
+    expect(job?.executionOutputs).toMatchObject([{ name: frontendBackendCandidateName('job_fb_retry', 2), version: 1 }]);
+
+    // Attempt 1 never reached staging (it failed inside prepare, before any
+    // candidate existed), so its namespace holds nothing at all — and even if
+    // it had, a different name is a different name.
+    await expect(registry.get(projectId, frontendBackendCandidateName('job_fb_retry', 1))).rejects.toThrow();
+    const attempt2Candidate = await readCandidate(projectId, 'job_fb_retry', 2);
+    expect(attempt2Candidate.files).toEqual([{ path: 'app/page.tsx', contents: 'attempt-2 content' }]);
+  });
+
+  it('an attempt whose staging completes after a newer attempt already validated still cannot become current', async () => {
+    // Both candidates genuinely exist, in this order — attempt 1 stages
+    // *after* attempt 2 has already validated — and canonical resolution
+    // (the job's own executionOutputs) must still name attempt 2. Not
+    // "whichever staged last": the guarded transition decides, not timing.
+    const projectId = 'proj_fb_ordering';
+    const profileRef = await setupProject(projectId);
+    const planRef = await putPlan(projectId, onePagePlan('ordering'));
+    await engine.enqueue({ spec: jobSpec(projectId, 'job_fb_order', profileRef, planRef), origin: { kind: 'plan' } });
+
+    const staleModel = routingModel(() => buildOutput([{ path: 'app/page.tsx', contents: 'stale content, staged last' }]));
+    const staleHandler = createTerraFrontendBackendHandler(handlerDeps(staleModel));
+
+    // Wraps the real handler: after it has finished staging its own
+    // candidate (attempt 1), and before returning, a second execution claims
+    // and validates the same job to completion under a *different* worker —
+    // simulating the job moving on while this execution was still working,
+    // without needing to race real timers to get both candidates to exist.
+    const wrappedStaleHandler: JobHandler = async (job, ctx) => {
+      const staged = await staleHandler(job, ctx);
+
+      const now = new Date(T0.getTime() + LEASE_MS + 1);
+      await engine.reclaimExpiredLeases(now);
+      const currentModel = routingModel(() => buildOutput([{ path: 'app/page.tsx', contents: 'current content' }]));
+      const currentRunner = new JobRunner({
+        engine,
+        identity: { workerId: 'terra-frontend-backend-2', tier: 'terra' },
+        claimableRoles: ['frontend_backend'],
+        handlers: new Map([['frontend_backend', createTerraFrontendBackendHandler(handlerDeps(currentModel))]]),
+        leaseMs: LEASE_MS,
+        heartbeatEveryMs: HEARTBEAT_MS,
+        now: () => now,
+        sleep: new ManualScheduler().sleep,
+      });
+      const currentResult = await currentRunner.runOnce({ projectId });
+      expect(currentResult).toEqual({ kind: 'submitted', jobId: 'job_fb_order', role: 'frontend_backend', attempt: 2 });
+
+      return staged;
+    };
+
+    const staleRunner = new JobRunner({
+      engine,
+      identity: { workerId: 'terra-frontend-backend-1', tier: 'terra' },
+      claimableRoles: ['frontend_backend'],
+      handlers: new Map([['frontend_backend', wrappedStaleHandler]]),
+      leaseMs: LEASE_MS,
+      heartbeatEveryMs: HEARTBEAT_MS,
+      now: () => T0,
+      sleep: new ManualScheduler().sleep,
+    });
+
+    const staleResult = await staleRunner.runOnce({ projectId });
+    expect(staleResult).toEqual({ kind: 'authority_lost', jobId: 'job_fb_order', reason: 'transition_conflict' });
+
+    // Both candidates now physically exist, staged in this exact order.
+    // Canonical resolution — the job's own attached output — is still
+    // attempt 2's.
+    const job = await store.jobs.findOne({ _id: 'job_fb_order' });
+    expect(job?.state).toBe('validating');
+    expect(job?.executionOutputs).toMatchObject([{ name: frontendBackendCandidateName('job_fb_order', 2), version: 1 }]);
+
+    const staleCandidate = await readCandidate(projectId, 'job_fb_order', 1); // orphaned, but present
+    expect(staleCandidate.files).toEqual([{ path: 'app/page.tsx', contents: 'stale content, staged last' }]);
+    const current = await readCandidate(projectId, 'job_fb_order', 2);
+    expect(current.files).toEqual([{ path: 'app/page.tsx', contents: 'current content' }]);
   });
 });

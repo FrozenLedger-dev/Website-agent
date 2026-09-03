@@ -1,7 +1,14 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { AgentTier, JobSpec, WorkerRole } from '@statxai/contracts';
 import { StateStore } from '@statxai/state';
-import { InvalidClaimRoles, JobEngine, JobLeaseConflict, JobNotFound, JobStateConflict } from '../src/index.js';
+import {
+  InvalidClaimRoles,
+  JobAttemptConflict,
+  JobEngine,
+  JobLeaseConflict,
+  JobNotFound,
+  JobStateConflict,
+} from '../src/index.js';
 
 const PROJECT = 'proj_engine_test';
 
@@ -236,7 +243,7 @@ describe('dependency graph', () => {
     expect(first?._id).toBe('job_base');
     expect(await engine.claim('worker-2', TERRA)).toBeNull();
 
-    await engine.submitForValidation('job_base', 'worker-1');
+    await engine.submitForValidation('job_base', 'worker-1', first!.attempt);
     await engine.accept('job_base', 'harness:validator');
 
     const second = await engine.claim('worker-2', TERRA);
@@ -249,10 +256,11 @@ describe('output conflict serialisation', () => {
     await engine.enqueue({ spec: spec('job_x', ['src/shared.tsx']), origin: { kind: 'plan' } });
     await engine.enqueue({ spec: spec('job_y', ['src/shared.tsx', 'src/other.tsx']), origin: { kind: 'plan' } });
 
-    expect((await engine.claim('worker-1', TERRA))?._id).toBe('job_x');
+    const x = await engine.claim('worker-1', TERRA);
+    expect(x?._id).toBe('job_x');
     expect(await engine.claim('worker-2', TERRA)).toBeNull();
 
-    await engine.submitForValidation('job_x', 'worker-1');
+    await engine.submitForValidation('job_x', 'worker-1', x!.attempt);
     await engine.accept('job_x', 'harness:validator');
     expect((await engine.claim('worker-2', TERRA))?._id).toBe('job_y');
   });
@@ -277,20 +285,21 @@ describe('lifecycle', () => {
   it('retries a failed job while attempts remain, then gives up', async () => {
     await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' }, maxAttempts: 2 });
 
-    await engine.claim('worker-1', TERRA);
-    const first = await engine.fail('job_a', 'build error', 'worker-1');
+    const firstClaim = await engine.claim('worker-1', TERRA);
+    const first = await engine.fail('job_a', 'build error', 'worker-1', firstClaim!.attempt);
     expect(first.state).toBe('ready');
 
-    await engine.claim('worker-1', TERRA);
-    const second = await engine.fail('job_a', 'build error again', 'worker-1');
+    const secondClaim = await engine.claim('worker-1', TERRA);
+    expect(secondClaim?.attempt).toBe(2);
+    const second = await engine.fail('job_a', 'build error again', 'worker-1', secondClaim!.attempt);
     expect(second.state).toBe('failed');
     expect(second.attempt).toBe(2);
   });
 
   it('records every transition in the audit log', async () => {
     await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
-    await engine.claim('worker-1', TERRA);
-    await engine.submitForValidation('job_a', 'worker-1');
+    const claim = await engine.claim('worker-1', TERRA);
+    await engine.submitForValidation('job_a', 'worker-1', claim!.attempt);
     await engine.accept('job_a', 'harness:validator');
 
     const events = await store.auditLog.find({ jobId: 'job_a' }).sort({ at: 1 }).toArray();
@@ -319,10 +328,10 @@ describe('lease reclamation', () => {
 
   it('refuses a heartbeat from a worker that lost its lease', async () => {
     await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
-    await engine.claim('worker-1', TERRA, { leaseMs: 1 });
+    const claim = await engine.claim('worker-1', TERRA, { leaseMs: 1 });
     await engine.reclaimExpiredLeases(new Date(Date.now() + 60_000));
 
-    expect(await engine.heartbeat('job_a', 'worker-1')).toBe(false);
+    expect(await engine.heartbeat('job_a', 'worker-1', claim!.attempt)).toBe(false);
   });
 });
 
@@ -345,6 +354,8 @@ describe('lease authority over a running job', () => {
   const AFTER = new Date(T0.getTime() + LEASE_MS + 1);
   /** The instant it ends. */
   const AT_EXPIRY = new Date(T0.getTime() + LEASE_MS);
+  /** worker-1's attempt throughout this block: always its first (and only, unless noted) claim. */
+  const ATTEMPT_1 = 1;
 
   const claimed = async (jobId = 'job_a', worker = 'worker-1', now = T0) => {
     await engine.enqueue({ spec: spec(jobId, [`src/${jobId}.tsx`]), origin: { kind: 'plan' } });
@@ -359,7 +370,7 @@ describe('lease authority over a running job', () => {
   describe('the worker that holds it', () => {
     it('may submit its finished work', async () => {
       await claimed();
-      const submitted = await engine.submitForValidation('job_a', 'worker-1', {
+      const submitted = await engine.submitForValidation('job_a', 'worker-1', ATTEMPT_1, {
         now: new Date(T0.getTime() + 1000),
       });
 
@@ -371,7 +382,7 @@ describe('lease authority over a running job', () => {
       const job = await claimed();
       expect(job.attempt).toBe(1);
 
-      const after = await engine.fail('job_a', 'build error', 'worker-1', {
+      const after = await engine.fail('job_a', 'build error', 'worker-1', ATTEMPT_1, {
         now: new Date(T0.getTime() + 1000),
       });
 
@@ -387,7 +398,7 @@ describe('lease authority over a running job', () => {
       await claimed();
 
       await expect(
-        engine.submitForValidation('job_a', 'worker-1', { now: AFTER }),
+        engine.submitForValidation('job_a', 'worker-1', ATTEMPT_1, { now: AFTER }),
       ).rejects.toBeInstanceOf(JobLeaseConflict);
 
       const job = await store.jobs.findOne({ _id: 'job_a' });
@@ -399,7 +410,7 @@ describe('lease authority over a running job', () => {
       await claimed();
 
       await expect(
-        engine.fail('job_a', 'late failure', 'worker-1', { now: AFTER }),
+        engine.fail('job_a', 'late failure', 'worker-1', ATTEMPT_1, { now: AFTER }),
       ).rejects.toBeInstanceOf(JobLeaseConflict);
 
       const job = await store.jobs.findOne({ _id: 'job_a' });
@@ -409,7 +420,7 @@ describe('lease authority over a running job', () => {
 
     it('may not extend a lease it no longer has', async () => {
       await claimed();
-      expect(await engine.heartbeat('job_a', 'worker-1', LEASE_MS, { now: AFTER })).toBe(false);
+      expect(await engine.heartbeat('job_a', 'worker-1', ATTEMPT_1, LEASE_MS, { now: AFTER })).toBe(false);
 
       const job = await store.jobs.findOne({ _id: 'job_a' });
       expect(job?.lease?.expiresAt.getTime()).toBe(T0.getTime() + LEASE_MS);
@@ -421,9 +432,9 @@ describe('lease authority over a running job', () => {
       // an instant where a lease is too dead to use and too alive to reclaim.
       await claimed();
 
-      expect(await engine.heartbeat('job_a', 'worker-1', LEASE_MS, { now: AT_EXPIRY })).toBe(false);
+      expect(await engine.heartbeat('job_a', 'worker-1', ATTEMPT_1, LEASE_MS, { now: AT_EXPIRY })).toBe(false);
       await expect(
-        engine.submitForValidation('job_a', 'worker-1', { now: AT_EXPIRY }),
+        engine.submitForValidation('job_a', 'worker-1', ATTEMPT_1, { now: AT_EXPIRY }),
       ).rejects.toBeInstanceOf(JobLeaseConflict);
       expect(await engine.reclaimExpiredLeases(AT_EXPIRY)).toBe(1);
     });
@@ -432,7 +443,7 @@ describe('lease authority over a running job', () => {
       await claimed();
       const justBefore = new Date(T0.getTime() + LEASE_MS - 1);
 
-      expect(await engine.heartbeat('job_a', 'worker-1', LEASE_MS, { now: justBefore })).toBe(true);
+      expect(await engine.heartbeat('job_a', 'worker-1', ATTEMPT_1, LEASE_MS, { now: justBefore })).toBe(true);
       expect(await engine.reclaimExpiredLeases(justBefore)).toBe(0);
     });
   });
@@ -452,7 +463,7 @@ describe('lease authority over a running job', () => {
       await superseded();
 
       await expect(
-        engine.submitForValidation('job_a', 'worker-1', { now: AFTER }),
+        engine.submitForValidation('job_a', 'worker-1', ATTEMPT_1, { now: AFTER }),
       ).rejects.toBeInstanceOf(JobLeaseConflict);
 
       const job = await store.jobs.findOne({ _id: 'job_a' });
@@ -467,7 +478,7 @@ describe('lease authority over a running job', () => {
       const before = await superseded();
 
       await expect(
-        engine.fail('job_a', 'late failure from the old worker', 'worker-1', { now: AFTER }),
+        engine.fail('job_a', 'late failure from the old worker', 'worker-1', ATTEMPT_1, { now: AFTER }),
       ).rejects.toBeInstanceOf(JobLeaseConflict);
 
       const after = await store.jobs.findOne({ _id: 'job_a' });
@@ -484,10 +495,10 @@ describe('lease authority over a running job', () => {
       const before = await transitions('job_a');
 
       await expect(
-        engine.submitForValidation('job_a', 'worker-1', { now: AFTER }),
+        engine.submitForValidation('job_a', 'worker-1', ATTEMPT_1, { now: AFTER }),
       ).rejects.toBeInstanceOf(JobLeaseConflict);
       await expect(
-        engine.fail('job_a', 'late failure', 'worker-1', { now: AFTER }),
+        engine.fail('job_a', 'late failure', 'worker-1', ATTEMPT_1, { now: AFTER }),
       ).rejects.toBeInstanceOf(JobLeaseConflict);
 
       expect(await transitions('job_a')).toBe(before);
@@ -495,7 +506,7 @@ describe('lease authority over a running job', () => {
 
     it('does not stop the new holder finishing', async () => {
       await superseded();
-      const submitted = await engine.submitForValidation('job_a', 'worker-2', { now: AFTER });
+      const submitted = await engine.submitForValidation('job_a', 'worker-2', 2, { now: AFTER });
       expect(submitted.state).toBe('validating');
     });
   });
@@ -504,13 +515,13 @@ describe('lease authority over a running job', () => {
     it('may not submit', async () => {
       await claimed();
       await expect(
-        engine.submitForValidation('job_a', 'worker-9', { now: T0 }),
+        engine.submitForValidation('job_a', 'worker-9', ATTEMPT_1, { now: T0 }),
       ).rejects.toBeInstanceOf(JobLeaseConflict);
     });
 
     it('may not heartbeat', async () => {
       await claimed();
-      expect(await engine.heartbeat('job_a', 'worker-9', LEASE_MS, { now: T0 })).toBe(false);
+      expect(await engine.heartbeat('job_a', 'worker-9', ATTEMPT_1, LEASE_MS, { now: T0 })).toBe(false);
     });
   });
 
@@ -519,20 +530,20 @@ describe('lease authority over a running job', () => {
       // Different facts. "The job moved on" may be retryable; "you lost it"
       // means someone else is doing the work and this worker must stop.
       await claimed();
-      await engine.submitForValidation('job_a', 'worker-1', { now: T0 });
+      await engine.submitForValidation('job_a', 'worker-1', ATTEMPT_1, { now: T0 });
 
       // Now validating, so a running-owned operation is a state conflict.
       await expect(
-        engine.submitForValidation('job_a', 'worker-1', { now: T0 }),
+        engine.submitForValidation('job_a', 'worker-1', ATTEMPT_1, { now: T0 }),
       ).rejects.toBeInstanceOf(JobStateConflict);
 
       await claimed('job_b');
       await expect(
-        engine.submitForValidation('job_b', 'worker-9', { now: T0 }),
+        engine.submitForValidation('job_b', 'worker-9', ATTEMPT_1, { now: T0 }),
       ).rejects.toBeInstanceOf(JobLeaseConflict);
 
       await expect(
-        engine.submitForValidation('job_missing', 'worker-1', { now: T0 }),
+        engine.submitForValidation('job_missing', 'worker-1', ATTEMPT_1, { now: T0 }),
       ).rejects.toBeInstanceOf(JobNotFound);
     });
 
@@ -542,7 +553,7 @@ describe('lease authority over a running job', () => {
       await engine.claim('worker-2', TERRA, { leaseMs: LEASE_MS, now: AFTER });
 
       await expect(
-        engine.submitForValidation('job_a', 'worker-1', { now: AFTER }),
+        engine.submitForValidation('job_a', 'worker-1', ATTEMPT_1, { now: AFTER }),
       ).rejects.toThrow(/held by worker-2/);
     });
   });
@@ -551,15 +562,170 @@ describe('lease authority over a running job', () => {
     it('needs no lease, because submission already cleared it', async () => {
       // The harness rejecting finished work is not a worker reporting its own
       // failure. Requiring a lease here would make validation impossible.
+      // `attempt` is accepted but unused on this branch — there is no lease
+      // left to fence.
       await claimed();
-      await engine.submitForValidation('job_a', 'worker-1', { now: T0 });
+      await engine.submitForValidation('job_a', 'worker-1', ATTEMPT_1, { now: T0 });
 
-      const failed = await engine.fail('job_a', 'gates rejected it', 'harness:validator', {
+      const failed = await engine.fail('job_a', 'gates rejected it', 'harness:validator', ATTEMPT_1, {
         now: new Date(T0.getTime() + 1000),
       });
 
       expect(failed.state).toBe('ready');
       expect(failed.failure?.message).toBe('gates rejected it');
+    });
+  });
+
+  /**
+   * Phase 5f. `lease.holder` alone cannot tell a stale execution of this
+   * job apart from the current one when both happen to share the same fixed
+   * `workerId` — the shape a `JobRunner` always claims under. `attempt` is
+   * what closes that gap: a later claim of the same job always has a larger
+   * one (`claim()`'s own `$inc`, never decremented), so it is reused as the
+   * execution's generation token rather than inventing a second counter.
+   */
+  describe('same worker, later attempt of its own job', () => {
+    /** worker-1 loses `job_a` to the reaper, then reclaims it — as itself. */
+    const sameWorkerReclaim = async () => {
+      await claimed();
+      expect(await engine.reclaimExpiredLeases(AFTER)).toBe(1);
+      const second = await engine.claim('worker-1', TERRA, { leaseMs: LEASE_MS, now: AFTER });
+      expect(second?.lease?.holder).toBe('worker-1');
+      expect(second?.attempt).toBe(2);
+      return second!;
+    };
+
+    it('a heartbeat from the stale attempt does not extend the new attempt’s lease', async () => {
+      const current = await sameWorkerReclaim();
+
+      expect(await engine.heartbeat('job_a', 'worker-1', ATTEMPT_1, LEASE_MS, { now: AFTER })).toBe(false);
+
+      const job = await store.jobs.findOne({ _id: 'job_a' });
+      expect(job?.attempt).toBe(2);
+      expect(job?.lease?.expiresAt.getTime()).toBe(current.lease!.expiresAt.getTime());
+    });
+
+    it('a heartbeat from the current attempt still works', async () => {
+      await sameWorkerReclaim();
+      expect(await engine.heartbeat('job_a', 'worker-1', 2, LEASE_MS, { now: AFTER })).toBe(true);
+    });
+
+    it('a submit from the stale attempt is a JobAttemptConflict, not a JobLeaseConflict', async () => {
+      // Distinct from "someone else holds it": the same workerId holds it,
+      // just on a later generation. The error must say which.
+      await sameWorkerReclaim();
+
+      await expect(
+        engine.submitForValidation('job_a', 'worker-1', ATTEMPT_1, { now: AFTER }),
+      ).rejects.toBeInstanceOf(JobAttemptConflict);
+
+      const job = await store.jobs.findOne({ _id: 'job_a' });
+      expect(job?.state).toBe('running');
+      expect(job?.attempt).toBe(2);
+    });
+
+    it('a submit from the current attempt still works', async () => {
+      await sameWorkerReclaim();
+      const submitted = await engine.submitForValidation('job_a', 'worker-1', 2, { now: AFTER });
+      expect(submitted.state).toBe('validating');
+    });
+
+    it('a running-fail from the stale attempt is rejected and touches nothing about the current one', async () => {
+      const current = await sameWorkerReclaim();
+
+      await expect(
+        engine.fail('job_a', 'stale failure', 'worker-1', ATTEMPT_1, { now: AFTER }),
+      ).rejects.toBeInstanceOf(JobAttemptConflict);
+
+      const job = await store.jobs.findOne({ _id: 'job_a' });
+      expect(job?.state).toBe('running');
+      expect(job?.attempt).toBe(2);
+      expect(job?.failure ?? null).toBeNull();
+      expect(job?.lease?.holder).toBe('worker-1');
+      expect(job?.lease?.expiresAt.getTime()).toBe(current.lease!.expiresAt.getTime());
+    });
+
+    it('a running-fail from the current attempt still works', async () => {
+      await sameWorkerReclaim();
+      const failed = await engine.fail('job_a', 'real failure', 'worker-1', 2, { now: AFTER });
+      expect(['ready', 'failed']).toContain(failed.state);
+    });
+
+    it('leaves zero transition audit for every rejected stale operation', async () => {
+      await sameWorkerReclaim();
+      const before = await transitions('job_a');
+
+      await expect(
+        engine.submitForValidation('job_a', 'worker-1', ATTEMPT_1, { now: AFTER }),
+      ).rejects.toBeInstanceOf(JobAttemptConflict);
+      await expect(
+        engine.fail('job_a', 'stale', 'worker-1', ATTEMPT_1, { now: AFTER }),
+      ).rejects.toBeInstanceOf(JobAttemptConflict);
+      await engine.heartbeat('job_a', 'worker-1', ATTEMPT_1, LEASE_MS, { now: AFTER });
+
+      expect(await transitions('job_a')).toBe(before);
+    });
+
+    it('the current attempt’s lease is byte-for-byte unchanged after every stale operation is rejected', async () => {
+      const current = await sameWorkerReclaim();
+      const snapshot = {
+        state: current.state,
+        attempt: current.attempt,
+        holder: current.lease?.holder,
+        expiresAt: current.lease?.expiresAt.getTime(),
+        failure: current.failure,
+      };
+
+      await engine.heartbeat('job_a', 'worker-1', ATTEMPT_1, LEASE_MS, { now: AFTER });
+      await expect(
+        engine.submitForValidation('job_a', 'worker-1', ATTEMPT_1, { now: AFTER }),
+      ).rejects.toBeInstanceOf(JobAttemptConflict);
+      await expect(
+        engine.fail('job_a', 'stale', 'worker-1', ATTEMPT_1, { now: AFTER }),
+      ).rejects.toBeInstanceOf(JobAttemptConflict);
+
+      const job = await store.jobs.findOne({ _id: 'job_a' });
+      expect(job?.state).toBe(snapshot.state);
+      expect(job?.attempt).toBe(snapshot.attempt);
+      expect(job?.lease?.holder).toBe(snapshot.holder);
+      expect(job?.lease?.expiresAt.getTime()).toBe(snapshot.expiresAt);
+      expect(job?.failure ?? null).toEqual(snapshot.failure);
+    });
+  });
+
+  describe('output refs attach atomically with the guarded submit', () => {
+    it('attaches exactly the staged refs in the same transition that moves to validating', async () => {
+      const job = await claimed();
+      const outputs = [{ name: 'job-output/job_a/1/candidate', version: 1 }];
+
+      const submitted = await engine.submitForValidation('job_a', 'worker-1', job.attempt, { now: T0, outputs });
+
+      expect(submitted.state).toBe('validating');
+      expect(submitted.executionOutputs).toEqual(outputs);
+
+      const stored = await store.jobs.findOne({ _id: 'job_a' });
+      expect(stored?.executionOutputs).toEqual(outputs);
+    });
+
+    it('a rejected stale submit attaches nothing, even when it tries to pass outputs', async () => {
+      await claimed();
+      expect(await engine.reclaimExpiredLeases(AFTER)).toBe(1);
+      await engine.claim('worker-1', TERRA, { leaseMs: LEASE_MS, now: AFTER }); // attempt 2, same worker
+
+      const staleOutputs = [{ name: 'job-output/job_a/1/stale', version: 1 }];
+      await expect(
+        engine.submitForValidation('job_a', 'worker-1', ATTEMPT_1, { now: AFTER, outputs: staleOutputs }),
+      ).rejects.toBeInstanceOf(JobAttemptConflict);
+
+      const job = await store.jobs.findOne({ _id: 'job_a' });
+      expect(job?.state).toBe('running');
+      expect(job?.executionOutputs ?? null).toBeNull();
+    });
+
+    it('omitting outputs leaves executionOutputs untouched — existing void handlers stay valid', async () => {
+      const job = await claimed();
+      const submitted = await engine.submitForValidation('job_a', 'worker-1', job.attempt, { now: T0 });
+      expect(submitted.executionOutputs ?? null).toBeNull();
     });
   });
 });

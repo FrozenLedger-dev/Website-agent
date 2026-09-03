@@ -3,10 +3,13 @@ import { rolesForTier, type JobOrigin, type JobSpec, type WorkerRole } from '@st
 import { StateStore } from '@statxai/state';
 import {
   DEFAULT_LEASE_MS,
+  InvalidJobOutputRefs,
   JobEngine,
   JobRunner,
   JobRunnerConfigError,
+  jobOutputNamespace,
   type JobHandler,
+  type JobHandlerResult,
   type JobWorkerIdentity,
 } from '../src/index.js';
 
@@ -136,6 +139,7 @@ class HeartbeatFailureEngine extends JobEngine {
   override async heartbeat(
     jobId: string,
     workerId: string,
+    attempt: number,
     leaseMs: number = DEFAULT_LEASE_MS,
     options: { now?: Date } = {},
   ): Promise<boolean> {
@@ -143,7 +147,7 @@ class HeartbeatFailureEngine extends JobEngine {
       this.armed = false;
       throw new Error('mongo unavailable');
     }
-    return super.heartbeat(jobId, workerId, leaseMs, options);
+    return super.heartbeat(jobId, workerId, attempt, leaseMs, options);
   }
 }
 
@@ -850,6 +854,282 @@ describe('stale execution cannot damage a replacement worker', () => {
     expect(job?.lease?.holder).toBe('terra-2');
     expect(job?.attempt).toBe(2);
     expect(job?.failure ?? null).toBeNull();
+  });
+});
+
+/**
+ * Phase 5f. `identity.workerId` alone is not execution authority — a
+ * `JobRunner` always claims under one fixed `workerId`, so if this same job's
+ * lease expires and this same runner (or a fresh process using the same
+ * identity) claims it back, `workerId` matches its own stale execution again.
+ * `attempt` — captured once from `claim()`'s own returned document, into a
+ * `JobExecutionToken`, and reused for every authority-bearing call this
+ * execution makes — is what tells the two apart.
+ */
+describe('execution-generation fencing', () => {
+  it('captures the claimed attempt once and reuses it for heartbeat, never rereading the job', async () => {
+    const clock = new ManualClock(T0);
+    const scheduler = new ManualScheduler();
+    const gate = deferred<void>();
+
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+
+    const runner = new JobRunner({
+      engine,
+      identity: TERRA_ID,
+      claimableRoles: TERRA_ALL_ROLES,
+      handlers: terraHandlers(async () => {
+        await gate.promise;
+      }),
+      leaseMs: LEASE_MS,
+      heartbeatEveryMs: HEARTBEAT_MS,
+      now: clock.now,
+      sleep: scheduler.sleep,
+    });
+
+    const resultPromise = runner.runOnce();
+    await waitUntil(() => scheduler.pendingCount() > 0);
+
+    const claimedDoc = await store.jobs.findOne({ _id: 'job_a' });
+    expect(claimedDoc?.attempt).toBe(1);
+
+    clock.advance(HEARTBEAT_MS);
+    await scheduler.tick();
+    await waitUntil(async () => (await store.jobs.findOne({ _id: 'job_a' }))?.updatedAt.getTime() !== claimedDoc?.updatedAt.getTime());
+
+    // The heartbeat succeeded — proof it used attempt 1 (the only attempt
+    // that has ever existed for this job so far), not something rereading
+    // the job could have gotten wrong in a busier scenario.
+    const afterHeartbeat = await store.jobs.findOne({ _id: 'job_a' });
+    expect(afterHeartbeat?.attempt).toBe(1);
+    expect(afterHeartbeat?.lease?.expiresAt.getTime()).toBe(clock.now().getTime() + LEASE_MS);
+
+    gate.resolve();
+    await resultPromise;
+  });
+
+  it('has no per-call way to override the attempt: runOnce’s options carry only a project scope', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+    const runner = new JobRunner({
+      engine,
+      identity: TERRA_ID,
+      claimableRoles: TERRA_ALL_ROLES,
+      handlers: terraHandlers(async () => {}),
+      leaseMs: LEASE_MS,
+      heartbeatEveryMs: HEARTBEAT_MS,
+      now: () => T0,
+      sleep: new ManualScheduler().sleep,
+    });
+
+    // Only reachable by bypassing the type system — runOnce's type has no
+    // `attempt` field at all. It must still do nothing.
+    const sneaky = { attempt: 999 } as unknown as { projectId?: string };
+    const result = await runner.runOnce(sneaky);
+    expect(result).toEqual({ kind: 'submitted', jobId: 'job_a', role: 'frontend_backend', attempt: 1 });
+  });
+
+  describe('the same fixed identity reclaims its own job', () => {
+    /**
+     * `terra-1` claims `job_a` (attempt 1), the lease expires, and `terra-1`
+     * — the same fixed identity, exactly what a restarted or reconnected
+     * worker process would present — claims its own job back as attempt 2.
+     * Everything below proves attempt 1 cannot act as attempt 2 merely
+     * because the workerId is identical.
+     */
+    const reclaimAsSameWorker = async (now: Date) => {
+      expect(await engine.reclaimExpiredLeases(now)).toBe(1);
+      const second = await engine.claim('terra-1', 'terra', { now, leaseMs: LEASE_MS });
+      expect(second?.lease?.holder).toBe('terra-1');
+      expect(second?.attempt).toBe(2);
+      return second!;
+    };
+
+    it('a stale attempt whose heartbeat wakes after the same worker reclaimed reports authority_lost, and the new attempt is untouched', async () => {
+      const clock = new ManualClock(T0);
+      const scheduler = new ManualScheduler();
+      let observedAbort = false;
+      const handlerDone = deferred<void>();
+
+      await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+
+      const runner = new JobRunner({
+        engine,
+        identity: TERRA_ID,
+        claimableRoles: TERRA_ALL_ROLES,
+        handlers: terraHandlers(
+          (_job, ctx) =>
+            new Promise((resolve) => {
+              const onAbort = () => {
+                observedAbort = true;
+                resolve();
+                handlerDone.resolve();
+              };
+              if (ctx.signal.aborted) onAbort();
+              else ctx.signal.addEventListener('abort', onAbort, { once: true });
+            }),
+        ),
+        leaseMs: LEASE_MS,
+        heartbeatEveryMs: HEARTBEAT_MS,
+        now: clock.now,
+        sleep: scheduler.sleep,
+      });
+
+      const resultPromise = runner.runOnce();
+      await waitUntil(() => scheduler.pendingCount() > 0);
+
+      clock.advance(LEASE_MS + 1);
+      const current = await reclaimAsSameWorker(clock.now());
+
+      await scheduler.tick();
+      await handlerDone.promise;
+      const result = await resultPromise;
+
+      // Before 5f this would have matched: lease.holder === 'terra-1' and the
+      // lease was live, because nothing distinguished attempt 1 from attempt
+      // 2. The result must be authority_lost, not a heartbeat that silently
+      // extended someone else's — its own later self's — lease.
+      expect(result).toEqual({ kind: 'authority_lost', jobId: 'job_a', reason: 'heartbeat_lost' });
+      expect(observedAbort).toBe(true);
+
+      const job = await store.jobs.findOne({ _id: 'job_a' });
+      expect(job?.attempt).toBe(2);
+      expect(job?.lease?.holder).toBe('terra-1');
+      expect(job?.lease?.expiresAt.getTime()).toBe(current.lease!.expiresAt.getTime());
+      expect(job?.failure ?? null).toBeNull();
+    });
+
+    it('a stale attempt’s submit — after the same worker reclaimed — is authority_lost and attaches no output', async () => {
+      await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+
+      const runner = new JobRunner({
+        engine,
+        identity: TERRA_ID,
+        claimableRoles: TERRA_ALL_ROLES,
+        handlers: terraHandlers(async (job): Promise<JobHandlerResult> => {
+          // Simulates the exact window the guarded submit exists for: this
+          // execution's own fixed identity reclaims the job while this
+          // execution is still "finishing" — same worker, later attempt.
+          await reclaimAsSameWorker(new Date(T0.getTime() + LEASE_MS + 1));
+          return {
+            outputs: [{ name: `${jobOutputNamespace(job._id, job.attempt)}candidate`, version: 1 }],
+          };
+        }),
+        leaseMs: LEASE_MS,
+        heartbeatEveryMs: HEARTBEAT_MS,
+        now: () => T0,
+        sleep: new ManualScheduler().sleep,
+      });
+
+      const result = await runner.runOnce();
+      expect(result).toEqual({ kind: 'authority_lost', jobId: 'job_a', reason: 'transition_conflict' });
+
+      const job = await store.jobs.findOne({ _id: 'job_a' });
+      expect(job?.state).toBe('running');
+      expect(job?.attempt).toBe(2);
+      expect(job?.executionOutputs ?? null).toBeNull();
+    });
+
+    it('a stale attempt’s handler failure — after the same worker reclaimed — is authority_lost, not a fail() against the new attempt', async () => {
+      await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' }, maxAttempts: 5 });
+
+      const runner = new JobRunner({
+        engine,
+        identity: TERRA_ID,
+        claimableRoles: TERRA_ALL_ROLES,
+        handlers: terraHandlers(async () => {
+          await reclaimAsSameWorker(new Date(T0.getTime() + LEASE_MS + 1));
+          throw new Error('stale handler blew up after losing the race to itself');
+        }),
+        leaseMs: LEASE_MS,
+        heartbeatEveryMs: HEARTBEAT_MS,
+        now: () => T0,
+        sleep: new ManualScheduler().sleep,
+      });
+
+      const result = await runner.runOnce();
+      expect(result).toEqual({ kind: 'authority_lost', jobId: 'job_a', reason: 'transition_conflict' });
+
+      const job = await store.jobs.findOne({ _id: 'job_a' });
+      expect(job?.state).toBe('running');
+      expect(job?.attempt).toBe(2);
+      expect(job?.failure ?? null).toBeNull();
+    });
+  });
+
+  describe('output refs, attached only through the guarded submit', () => {
+    it('a successful handler’s exact returned refs are attached, atomically with validating', async () => {
+      await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+      const runner = new JobRunner({
+        engine,
+        identity: TERRA_ID,
+        claimableRoles: TERRA_ALL_ROLES,
+        handlers: terraHandlers(async (job): Promise<JobHandlerResult> => ({
+          outputs: [{ name: `${jobOutputNamespace(job._id, job.attempt)}candidate`, version: 1 }],
+        })),
+        leaseMs: LEASE_MS,
+        heartbeatEveryMs: HEARTBEAT_MS,
+        now: () => T0,
+        sleep: new ManualScheduler().sleep,
+      });
+
+      const result = await runner.runOnce();
+      expect(result).toEqual({ kind: 'submitted', jobId: 'job_a', role: 'frontend_backend', attempt: 1 });
+
+      const job = await store.jobs.findOne({ _id: 'job_a' });
+      expect(job?.state).toBe('validating');
+      expect(job?.executionOutputs).toEqual([{ name: 'job-output/job_a/1/candidate', version: 1 }]);
+    });
+
+    it('a handler returning nothing leaves executionOutputs null — existing void handlers stay valid', async () => {
+      await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+      const runner = new JobRunner({
+        engine,
+        identity: TERRA_ID,
+        claimableRoles: TERRA_ALL_ROLES,
+        handlers: terraHandlers(async () => {}),
+        leaseMs: LEASE_MS,
+        heartbeatEveryMs: HEARTBEAT_MS,
+        now: () => T0,
+        sleep: new ManualScheduler().sleep,
+      });
+
+      await runner.runOnce();
+      const job = await store.jobs.findOne({ _id: 'job_a' });
+      expect(job?.executionOutputs ?? null).toBeNull();
+    });
+
+    it('rejects a handler’s output ref that is not namespaced under its own job and attempt, as a handler failure', async () => {
+      await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' }, maxAttempts: 2 });
+      const runner = new JobRunner({
+        engine,
+        identity: TERRA_ID,
+        claimableRoles: TERRA_ALL_ROLES,
+        handlers: terraHandlers(async (): Promise<JobHandlerResult> => ({
+          // A different job's namespace — exactly what job-engine has no way
+          // to know is "wrong" except by checking the namespace itself.
+          outputs: [{ name: 'job-output/job_other/1/candidate', version: 1 }],
+        })),
+        leaseMs: LEASE_MS,
+        heartbeatEveryMs: HEARTBEAT_MS,
+        now: () => T0,
+        sleep: new ManualScheduler().sleep,
+      });
+
+      const result = await runner.runOnce();
+      expect(result).toEqual({ kind: 'handler_failed', jobId: 'job_a', jobState: 'ready', attempt: 1 });
+
+      const job = await store.jobs.findOne({ _id: 'job_a' });
+      expect(job?.state).toBe('ready');
+      expect(job?.executionOutputs ?? null).toBeNull();
+      expect(job?.failure?.message).toMatch(/InvalidJobOutputRefs|not namespaced/i);
+    });
+
+    it('InvalidJobOutputRefs names exactly the offending refs', () => {
+      const error = new InvalidJobOutputRefs('job_a', 1, ['job-output/job_other/1/x']);
+      expect(error.jobId).toBe('job_a');
+      expect(error.attempt).toBe(1);
+      expect(error.invalidNames).toEqual(['job-output/job_other/1/x']);
+    });
   });
 });
 

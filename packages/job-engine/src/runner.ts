@@ -22,9 +22,67 @@
  * to run. It can only narrow the tier's authority, never widen it; 5b's
  * `ROLE_TIER` stays the one canonical permission table.
  */
-import { rolesForTier, type AgentTier, type WorkerRole } from '@statxai/contracts';
+import { rolesForTier, type AgentTier, type ArtifactRef, type WorkerRole } from '@statxai/contracts';
 import type { JobDocument } from '@statxai/state';
-import { DEFAULT_LEASE_MS, JobLeaseConflict, JobStateConflict, type JobEngine } from './engine.js';
+import { DEFAULT_LEASE_MS, JobAttemptConflict, JobLeaseConflict, JobStateConflict, type JobEngine } from './engine.js';
+
+/**
+ * The exact execution generation a claim granted (Phase 5f).
+ *
+ * A worker id is who the caller is; `attempt` is *which claim* of the job
+ * this execution is. Both are needed: `JobRunner` always claims under one
+ * fixed `workerId`, so if this job's lease expires and this same worker
+ * claims it back, `workerId` alone can no longer distinguish the new
+ * execution from the one that just lost authority over it. `attempt` is what
+ * `JobEngine.claim` already increments on every successful claim (5a/enqueue)
+ * and never decrements — a later claim of the same job always has a larger
+ * one — so it is reused here rather than inventing a second counter.
+ *
+ * Captured exactly once, from the `JobDocument` `claim()` itself returned,
+ * and never recomputed: an old execution stays permanently associated with
+ * its own token, even after the job has moved on to a newer one.
+ */
+export interface JobExecutionToken {
+  readonly jobId: string;
+  readonly workerId: string;
+  readonly attempt: number;
+}
+
+/**
+ * The namespace a `JobHandler`'s output refs must live under to be accepted
+ * (Phase 5f). Job ids are unique across the whole `jobs` collection (Mongo's
+ * own `_id` uniqueness), so a ref actually named under *this* job's *this*
+ * attempt could only have been produced by this exact execution — no other
+ * job, in any project, can collide with it, and no other attempt of this same
+ * job can either. This is the only namespacing rule `job-engine` enforces; it
+ * has no idea what a "site file" or a "route decision" is, only that an
+ * output must own the execution that produced it.
+ */
+export function jobOutputNamespace(jobId: string, attempt: number): string {
+  return `job-output/${jobId}/${attempt}/`;
+}
+
+/**
+ * Raised when a handler's returned output refs are not namespaced under the
+ * execution that produced them. Defense at the harness boundary (§29 of the
+ * brief this shipped under): a handler cannot make its own output
+ * authoritative by construction, but nothing stops one from *trying* to
+ * return a ref it does not own, and this is what catches that before
+ * `submitForValidation` would otherwise attach it.
+ */
+export class InvalidJobOutputRefs extends Error {
+  constructor(
+    readonly jobId: string,
+    readonly attempt: number,
+    readonly invalidNames: readonly string[],
+  ) {
+    super(
+      `Job ${jobId} attempt ${attempt}: output ref(s) not namespaced under ` +
+        `${jobOutputNamespace(jobId, attempt)}: ${invalidNames.join(', ')}`,
+    );
+    this.name = 'InvalidJobOutputRefs';
+  }
+}
 
 /**
  * What the runner is, fixed for its lifetime. Not worker-supplied and not
@@ -50,12 +108,27 @@ export interface JobHandlerContext {
 }
 
 /**
- * Does the work for one claimed job. Returns when the work is done; throws
- * when it fails. The runner — not the handler — decides what that becomes:
- * `submitForValidation` on success, `fail` on rejection, and neither once
- * authority over the job is lost.
+ * What a handler actually produced, if anything (Phase 5f). `outputs`, when
+ * given, must be namespaced under {@link jobOutputNamespace} for this job's
+ * claimed attempt — checked before they can ever be attached, so a handler
+ * cannot make output authoritative merely by returning it.
+ *
+ * Optional refs on an optional result: a handler that returns nothing, or
+ * returns `undefined`/`void`, stays perfectly valid — existing handlers that
+ * predate this field are not required to invent output to remain correct.
  */
-export type JobHandler = (job: JobDocument, context: JobHandlerContext) => Promise<void>;
+export interface JobHandlerResult {
+  readonly outputs?: readonly ArtifactRef[];
+}
+
+/**
+ * Does the work for one claimed job. Returns when the work is done, optionally
+ * with what it produced; throws when it fails. The runner — not the handler —
+ * decides what that becomes: `submitForValidation` (with those outputs
+ * attached, atomically, in the same transition) on success, `fail` on
+ * rejection, and neither once authority over the job is lost.
+ */
+export type JobHandler = (job: JobDocument, context: JobHandlerContext) => Promise<JobHandlerResult | void>;
 
 export type AuthorityLostReason = 'heartbeat_lost' | 'transition_conflict';
 
@@ -194,6 +267,16 @@ export class JobRunner {
     });
     if (!claimed) return { kind: 'idle' };
 
+    // The execution token: captured once, from the document claim() itself
+    // returned, and reused for every authority-bearing call this execution
+    // makes. Never recomputed by rereading the job later — an execution that
+    // has lost authority has no way back to a token that would grant it any.
+    const token: JobExecutionToken = {
+      jobId: claimed._id,
+      workerId: this.identity.workerId,
+      attempt: claimed.attempt,
+    };
+
     // Guaranteed by the constructor's coverage check plus the role filter on
     // `claim` (now `claimableRoles`, itself checked at construction to be a
     // subset of 5b's tier authority): a claimed job's role is always one
@@ -204,10 +287,10 @@ export class JobRunner {
       throw new Error(`No handler registered for claimed role "${claimed.role}"; this should be unreachable`);
     }
 
-    return this.execute(claimed, handler);
+    return this.execute(claimed, handler, token);
   }
 
-  private async execute(job: JobDocument, handler: JobHandler): Promise<JobRunOnceResult> {
+  private async execute(job: JobDocument, handler: JobHandler, token: JobExecutionToken): Promise<JobRunOnceResult> {
     const controller = new AbortController();
     let stopped = false;
 
@@ -216,7 +299,7 @@ export class JobRunner {
         await this.sleep(this.heartbeatEveryMs, controller.signal);
         if (stopped) break;
         try {
-          const alive = await this.engine.heartbeat(job._id, this.identity.workerId, this.leaseMs, {
+          const alive = await this.engine.heartbeat(token.jobId, token.workerId, token.attempt, this.leaseMs, {
             now: this.now(),
           });
           if (!alive) {
@@ -233,10 +316,12 @@ export class JobRunner {
 
     const heartbeatDone = heartbeatLoop();
 
-    let handlerOutcome: { ok: true } | { ok: false; error: unknown };
+    let handlerOutcome: { ok: true; outputs: readonly ArtifactRef[] | undefined } | { ok: false; error: unknown };
     try {
-      await handler(job, { signal: controller.signal });
-      handlerOutcome = { ok: true };
+      const result = await handler(job, { signal: controller.signal });
+      const outputs = result?.outputs;
+      if (outputs !== undefined) this.assertOwnedOutputs(token, outputs);
+      handlerOutcome = { ok: true, outputs };
     } catch (error) {
       handlerOutcome = { ok: false, error };
     }
@@ -257,18 +342,19 @@ export class JobRunner {
       throw heartbeatResult.error;
     }
     if (heartbeatResult.kind === 'lost') {
-      return { kind: 'authority_lost', jobId: job._id, reason: 'heartbeat_lost' };
+      return { kind: 'authority_lost', jobId: token.jobId, reason: 'heartbeat_lost' };
     }
 
     if (handlerOutcome.ok) {
       try {
-        const submitted = await this.engine.submitForValidation(job._id, this.identity.workerId, {
+        const submitted = await this.engine.submitForValidation(token.jobId, token.workerId, token.attempt, {
           now: this.now(),
+          ...(handlerOutcome.outputs !== undefined ? { outputs: handlerOutcome.outputs } : {}),
         });
         return { kind: 'submitted', jobId: submitted._id, role: submitted.role, attempt: submitted.attempt };
       } catch (error) {
-        if (error instanceof JobLeaseConflict || error instanceof JobStateConflict) {
-          return { kind: 'authority_lost', jobId: job._id, reason: 'transition_conflict' };
+        if (this.isAuthorityConflict(error)) {
+          return { kind: 'authority_lost', jobId: token.jobId, reason: 'transition_conflict' };
         }
         throw error;
       }
@@ -276,16 +362,34 @@ export class JobRunner {
 
     const message = handlerOutcome.error instanceof Error ? handlerOutcome.error.message : String(handlerOutcome.error);
     try {
-      const failed = await this.engine.fail(job._id, message, this.identity.workerId, { now: this.now() });
+      const failed = await this.engine.fail(token.jobId, message, token.workerId, token.attempt, { now: this.now() });
       // `fail` only ever returns a job in 'ready' (a retry remains) or
       // 'failed' (attempts exhausted) — see JobEngine.fail.
       const jobState = failed.state as 'ready' | 'failed';
       return { kind: 'handler_failed', jobId: failed._id, jobState, attempt: failed.attempt };
     } catch (error) {
-      if (error instanceof JobLeaseConflict || error instanceof JobStateConflict) {
-        return { kind: 'authority_lost', jobId: job._id, reason: 'transition_conflict' };
+      if (this.isAuthorityConflict(error)) {
+        return { kind: 'authority_lost', jobId: token.jobId, reason: 'transition_conflict' };
       }
       throw error;
+    }
+  }
+
+  private isAuthorityConflict(error: unknown): boolean {
+    return error instanceof JobLeaseConflict || error instanceof JobStateConflict || error instanceof JobAttemptConflict;
+  }
+
+  /**
+   * The harness-side half of Phase 5f: a handler cannot make its own output
+   * authoritative merely by returning it. Every ref must be namespaced under
+   * this exact execution's own {@link jobOutputNamespace} — not any other
+   * job's, and not an earlier or later attempt of this same job's.
+   */
+  private assertOwnedOutputs(token: JobExecutionToken, outputs: readonly ArtifactRef[]): void {
+    const prefix = jobOutputNamespace(token.jobId, token.attempt);
+    const invalid = outputs.filter((ref) => !ref.name.startsWith(prefix)).map((ref) => ref.name);
+    if (invalid.length > 0) {
+      throw new InvalidJobOutputRefs(token.jobId, token.attempt, invalid);
     }
   }
 }
