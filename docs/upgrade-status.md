@@ -1116,13 +1116,117 @@ and Luna's set is exactly `['repair']`.
 authorisation gap the doc flagged before real workers exist; it does not wire
 any worker up. Delivery behaviour is unchanged.
 
+### Phase 5c — harness-owned in-process job runner — **DONE**
+
+A runtime primitive only: a `JobRunner` that can claim, execute and settle one
+job. Nothing yet decides *what* jobs to enqueue — `runProject` still does not
+execute through `JobEngine`, and no production Terra or Luna skill is wired
+into a runner. This closes "how does a claimed job actually run" without
+touching "what work exists as a job" at all.
+
+**Identity is fixed at construction, not per call.** `JobRunner` takes a
+`JobWorkerIdentity` (`{ workerId, tier }`) once; `runOnce({ projectId? })`
+always claims with that same identity, so a caller cannot quietly widen what a
+worker may take by passing a different tier on one call. `rolesForTier(tier)`
+— the same table 5b's `claim` filters candidates by — is checked again at
+construction: every role that tier may claim must have a registered handler,
+or the runner throws `JobRunnerConfigError` before touching the store. A tier
+with no executable roles (`sol`) is rejected outright, so a Sol execution
+runner cannot be built; Sol still only plans, routes and adjudicates.
+
+**The handler never gets `JobEngine`.** A `JobHandler` receives the claimed
+`JobDocument` and an `AbortSignal` and nothing else — no submit, no fail, no
+accept, no way to transition the job itself. The runner alone decides what a
+returned promise or a thrown error becomes:
+
+    ready --JobEngine.claim()--> running --handler resolves--> JobEngine.submitForValidation() --> validating
+    ready --JobEngine.claim()--> running --handler throws----> JobEngine.fail()                 --> ready | failed
+
+A successful run ends in `validating` with a cleared lease — **not**
+`accepted`; acceptance stays separate harness authority this slice does not
+touch. Every transition still goes through `JobEngine`'s own guarded filters
+and audit writes; the runner duplicates none of 5a's or 5b's logic.
+
+**Heartbeats are the runner's job, not the handler's.** While a handler runs,
+the runner renews the lease on an interval strictly under the lease duration
+(default `leaseMs / 3`; both are validated at construction —
+`heartbeatEveryMs` must be `> 0` and `< leaseMs`). `now: () => Date` and
+`sleep: (ms, signal) => Promise<void>` are injectable seams threaded through
+*every* engine call the runner makes (`claim`, `heartbeat`, `submitForValidation`,
+`fail`), not just the ones an obvious reading would need — so a test can hold
+simulated time fixed across a whole execution without a stray default
+`new Date()` leaking real wall-clock state into a deterministic scenario.
+Production defaults use real `Date`/`setTimeout`.
+
+**Losing authority stops everything, one way or another:**
+
+- `heartbeat()` returns `false` → the signal is aborted, the handler's
+  outcome is discarded unread, and the result is `{ kind: 'authority_lost',
+  reason: 'heartbeat_lost' }`. Neither `submitForValidation` nor `fail` is
+  called.
+- `heartbeat()` *throws* (a platform failure, not "someone else has it") is
+  handled differently on purpose: the signal is still aborted and nothing is
+  submitted or failed, but the error is **rethrown from `runOnce`**, not
+  folded into a job outcome. A Mongo outage must not read as a build failure,
+  and recovery is left to the existing lease reaper rather than invented here.
+- Authority can still be lost in the gap between the last heartbeat and the
+  final transition. `submitForValidation`/`fail` throwing `JobLeaseConflict`
+  or `JobStateConflict` — 5a's own guard, unmodified — is caught and mapped to
+  `{ kind: 'authority_lost', reason: 'transition_conflict' }`. The runner
+  never retries with another actor and never attempts a different transition
+  to force the outcome through.
+- The heartbeat loop is always fully stopped and awaited (`stopped = true;
+  controller.abort();` then `await heartbeatDone`) before any authoritative
+  transition is attempted, and before `runOnce` returns — no timer or promise
+  is left running afterward.
+
+**Result contract** (`JobRunOnceResult`): `idle | submitted | handler_failed |
+authority_lost`, control-plane only — no `RunResult`, no orchestrator release
+outcome mixed in.
+
+**Files:** `packages/job-engine/src/runner.ts` (new), `packages/job-engine/src/index.ts`
+(export it), `packages/job-engine/test/runner.integration.test.ts` (new, 21
+tests against the real replica set — named for the repo's own convention so
+it's picked up by `vitest.integration.config.ts`'s glob without hand-editing
+either config's suite list).
+
+**Tests, end to end:** 462 unit, 121 integration, 583 total. The 5b boundary
+was 462 unit + 100 integration = 562; 5c adds only the 21 new tests in
+`runner.integration.test.ts` (unit count unchanged, integration 100 → 121).
+Typecheck and lint both clean. Not
+claiming GitHub CI ran on this — it did not; these are local results on the
+commit described below.
+
+**Mutation checks, run manually and reverted after each** (not part of the
+committed diff): a caller-selected tier instead of the fixed identity (13/21
+tests killed); removing handler-coverage validation (1/21); skipping the
+success-path submit (2/21); auto-accepting after submit (1/21); reporting a
+handler failure under a different actor (3/21 — partly via 5a's own
+lease-holder guard rejecting the mismatched actor); removing heartbeat
+renewal entirely (3/21, two by test timeout rather than a fast assertion);
+allowing `heartbeatEveryMs >= leaseMs` (1/21); ignoring a lost heartbeat and
+submitting anyway (1/21 — backstopped by 5a's own expiry guard on the submit
+itself); converting a heartbeat platform error into `JobEngine.fail()` (1/21);
+leaving the heartbeat loop running after a successful submission (4/21,
+including the dedicated cleanup test); forcing a second transition after a
+`JobLeaseConflict`/`JobStateConflict` on the final submit (1/21 — the forced
+retry is itself rejected by 5a's guard, surfacing as an unhandled rejection
+the test catches). Every mutation was killed by at least one test.
+
+**`runProject` still does not execute through `JobEngine`.**
+
+**No production Terra or Luna skill is wired into `JobRunner` yet.** The
+handlers in every test are stubs; nothing here reads a Sol plan, calls a
+model, writes source files, or runs a gate.
+
 ### Deliberately next, not now
 
-- **5c** — an in-process execution loop.
-- **Later** — mapping Terra build work and Luna repair work onto persisted jobs,
-  the validation and acceptance lifecycle, what a replan does to jobs from the
-  old plan (`superseded` does not exist yet), and eventually a real process
-  boundary.
+- **Later** — mapping Terra build work and Luna repair work onto persisted
+  jobs (turning plan output into real `JobSpec`s with real handlers), the
+  validation and acceptance lifecycle those jobs need, what a replan does to
+  jobs from the superseded plan (`superseded` does not exist yet), and
+  eventually a real process boundary (workers as separate processes, not
+  in-process handlers).
 
 None of these are implemented.
 
