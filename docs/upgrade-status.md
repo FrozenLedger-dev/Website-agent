@@ -1520,31 +1520,57 @@ job's this exact attempt — no other job, in any project, and no other
 attempt of this same job, can collide with it.
 
 **Known limitation, stated rather than hidden:** this check validates the
-job/attempt component of a ref's name; it cannot validate which *project* an
-artifact actually lives under, because `ArtifactRef` carries no `projectId`
-and `job-engine` deliberately has no registry access to look one up (§15 of
-the brief this shipped under: "the generic job layer should understand
-references, not website internals"). A handler that staged under the
-*correct* job/attempt namespace but the *wrong* project would still pass this
-check — caught in this repo's own tests only incidentally, by a fixture that
-tries to read the candidate back under the real project and fails. Adding a
-positive check would mean giving `job-engine` `ArtifactRegistry` knowledge
-or adding `projectId` to the shared `ArtifactRef` contract, either of which
-is a real design decision, not a one-line fix — left to a later phase rather
-than done quietly here.
+job/attempt component of a ref's name; it cannot itself confirm which
+*project* an artifact lives under, because `ArtifactRef` is project-relative
+by construction everywhere else in the repo — `{ name, version, contentHash?
+}`, no `projectId` — and always resolved against a project supplied
+separately by the caller (`registry.resolve(projectId, ref)`,
+`ArtifactDocument._id = artifactId(projectId, name, version)`). `job-engine`
+does not hold a second, competing notion of project scope for refs; it
+deliberately has no `ArtifactRegistry` access at all (§15 of the brief this
+shipped under: "the generic job layer should understand references, not
+website internals"). The invariant that has to hold, and does not need a
+code change to state, is: `JobDocument.projectId` + an `executionOutputs`
+ref together are what future resolution needs, and every future resolution
+must use the *validating job's own* `projectId` — never one read from, or
+guessed at from, the ref itself. A handler that staged under the *correct*
+job/attempt namespace but called `registry.put` with the *wrong* project id
+would still pass this namespace check; caught in this repo's own tests only
+incidentally, by a fixture that resolves the candidate back under the real
+project and finds nothing there. Phase 5g's promotion step is where that
+invariant must be honoured explicitly (resolve every output through
+`job.projectId`, never trust a project id carried any other way) — not a
+reason to add `projectId` to `ArtifactRef` itself, which would be a
+repo-wide contract change this phase has no evidence is actually needed.
 
 **`frontend_backend` stages; it no longer publishes.** `buildFromPlan` split
 into `prepareBuildFromPlan` (routes, builds, decompose-recovers — every model
-call, writes nothing durable, returns a `BuildCandidate`) and
-`publishBuildDirectly` (every durable write `buildFromPlan` always made:
-route-decision artifact(s), site files, commit). `buildFromPlan` is still
-exactly project-state update → scaffold → prepare → publish, so the direct
-delivery loop is unchanged — proven by a characterisation test pinning the
-full call sequence, and unmodified by every existing `delivery.parity`/
-`refusal` integration test still passing. The one deliberate behaviour change
-for the direct path: `route-decision` now persists *after* Terra generates
-rather than before (prepare no longer persists anything mid-generation) —
-final artifacts, files and commit are identical either way. The handler now
+call; writes nothing durable *itself*) and `publishBuildDirectly` (the site
+files, then the commit). `buildFromPlan` is still exactly project-state
+update → scaffold → prepare → publish, so the direct delivery loop is
+unchanged — proven by a characterisation test pinning the full call
+sequence, and unmodified by every existing `delivery.parity`/`refusal`
+integration test still passing.
+
+Route-decision persistence is *not* inside either half — an early version of
+this split deferred it into `publishBuildDirectly` along with everything
+else, which silently changed the direct path's own failure semantics: pre-5f
+a route decision was durable the moment Sol (or the fallback) decided it,
+before Terra was ever asked to build, so a build that failed after routing
+still left that decision on record; deferred to publish, a failed build left
+*nothing*, since publish is never reached on a thrown error. Caught in
+review before landing. The fix: `prepareBuildFromPlan` takes an optional
+`onRouteDecision` hook, invoked synchronously the instant each record is
+decided (the original, and — should one-shot truncate — the recovery one),
+in the exact relative position the old inline `recordRoute` call occupied.
+`buildFromPlan` is the only caller that supplies it (wired to the same
+persistence `publishBuildDirectly` used to do), restoring pre-5f timing on
+the direct path exactly, including on failure — pinned by a regression test
+that fails against the deferred version and passes against this one. Every
+job execution calls `prepareBuildFromPlan` without the hook, unchanged: the
+record is still collected into the returned candidate for whenever 5g
+promotes it, but nothing reaches the registry before this execution's
+authority is proven. The handler now
 calls only `prepareBuildFromPlan`, stages the returned `BuildCandidate` as a
 single artifact named `frontendBackendCandidateName(jobId, attempt)`, and
 returns its ref as its `JobHandlerResult`. It never opens the canonical
@@ -1566,20 +1592,47 @@ already validated still cannot become canonical — the job's own
 `executionOutputs`, set once by the transition that actually won, decides,
 never "whichever candidate wrote last."
 
+**Legacy `JobDocument` compatibility, checked rather than assumed.**
+`executionOutputs` is `.nullable().default(null)` on the shared `JobRecord`
+zod schema — the same pattern `lease`/`failure` already use. That default
+only applies when a document is actually parsed through the schema, though,
+and nothing in `job-engine` does that on read (`store.jobs.findOne`, and
+`claim`'s own `findOneAndUpdate`, return whatever Mongo stored, trusted
+directly via the `JobDocument` TypeScript interface — no `.parse()` in
+between). A document written before this field existed therefore reads back
+with `executionOutputs: undefined`, not a genuine `null`. Checked, not
+papered over: nothing here ever *reads* an existing job's `executionOutputs`
+— it is write-only, set only by the guarded `submitForValidation` transition
+— so the gap between the schema's default and a legacy document's actual
+shape never reaches a comparison that would tell the two apart. Pinned by a
+real Mongo test that inserts a job exactly as `enqueue` would have written
+one before this field existed (the field genuinely absent, not merely
+`null`) and proves it still claims, heartbeats, submits, and accepts newly
+staged outputs precisely like a current job — reading `?? null`, the same
+idiom already used everywhere else in this codebase for exactly this shape
+of field.
+
 **Files:** `packages/contracts/src/job.ts` (`executionOutputs`),
 `packages/job-engine/src/engine.ts` (`JobAttemptConflict`, attempt-fenced
 `heartbeat`/`submitForValidation`/`fail`, atomic output attachment),
 `packages/job-engine/src/runner.ts` (`JobExecutionToken`,
 `jobOutputNamespace`, `InvalidJobOutputRefs`, `JobHandlerResult`, token
 capture and reuse, output-ref validation), `packages/orchestrator/src/phases/build.ts`
-(`prepareBuildFromPlan`/`publishBuildDirectly`/`PrepareContext` split),
-`packages/orchestrator/src/job-handlers/frontend-backend.ts` (stages instead
-of publishes), plus the corresponding test files for each.
+(`prepareBuildFromPlan`/`publishBuildDirectly`/`PrepareContext` split, plus
+the `onRouteDecision` hook that restores the direct path's exact pre-5f
+route-decision timing), `packages/orchestrator/src/job-handlers/frontend-backend.ts`
+(stages instead of publishes), plus the corresponding test files for each —
+`packages/job-engine/test/engine.test.ts` gains the legacy-`JobDocument`
+suite above, `packages/orchestrator/test/build.test.ts` gains the
+route-decision-survives-failure regression test.
 
-**Tests, end to end:** 471 unit, 169 integration, 640 total — up from the 5e
-figure of 469 + 147 = 616. Typecheck and lint both clean. Not claiming GitHub
-CI ran on this — it did not; these are local results on an uncommitted
-working tree, per this phase's own instruction not to commit.
+**Tests, end to end:** 472 unit, 172 integration, 644 total — up from the 5e
+figure of 469 + 147 = 616 (+3 unit, +25 integration — the figure reported
+before this review's fixes landed was 471 + 169 = 640; this review added one
+unit regression test and three integration legacy-compatibility tests on
+top). Typecheck and lint both clean. Not claiming GitHub CI ran on this — it
+did not; these are local results on an uncommitted working tree, per this
+phase's own instruction not to commit.
 
 **Mutation checks, run manually against `engine.ts`, `runner.ts`, `build.ts`
 and `frontend-backend.ts`, each reverted after** (not part of the committed

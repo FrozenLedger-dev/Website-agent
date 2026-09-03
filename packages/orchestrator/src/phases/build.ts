@@ -22,11 +22,9 @@
  *
  *   {@link prepareBuildFromPlan}   route, build, decompose-recover — every
  *                                  model call and the data those calls
- *                                  produce, computed but not yet written
- *                                  anywhere durable.
- *   {@link publishBuildDirectly}   the durable writes {@link buildFromPlan}
- *                                  always made after generating: the
- *                                  route-decision artifact(s), the site files,
+ *                                  produce. Writes nothing durable itself.
+ *   {@link publishBuildDirectly}   the durable writes that remain
+ *                                  batchable-after-the-fact: the site files,
  *                                  the commit.
  *   {@link buildFromPlan}          project-state update, scaffold, prepare,
  *                                  publish — unchanged from before the split,
@@ -41,6 +39,26 @@
  * while `buildFromPlan` keeps doing exactly what it always did, including the
  * publish step, for the one caller (`orchestrator.ts`) that has never needed
  * anything else.
+ *
+ * Route-decision persistence is the one write that is *not* deferred to
+ * publish, and deliberately not batched into {@link BuildCandidate}'s
+ * eventual promotion either. Before the fix below, moving it into
+ * `publishBuildDirectly` silently changed the direct path's own failure
+ * semantics: pre-5f, `route-decision` was durable the moment Sol decided,
+ * before Terra was ever asked to build, so a build that failed after routing
+ * still left a route decision on record. Deferring it to publish meant a
+ * failed build left *nothing* — publish is never reached. `decideStrategy`
+ * and `prepareBuildFromPlan` therefore take an optional `onRouteDecision`
+ * hook, invoked synchronously at the exact moment each record is decided (the
+ * initial one, and — should one-shot truncate — the recovery one), in the
+ * same relative position `recordRoute` used to occupy. `buildFromPlan` is the
+ * only caller that supplies it, wired straight to the same persistence
+ * `publishBuildDirectly` used to do, so the direct path's write timing is
+ * restored exactly. `prepareBuildFromPlan` called without it — every job
+ * execution — persists nothing at decide-time either, unchanged: the record
+ * is still collected into the returned candidate, for whenever 5g promotes
+ * it, but nothing reaches the registry before this execution's authority is
+ * proven.
  */
 import { HOME_ROUTE, routeToSourcePath, type GeneratedFile, type SitePlan } from '@statxai/contracts';
 import { buildAnchor, buildPage, buildSite, routeBuild } from '@statxai/agents';
@@ -84,11 +102,20 @@ async function persistRouteDecision(ctx: FixedContext, record: RouteDecisionReco
   await deps.workspace.materialiseArtifact('decisions/route-decision.json', record);
 }
 
-/** Decide the strategy. Pure computation — the decision is returned, not persisted. */
+/**
+ * Fired once for every route-decision record `prepareBuildFromPlan` produces,
+ * at the exact moment it is decided — before generation proceeds on it. The
+ * direct path supplies {@link persistRouteDecision} here, restoring pre-5f
+ * timing exactly; a job execution supplies nothing, so nothing is written.
+ */
+type RouteDecisionHook = (record: RouteDecisionRecord) => Promise<void>;
+
+/** Decide the strategy. Pure computation — persistence is entirely the caller's choice, via `onRouteDecision`. */
 async function decideStrategy(
   ctx: PrepareContext,
   current: SitePlan,
   signal?: AbortSignal,
+  onRouteDecision?: RouteDecisionHook,
 ): Promise<{ authorization: RoutingAuthorization; record: RouteDecisionRecord }> {
   const { deps, facts } = ctx;
   const override = developerOverride();
@@ -130,6 +157,25 @@ async function decideStrategy(
     };
   }
 
+  const record: RouteDecisionRecord = {
+    strategy: authorization.strategy,
+    source: authorization.source,
+    refusal: authorization.refusal,
+    proposed,
+    modelFailure,
+    decidedAt: new Date(),
+  };
+  // Persisted, when the caller wants that at all, before the "routed to X"
+  // narration — the same relative order `recordRoute` occupied pre-5f. Sol's
+  // call above cannot be cancelled once sent, so this checks again first:
+  // today's two callers never combine a real signal with a hook (the direct
+  // path passes no signal; a job execution passes no hook), but the primitive
+  // itself must not have a write a future caller could reach uncancellably.
+  if (onRouteDecision) {
+    signal?.throwIfAborted();
+    await onRouteDecision(record);
+  }
+
   deps.say({
     phase: 'build',
     detail:
@@ -139,14 +185,6 @@ async function decideStrategy(
     level: authorization.source === 'sol' ? 'ok' : 'warn',
   });
 
-  const record: RouteDecisionRecord = {
-    strategy: authorization.strategy,
-    source: authorization.source,
-    refusal: authorization.refusal,
-    proposed,
-    modelFailure,
-    decidedAt: new Date(),
-  };
   return { authorization, record };
 }
 
@@ -217,19 +255,26 @@ async function executeDecomposed(ctx: PrepareContext, current: SitePlan, signal?
 
 /**
  * Route, build, and (if one-shot truncates) recover by decomposing — every
- * model call {@link buildFromPlan} makes, and nothing durable. Callers decide
- * separately whether and how to publish the result: {@link buildFromPlan}
- * always does, immediately; a job execution stages it instead, and only
- * publishes once it has proven — via a guarded transition, not this call —
- * that it still owns the job.
+ * model call {@link buildFromPlan} makes. Writes nothing durable itself
+ * *unless* `onRouteDecision` is supplied, in which case each route-decision
+ * record is handed to it the instant it is decided — see the module doc
+ * comment for why that one write is not deferred like the others. Every
+ * record is always collected into the returned candidate regardless, so a
+ * caller that never persists still has them for whenever it does.
+ *
+ * Callers decide separately whether and how to publish the rest — the
+ * generated files: {@link buildFromPlan} always does, immediately; a job
+ * execution stages them instead, and only publishes once it has proven — via
+ * a guarded transition, not this call — that it still owns the job.
  */
 export async function prepareBuildFromPlan(
   ctx: PrepareContext,
   current: SitePlan,
   signal?: AbortSignal,
+  onRouteDecision?: RouteDecisionHook,
 ): Promise<BuildCandidate> {
   const { deps } = ctx;
-  const { authorization, record } = await decideStrategy(ctx, current, signal);
+  const { authorization, record } = await decideStrategy(ctx, current, signal, onRouteDecision);
   const routeDecisions: RouteDecisionRecord[] = [record];
   let files: GeneratedFile[] = [];
 
@@ -261,16 +306,21 @@ export async function prepareBuildFromPlan(
       });
       // A further record, so the trail reads "Sol chose one-shot, then the
       // harness recovered" rather than implying that decomposition had been
-      // chosen. Queued alongside the first rather than persisted here — both
-      // are written by whichever caller publishes this candidate.
-      routeDecisions.push({
+      // chosen. Persisted here too, at the same moment recordRoute used to be
+      // called for this exact case, when the caller wants that at all.
+      const recovery: RouteDecisionRecord = {
         strategy: 'decompose',
         source: 'truncation-recovery',
         refusal: `One-shot exceeded the output ceiling: ${error instanceof Error ? error.message : String(error)}`,
         proposed: null,
         modelFailure: null,
         decidedAt: new Date(),
-      });
+      };
+      routeDecisions.push(recovery);
+      if (onRouteDecision) {
+        signal?.throwIfAborted();
+        await onRouteDecision(recovery);
+      }
     },
   });
 
@@ -278,16 +328,19 @@ export async function prepareBuildFromPlan(
 }
 
 /**
- * The durable writes a generated {@link BuildCandidate} always used to cause,
- * exactly as {@link buildFromPlan} made them before Phase 5f split it: every
- * route-decision record (in order — the recovery record, when there is one,
- * always follows the original), then the site files, then the commit.
+ * The durable writes {@link buildFromPlan} still batches until after
+ * generating: the site files, then the commit. Route-decision persistence is
+ * deliberately *not* here — see the module doc comment — so `candidate
+ * .routeDecisions` is not read by this function at all; it already reached
+ * the registry via `onRouteDecision`, at decide-time, for any caller that
+ * wanted that.
  *
- * This is the *only* place that materialises a candidate into the canonical
- * project workspace. `buildFromPlan` calls it once, immediately after
- * generating. A job execution never calls it at all until its own guarded
- * `running -> validating` transition has proven it still owns the job —
- * see `job-handlers/frontend-backend.ts`, which stages instead.
+ * This is the *only* place that materialises a candidate's generated files
+ * into the canonical project workspace. `buildFromPlan` calls it once,
+ * immediately after generating. A job execution never calls it at all until
+ * its own guarded `running -> validating` transition has proven it still
+ * owns the job — see `job-handlers/frontend-backend.ts`, which stages
+ * instead.
  */
 export async function publishBuildDirectly(
   candidate: BuildCandidate,
@@ -295,11 +348,6 @@ export async function publishBuildDirectly(
   signal?: AbortSignal,
 ): Promise<void> {
   const { deps } = ctx;
-  for (const record of candidate.routeDecisions) {
-    signal?.throwIfAborted();
-    await persistRouteDecision(ctx, record);
-  }
-
   signal?.throwIfAborted();
   await deps.workspace.writeSiteFiles(candidate.files);
 
@@ -320,6 +368,9 @@ export async function buildFromPlan(ctx: FixedContext, current: SitePlan, signal
   // a build failure is always about the site rather than the toolchain.
   await scaffoldSite(deps.workspace.siteRoot);
 
-  const candidate = await prepareBuildFromPlan(ctx, current, signal);
+  // Restores pre-5f timing exactly: a route decision is durable the moment
+  // Sol (or the fallback) decides it, before Terra is ever asked to build —
+  // so a build that fails after routing still leaves that decision on record.
+  const candidate = await prepareBuildFromPlan(ctx, current, signal, (record) => persistRouteDecision(ctx, record));
   await publishBuildDirectly(candidate, ctx, signal);
 }

@@ -1,32 +1,34 @@
 /**
- * `buildFromPlan`'s cancellation checkpoints — and, since Phase 5f, the
- * prepare/publish split itself: `prepareBuildFromPlan` computes and writes
- * nothing durable; `publishBuildDirectly` makes everything durable that
- * `buildFromPlan` always made; `buildFromPlan` is still exactly
- * project-state update, scaffold, prepare, publish, in that order, so the
- * direct delivery loop's behaviour is unchanged.
+ * `buildFromPlan`'s cancellation checkpoints, and that the prepare/publish
+ * split (Phase 5f) leaves the direct delivery loop behaviourally identical —
+ * including on failure, not merely on the successful path.
  *
  * Every collaborator is a fake here (no Mongo, no filesystem, no network):
- * this is a unit test of the checkpoints themselves, one at a time, isolated
- * from everything else `buildFromPlan` does. `frontend-backend-job-handler
- * .integration.test.ts` covers the end-to-end property — a real handler,
- * under a real JobRunner, against a real store and a real Git workspace —
- * this file exists because that test can only prove the *outermost* gap is
- * closed (the one right around the model call it happens to exercise), and
- * a mutation check found exactly that: removing the pre-model check inside
- * `executeOneShot` broke nothing there, because a *later* checkpoint in the
- * same call happened to cover the one scenario under test. Each checkpoint
- * gets its own proof here instead.
+ * this is a unit test of the checkpoints and the call sequence themselves,
+ * isolated from everything else `buildFromPlan` does.
+ * `frontend-backend-job-handler.integration.test.ts` covers the end-to-end
+ * property — a real handler, under a real JobRunner, against a real store
+ * and a real Git workspace — this file exists because that test can only
+ * prove the *outermost* gap is closed (the one right around the model call
+ * it happens to exercise), and a mutation check found exactly that: removing
+ * the pre-model check inside `executeOneShot` broke nothing there, because a
+ * *later* checkpoint in the same call happened to cover the one scenario
+ * under test. Each checkpoint gets its own proof here instead.
  *
- * Note what moved with the split: `route-decision` used to be persisted
- * *before* Terra was ever asked to build (right after Sol's routing call
- * returned). Deferring all durable writes to `publishBuildDirectly` means it
- * is now persisted *after* — the direct path's final state (which artifacts
- * exist, with what content, in what versions; which files are written;
- * that a commit happens) is unchanged, but the relative order of "model
- * call" versus "durable write" during generation is exactly what this split
- * exists to change, for the job path's sake. The characterisation test below
- * pins the new order deliberately, not by oversight.
+ * `route-decision` persistence is the one write the split deliberately does
+ * *not* defer to `publishBuildDirectly`, and the reason is failure, not the
+ * happy path: pre-5f, a route decision was durable the moment Sol (or the
+ * fallback) decided it, before Terra was ever asked to build — so a build
+ * that failed after routing still left that decision on record. An earlier
+ * version of this split moved the write into `publishBuildDirectly`, which
+ * silently changed that: a build that failed after routing left *nothing*,
+ * because publish is never reached on a thrown error. `prepareBuildFromPlan`
+ * now takes an optional `onRouteDecision` hook, invoked at the exact moment
+ * each record is decided, and `buildFromPlan` is the only caller that
+ * supplies it — restoring the original timing exactly. The regression test
+ * below is the one that would have caught the original mistake: it fails
+ * against a version where route-decision persistence is deferred to publish,
+ * and passes against this one.
  */
 import { describe, expect, it, vi } from 'vitest';
 import { ModelClient, type Provider, type ProviderRequest, type ProviderResponse } from '@statxai/agents';
@@ -94,13 +96,15 @@ interface Rig {
  * `onSolRoute` / `onTerraBuild` / `onRecordRoute` / `onWriteSiteFiles` are
  * side-effect hooks fired from inside the collaborator they name — the only
  * way to move an AbortController's `.abort()` to a precise point *between*
- * two checkpoints without depending on real async I/O timing.
+ * two checkpoints without depending on real async I/O timing. `terraBuild`
+ * lets a test make the fake Terra call itself fail, rather than merely abort.
  */
 function rig(options: {
   onSolRoute?: () => void;
   onTerraBuild?: () => void;
   onRecordRoute?: () => void;
   onWriteSiteFiles?: () => void;
+  terraBuild?: () => ProviderResponse;
 } = {}): Rig {
   const calls: string[] = [];
   let projectStateUpdated = false;
@@ -115,7 +119,7 @@ function rig(options: {
       if (request.schemaName.startsWith('terra_build')) {
         calls.push('model:terra-build');
         options.onTerraBuild?.();
-        return buildOutput('built');
+        return (options.terraBuild ?? (() => buildOutput('built')))();
       }
       throw new Error(`unexpected model call: ${request.schemaName}`);
     }),
@@ -172,19 +176,16 @@ function rig(options: {
 }
 
 describe('the direct build path is unchanged', () => {
-  it('runs to completion exactly as before when no signal is passed', async () => {
+  it('runs to completion in exactly the pre-5f order: route decided and persisted before Terra ever builds', async () => {
     const { ctx, calls, writeSiteFiles, commit, projectStateUpdated } = rig();
 
     await buildFromPlan(ctx, plan());
 
     expect(projectStateUpdated()).toBe(true);
-    // route-decision now persists after Terra generates, not before — see the
-    // module doc comment on why the split moves this, deliberately, without
-    // changing the direct path's final artifacts, files, or commit.
     expect(calls).toEqual([
       'model:sol-route',
-      'model:terra-build',
       'registry.put:route-decision',
+      'model:terra-build',
       'workspace.writeSiteFiles',
       'workspace.commit',
     ]);
@@ -192,24 +193,41 @@ describe('the direct build path is unchanged', () => {
     expect(commit).toHaveBeenCalledWith('Terra: build');
   });
 
-  it('composes exactly prepare then publish, with nothing else in between', async () => {
-    const { ctx, calls } = rig();
+  it('the failure case: a route decision survives a Terra build that fails after it', async () => {
+    // The regression this test exists for. Before the fix, deferring
+    // route-decision persistence into publishBuildDirectly meant a build
+    // that failed here left no record of the routing decision at all —
+    // publish is never reached on a thrown error. This must fail against
+    // that version and pass against the restored one.
+    const { ctx, calls, registryPut, writeSiteFiles } = rig({
+      terraBuild: () => {
+        throw new Error('terra build rejected');
+      },
+    });
+
+    await expect(buildFromPlan(ctx, plan())).rejects.toThrow('terra build rejected');
+
+    expect(registryPut).toHaveBeenCalledTimes(1);
+    expect(registryPut).toHaveBeenCalledWith(facts.projectId, 'route-decision', expect.objectContaining({ strategy: 'one_shot' }));
+    expect(calls).toEqual(['model:sol-route', 'registry.put:route-decision', 'model:terra-build']);
+    expect(writeSiteFiles).not.toHaveBeenCalled();
+  });
+
+  it('prepare alone, given no route-decision hook, persists nothing at all — the job path’s own shape', async () => {
+    const { ctx, calls, registryPut } = rig();
     const candidate = await prepareBuildFromPlan(ctx, plan());
 
-    // Prepare alone writes nothing durable at all.
     expect(calls).toEqual(['model:sol-route', 'model:terra-build']);
+    expect(registryPut).not.toHaveBeenCalled();
     expect(candidate.routeDecisions).toHaveLength(1);
     expect(candidate.routeDecisions[0]!.strategy).toBe('one_shot');
     expect(candidate.files).toEqual([{ path: 'app/page.tsx', contents: 'built' }]);
 
+    // publishBuildDirectly only ever handles the files and the commit now —
+    // route-decision persistence happens (or does not) at decide-time.
     await publishBuildDirectly(candidate, ctx);
-    expect(calls).toEqual([
-      'model:sol-route',
-      'model:terra-build',
-      'registry.put:route-decision',
-      'workspace.writeSiteFiles',
-      'workspace.commit',
-    ]);
+    expect(calls).toEqual(['model:sol-route', 'model:terra-build', 'workspace.writeSiteFiles', 'workspace.commit']);
+    expect(registryPut).not.toHaveBeenCalled();
   });
 });
 
@@ -223,40 +241,37 @@ describe('cancellation checkpoints, each isolated from the others', () => {
     expect(calls).toEqual([]);
   });
 
-  it('checks after Sol answers, before Terra is asked to build', async () => {
+  it('checks after Sol answers, before the route decision is persisted', async () => {
     const controller = new AbortController();
-    const { ctx, calls } = rig({ onSolRoute: () => controller.abort() });
+    const { ctx, calls, registryPut } = rig({ onSolRoute: () => controller.abort() });
 
     await expect(buildFromPlan(ctx, plan(), controller.signal)).rejects.toThrow();
     expect(calls).toEqual(['model:sol-route']);
+    expect(registryPut).not.toHaveBeenCalled();
+  });
+
+  it('checks before Terra is asked to build, after the route decision is already persisted', async () => {
+    const controller = new AbortController();
+    const { ctx, calls } = rig({ onRecordRoute: () => controller.abort() });
+
+    await expect(buildFromPlan(ctx, plan(), controller.signal)).rejects.toThrow();
+    expect(calls).toEqual(['model:sol-route', 'registry.put:route-decision']);
   });
 
   it('checks after Terra answers, before the candidate is even returned from prepare — the gap the mutation check found', async () => {
     const controller = new AbortController();
-    const { ctx, calls, registryPut } = rig({ onTerraBuild: () => controller.abort() });
+    const { ctx, calls, writeSiteFiles } = rig({ onTerraBuild: () => controller.abort() });
 
     await expect(buildFromPlan(ctx, plan(), controller.signal)).rejects.toThrow();
-    expect(calls).toEqual(['model:sol-route', 'model:terra-build']);
-    // Prepare itself throws, so publish — and therefore every durable write —
-    // is never reached at all.
-    expect(registryPut).not.toHaveBeenCalled();
-  });
-
-  it('checks before the route-decision artifact is published', async () => {
-    const controller = new AbortController();
-    const { ctx, calls, writeSiteFiles } = rig();
-    const candidate = await prepareBuildFromPlan(ctx, plan());
-    controller.abort();
-
-    await expect(publishBuildDirectly(candidate, ctx, controller.signal)).rejects.toThrow();
-    expect(calls).toEqual(['model:sol-route', 'model:terra-build']);
+    expect(calls).toEqual(['model:sol-route', 'registry.put:route-decision', 'model:terra-build']);
     expect(writeSiteFiles).not.toHaveBeenCalled();
   });
 
-  it('checks after the route-decision is published, before the generated files are written', async () => {
+  it('checks before the generated files are written, once prepare has actually returned', async () => {
     const controller = new AbortController();
-    const { ctx, writeSiteFiles } = rig({ onRecordRoute: () => controller.abort() });
+    const { ctx, writeSiteFiles } = rig();
     const candidate = await prepareBuildFromPlan(ctx, plan());
+    controller.abort();
 
     await expect(publishBuildDirectly(candidate, ctx, controller.signal)).rejects.toThrow();
     expect(writeSiteFiles).not.toHaveBeenCalled();

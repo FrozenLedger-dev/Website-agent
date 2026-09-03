@@ -72,6 +72,93 @@ describe('claiming', () => {
 });
 
 /**
+ * `executionOutputs` (Phase 5f) is `.nullable().default(null)` in the shared
+ * `JobRecord` zod schema — the same pattern `lease`/`failure` already use for
+ * a field that must be safe to be absent. That default only ever applies
+ * when a document is actually parsed through the schema, though, and nothing
+ * in this engine does that on read — `store.jobs.findOne` and `claim`'s own
+ * `findOneAndUpdate` return whatever Mongo actually stored, trusted directly
+ * via the `JobDocument` TypeScript interface, no `.parse()` in between. A
+ * document written before this field existed therefore reads back with
+ * `executionOutputs: undefined`, not `null` — a real gap between the
+ * schema's default and what a legacy document actually contains at runtime.
+ *
+ * It is a safe gap, not a silent one: nothing here ever *reads* an existing
+ * job's `executionOutputs` — it is write-only, set only by the guarded
+ * `submitForValidation` transition — so `undefined` where the type says
+ * `null` never reaches a comparison that would tell the two apart. These pin
+ * that a legacy document (inserted the way one from before Phase 5f would
+ * have looked, missing the field entirely) still claims, heartbeats, and
+ * submits exactly like a current one, and that reading its `executionOutputs`
+ * with the same `?? null` idiom already used everywhere else in this suite
+ * (`job?.failure ?? null`, etc.) gives the same answer a current job's
+ * genuine `null` would.
+ */
+describe('legacy JobDocuments (written before executionOutputs existed)', () => {
+  const legacySpec = (jobId: string): JobSpec => spec(jobId, [`src/${jobId}.tsx`]);
+
+  /** A job as `enqueue` would have written it before Phase 5f — no `executionOutputs` key at all. */
+  const insertLegacyJob = async (jobId: string): Promise<void> => {
+    const now = new Date();
+    const legacyDoc = {
+      _id: jobId,
+      projectId: PROJECT,
+      role: 'frontend_backend' as const,
+      spec: legacySpec(jobId),
+      state: 'ready' as const,
+      origin: { kind: 'plan' as const },
+      dependsOn: [],
+      attempt: 0,
+      maxAttempts: 3,
+      lease: null,
+      failure: null,
+      // executionOutputs intentionally omitted — the field this test exists for.
+      createdAt: now,
+      updatedAt: now,
+    };
+    await store.db.collection<{ _id: string } & Record<string, unknown>>('jobs').insertOne(legacyDoc);
+  };
+
+  it('a legacy document with no executionOutputs field is still readable', async () => {
+    await insertLegacyJob('job_legacy_read');
+
+    const found = await store.jobs.findOne({ _id: 'job_legacy_read' });
+    expect(found).not.toBeNull();
+    expect(found?.state).toBe('ready');
+    // The honest runtime answer: `undefined`, not `null` — no `.parse()` ever
+    // ran to apply the schema's default. `?? null` is what normalises it.
+    expect(found?.executionOutputs).toBeUndefined();
+    expect(found?.executionOutputs ?? null).toBeNull();
+  });
+
+  it('remains claimable, heartbeatable, and submittable exactly like a current job', async () => {
+    await insertLegacyJob('job_legacy_lifecycle');
+
+    const claimed = await engine.claim('worker-1', TERRA);
+    expect(claimed?._id).toBe('job_legacy_lifecycle');
+    expect(claimed?.attempt).toBe(1);
+    expect(claimed?.executionOutputs ?? null).toBeNull();
+
+    expect(await engine.heartbeat('job_legacy_lifecycle', 'worker-1', 1)).toBe(true);
+
+    const submitted = await engine.submitForValidation('job_legacy_lifecycle', 'worker-1', 1);
+    expect(submitted.state).toBe('validating');
+    // No outputs were offered, exactly like an existing void handler — the
+    // field stays whatever it already was: absent, read as null.
+    expect(submitted.executionOutputs ?? null).toBeNull();
+  });
+
+  it('accepts newly-attached outputs on a legacy job exactly like a current one', async () => {
+    await insertLegacyJob('job_legacy_outputs');
+    await engine.claim('worker-1', TERRA);
+
+    const outputs = [{ name: 'job-output/job_legacy_outputs/1/candidate', version: 1 }];
+    const submitted = await engine.submitForValidation('job_legacy_outputs', 'worker-1', 1, { outputs });
+    expect(submitted.executionOutputs).toEqual(outputs);
+  });
+});
+
+/**
  * A worker id is a claim; `tier` is what the caller actually is. `claim` must
  * narrow the candidate pool by it rather than hand out a job and let something
  * downstream object, because nothing downstream does — a lease is granted, an
