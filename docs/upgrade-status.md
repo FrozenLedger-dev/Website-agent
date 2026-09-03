@@ -1219,6 +1219,111 @@ the test catches). Every mutation was killed by at least one test.
 handlers in every test are stubs; nothing here reads a Sol plan, calls a
 model, writes source files, or runs a gate.
 
+### Phase 5d — role-scoped worker capabilities — **DONE**
+
+5c required a Terra `JobRunner` to have a handler for every role Terra is
+*permitted* to run — correct for a general-purpose runner, but it meant a
+specialised production worker (a Terra build worker with code for only
+`frontend_backend`) could only be built with fake or throwing-stub handlers
+for every other Terra role it would never actually claim. 5d closes that
+without adding a second permission table:
+
+    ROLE_TIER / rolesForTier(tier)      the maximum authority a tier has (5b, unchanged)
+    claimableRoles ⊆ rolesForTier(tier)  one runner's fixed, narrower subset of it (5d)
+
+Neither a model nor a `runOnce` caller chooses `claimableRoles` — it is
+supplied once at `JobRunner` construction, exactly like `identity`, and
+`runOnce({ projectId? })`'s type has no field that could widen it per call.
+
+**`JobEngine.claim` signature:**
+
+    claim(
+      workerId: string,
+      tier: AgentTier,
+      options: { projectId?: string; leaseMs?: number; now?: Date; roles?: readonly WorkerRole[] } = {},
+    ): Promise<JobDocument | null>
+
+`roles`, when given, must be a non-empty subset of `rolesForTier(tier)` —
+checked by a new private `resolveClaimRoles` *before* the claim transaction
+opens, so a rejected request mutates nothing. Requesting a role outside the
+supplied tier, or an empty array, throws `InvalidClaimRoles` (new,
+engine-local — not added to `@statxai/contracts`, nothing persisted).
+Duplicate roles in the request are canonicalised (`[...new Set(requested)]`),
+not rejected. **Omitting `roles` entirely preserves 5b's original behaviour
+exactly** — the caller may claim anything its tier can — so every existing
+5a/5b call site (`claim(workerId, tier, { projectId, leaseMs, now })`, no
+`roles`) needed no changes and still passes unmodified.
+
+The resolved role set is what reaches the Mongo candidate query, unchanged in
+shape from 5b:
+
+    { ...projectScope, state: 'ready', role: { $in: resolvedRoles } }
+
+— never "fetch every tier-compatible candidate, then skip unsupported roles
+in JavaScript." That distinction is what keeps an older, out-of-subset job
+from head-of-line blocking a worker's narrower queue: it never becomes a
+candidate to begin with, the same property 5b already established for
+tier-level filtering.
+
+**`JobRunner` constructor:** gains a required `claimableRoles: readonly
+WorkerRole[]` field, validated in this order before anything touches the
+store: `leaseMs`/`heartbeatEveryMs` numeric sanity (unchanged from 5c) → the
+tier itself has executable roles (Sol still rejected outright, unchanged from
+5c) → `claimableRoles` is non-empty → every entry in `claimableRoles` belongs
+to `rolesForTier(identity.tier)` (else `JobRunnerConfigError`, naming the
+offending roles) → duplicates canonicalised → **handler completeness is
+checked against `claimableRoles`, not `rolesForTier(tier)`** — the one
+behaviour change from 5c. `runOnce` forwards `roles: this.claimableRoles` to
+`claim`, never `rolesForTier(this.identity.tier)`.
+
+**Extra handlers grant no authority.** A handler map may carry entries for
+roles outside `claimableRoles` — construction does not forbid it — but
+`claim` is scoped to `this.claimableRoles`, so such a role can never be
+returned by `claim` and its handler is simply unreachable. Proven directly:
+`role-scoped worker capabilities > never claims a role outside claimableRoles
+even when a handler for it is registered` registers handlers for both
+`frontend_backend` and `qa_review`, restricts `claimableRoles` to
+`['frontend_backend']`, and asserts a ready `qa_review` job is left untouched
+(`runOnce` returns `idle`).
+
+**Files:** `packages/job-engine/src/engine.ts` (`claim`'s `roles` option,
+`resolveClaimRoles`, `InvalidClaimRoles`), `packages/job-engine/src/runner.ts`
+(`claimableRoles`), `packages/job-engine/test/engine.test.ts` (+9, a
+`role-scoped claiming` suite), `packages/job-engine/test/runner.integration.test.ts`
+(+10: a `role-scoped worker capabilities` suite, one heartbeat test switched
+to a genuinely narrowed single-role runner so 5d cannot accidentally bypass
+the 5c heartbeat runtime, and one structural source-scan guard). No change to
+`@statxai/contracts`, `packages/orchestrator`, `packages/agents` or
+`packages/workspace` — nothing outside `job-engine` needed touching, since
+nothing outside it calls `claim` or constructs a `JobRunner` yet.
+
+**Tests, end to end:** 462 unit (unchanged), 140 integration, 602 total —
+up from the 5c figure of 462 + 121 = 583 by +19 integration tests (+9 in
+`engine.test.ts`, +10 in `runner.integration.test.ts`). Typecheck and lint
+both clean. Not claiming GitHub CI ran on this — it did not; these are local
+results on the commit described below.
+
+**Mutation checks, run manually against `engine.ts`/`runner.ts` and reverted
+after each** (not part of the committed diff): `JobRunner` ignoring
+`claimableRoles` and requesting the full tier instead (4/31 runner tests,
+including the structural guard); `JobEngine` ignoring the requested subset
+entirely (10/72 across both suites); `JobEngine` accepting a role outside the
+supplied tier (4/72); a mixed valid/invalid request silently dropping the
+forbidden role instead of rejecting the whole request (4/72); handler
+completeness checked against `rolesForTier(tier)` instead of `claimableRoles`
+(7/31); an extra registered handler implicitly widening claim authority
+(2/31, including the structural guard); an empty `claimableRoles` accepted
+(1/31); the role filter moved out of the Mongo query into a JavaScript
+`break` that head-of-line-blocks on the first ineligible candidate (3/72,
+catching both the 5b- and 5d-era head-of-line tests); `runOnce` accepting and
+honouring a type-unsafe `roles` override in its options (2/31, including the
+structural guard and a test written specifically to exercise that
+type-unsafe path). Every mutation was killed by at least one test.
+
+**`runProject` still does not execute through `JobEngine`.**
+
+**No production Terra or Luna skill is wired into `JobRunner` yet.**
+
 ### Deliberately next, not now
 
 - **Later** — mapping Terra build work and Luna repair work onto persisted

@@ -15,6 +15,7 @@ import {
   type JobOrigin,
   type JobSpec,
   type JobState,
+  type WorkerRole,
 } from '@statxai/contracts';
 import type { AuditEvent, JobDocument, StateStore } from '@statxai/state';
 
@@ -81,6 +82,22 @@ export class JobStateConflict extends Error {
   }
 }
 
+/**
+ * Raised when `claim()` is asked to narrow to a role set that is not a
+ * non-empty subset of what the supplied tier may execute (Phase 5d).
+ *
+ * `ROLE_TIER` / `rolesForTier` stay the ceiling on authority; a caller may
+ * only ask `claim` for less of it than the tier already grants, never more.
+ * This is checked before the claim transaction opens, so an invalid request
+ * mutates nothing.
+ */
+export class InvalidClaimRoles extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidClaimRoles';
+  }
+}
+
 export interface EnqueueParams {
   spec: JobSpec;
   origin: JobOrigin;
@@ -120,10 +137,10 @@ export class JobEngine {
    * Eligibility is not expressible as a single-document filter, because two of
    * the four conditions are cross-document:
    *
-   *   1. the job is `ready`                        — single document
-   *   2. the job's role belongs to `tier`           — single document
-   *   3. every dependency has been accepted        — other job documents
-   *   4. no running job writes an overlapping path — other job documents
+   *   1. the job is `ready`                          — single document
+   *   2. the job's role is in the resolved claim set — single document
+   *   3. every dependency has been accepted          — other job documents
+   *   4. no running job writes an overlapping path   — other job documents
    *
    * So the whole selection runs inside a transaction. Snapshot isolation gives
    * a consistent view of (3) and (4), and the final guarded update makes the
@@ -138,6 +155,17 @@ export class JobEngine {
    * job left open to any tier would let a Terra worker execute a Luna-priced
    * repair, or Luna hold a judgment seat §7 reserves for Terra's reviewer.
    *
+   * `options.roles`, when given, narrows further still (Phase 5d): a
+   * specialised worker — one built to run only `frontend_backend`, say —
+   * passes the single role it actually has code for, and the resolved set is
+   * that role alone rather than everything Terra may claim. `tier` remains
+   * the ceiling: every requested role must already belong to
+   * `rolesForTier(tier)`, checked and thrown on (`InvalidClaimRoles`, before
+   * the transaction opens) rather than silently clamped, and an empty request
+   * is rejected the same way — "narrow to nothing" is a configuration error,
+   * not a valid way to claim nothing. Omitting `roles` entirely preserves the
+   * original behaviour: the caller may claim anything its tier can.
+   *
    * Condition (4) is what keeps parallel workers from corrupting a single
    * project repository. §2 promises parallel execution and §1 gives each
    * project one Git repo; the declared `output` list is what reconciles them.
@@ -145,10 +173,10 @@ export class JobEngine {
   async claim(
     workerId: string,
     tier: AgentTier,
-    options: { projectId?: string; leaseMs?: number; now?: Date } = {},
+    options: { projectId?: string; leaseMs?: number; now?: Date; roles?: readonly WorkerRole[] } = {},
   ): Promise<JobDocument | null> {
     const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
-    const roles = rolesForTier(tier);
+    const roles = this.resolveClaimRoles(tier, options.roles);
 
     return this.store.withTransaction(async (session) => {
       const scope = options.projectId ? { projectId: options.projectId } : {};
@@ -196,6 +224,27 @@ export class JobEngine {
 
       return null;
     });
+  }
+
+  /**
+   * `tier` sets the ceiling (5b); `requested`, when given, narrows within it
+   * (5d). Duplicates in `requested` are canonicalised rather than rejected —
+   * a repeated role is redundant configuration, not a conflicting one.
+   */
+  private resolveClaimRoles(tier: AgentTier, requested: readonly WorkerRole[] | undefined): WorkerRole[] {
+    const tierRoles = rolesForTier(tier);
+    if (requested === undefined) return tierRoles;
+
+    if (requested.length === 0) {
+      throw new InvalidClaimRoles('claim() roles, when given, must be non-empty');
+    }
+    const outsideTier = requested.filter((role) => !tierRoles.includes(role));
+    if (outsideTier.length > 0) {
+      throw new InvalidClaimRoles(
+        `claim() requested role(s) outside tier "${tier}"'s authority: ${outsideTier.join(', ')}`,
+      );
+    }
+    return [...new Set(requested)];
   }
 
   private async dependenciesSatisfied(job: JobDocument, session: ClientSession): Promise<boolean> {

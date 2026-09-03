@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { AgentTier, JobSpec, WorkerRole } from '@statxai/contracts';
 import { StateStore } from '@statxai/state';
-import { JobEngine, JobLeaseConflict, JobNotFound, JobStateConflict } from '../src/index.js';
+import { InvalidClaimRoles, JobEngine, JobLeaseConflict, JobNotFound, JobStateConflict } from '../src/index.js';
 
 const PROJECT = 'proj_engine_test';
 
@@ -119,6 +119,106 @@ describe('role-aware claiming', () => {
 
     const claimed = await engine.claim('worker-1', TERRA);
     expect(claimed?._id).toBe('job_build');
+  });
+});
+
+/**
+ * `tier` is the ceiling (5b); `roles`, when given, narrows within it (5d) —
+ * for a specialised worker that only has code for some of what its tier is
+ * merely permitted to run. It can only ask for less than the tier grants,
+ * never more, and an invalid request is refused before the claim transaction
+ * opens, so it mutates nothing.
+ */
+describe('role-scoped claiming', () => {
+  it('claims only the requested subset of the tier', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx'], 'frontend_backend'), origin: { kind: 'plan' } });
+
+    const claimed = await engine.claim('worker-1', TERRA, { roles: ['frontend_backend'] });
+    expect(claimed?._id).toBe('job_a');
+  });
+
+  it('leaves a same-tier job outside the requested subset untouched', async () => {
+    await engine.enqueue({ spec: spec('job_review', ['src/a.tsx'], 'qa_review'), origin: { kind: 'plan' } });
+
+    expect(await engine.claim('worker-1', TERRA, { roles: ['frontend_backend'] })).toBeNull();
+
+    const job = await store.jobs.findOne({ _id: 'job_review' });
+    expect(job?.state).toBe('ready');
+    expect(job?.attempt).toBe(0);
+    expect(job?.lease).toBeNull();
+  });
+
+  it('is not head-of-line blocked by an older job outside the requested subset', async () => {
+    await engine.enqueue({ spec: spec('job_review', ['src/a.tsx'], 'qa_review'), origin: { kind: 'plan' } });
+    await engine.enqueue({ spec: spec('job_build', ['src/b.tsx'], 'frontend_backend'), origin: { kind: 'plan' } });
+
+    const claimed = await engine.claim('worker-1', TERRA, { roles: ['frontend_backend'] });
+    expect(claimed?._id).toBe('job_build');
+  });
+
+  it('refuses to widen past the supplied tier, mutating nothing', async () => {
+    await engine.enqueue({
+      spec: spec('job_repair', ['src/a.tsx'], 'repair'),
+      origin: { kind: 'repair', defectFingerprint: 'fp1', reviewCycle: 0, parentJobId: 'job_other' },
+    });
+
+    await expect(engine.claim('worker-1', TERRA, { roles: ['repair'] })).rejects.toBeInstanceOf(InvalidClaimRoles);
+
+    const job = await store.jobs.findOne({ _id: 'job_repair' });
+    expect(job?.state).toBe('ready');
+    expect(job?.attempt).toBe(0);
+    expect(job?.lease).toBeNull();
+    expect(await store.auditLog.countDocuments({ jobId: 'job_repair' })).toBe(0);
+  });
+
+  it('refuses a mixed request entirely rather than silently dropping the illegal role', async () => {
+    await engine.enqueue({ spec: spec('job_build', ['src/a.tsx'], 'frontend_backend'), origin: { kind: 'plan' } });
+    await engine.enqueue({
+      spec: spec('job_repair', ['src/b.tsx'], 'repair'),
+      origin: { kind: 'repair', defectFingerprint: 'fp1', reviewCycle: 0, parentJobId: 'job_other' },
+    });
+
+    await expect(
+      engine.claim('worker-1', TERRA, { roles: ['frontend_backend', 'repair'] }),
+    ).rejects.toBeInstanceOf(InvalidClaimRoles);
+
+    // Neither job moved — not the illegal one, and not the otherwise-legal one either.
+    const build = await store.jobs.findOne({ _id: 'job_build' });
+    const repair = await store.jobs.findOne({ _id: 'job_repair' });
+    expect(build?.state).toBe('ready');
+    expect(repair?.state).toBe('ready');
+  });
+
+  it('rejects an empty role request rather than treating it as "claim nothing"', async () => {
+    await expect(engine.claim('worker-1', TERRA, { roles: [] })).rejects.toBeInstanceOf(InvalidClaimRoles);
+  });
+
+  it('Luna narrowed to repair claims it; Luna narrowed to a Terra role is refused', async () => {
+    await engine.enqueue({
+      spec: spec('job_repair', ['src/a.tsx'], 'repair'),
+      origin: { kind: 'repair', defectFingerprint: 'fp1', reviewCycle: 0, parentJobId: 'job_other' },
+    });
+
+    const claimed = await engine.claim('luna-1', 'luna', { roles: ['repair'] });
+    expect(claimed?._id).toBe('job_repair');
+
+    await expect(engine.claim('luna-2', 'luna', { roles: ['frontend_backend'] })).rejects.toBeInstanceOf(
+      InvalidClaimRoles,
+    );
+  });
+
+  it('cannot make Sol executable by asking claim() to widen it', async () => {
+    await expect(engine.claim('sol-1', 'sol', { roles: ['frontend_backend'] })).rejects.toBeInstanceOf(
+      InvalidClaimRoles,
+    );
+    await expect(engine.claim('sol-1', 'sol', { roles: ['repair'] })).rejects.toBeInstanceOf(InvalidClaimRoles);
+  });
+
+  it('omitting roles still means everything the tier permits, unchanged from 5b', async () => {
+    await engine.enqueue({ spec: spec('job_review', ['src/a.tsx'], 'qa_review'), origin: { kind: 'plan' } });
+
+    const claimed = await engine.claim('worker-1', TERRA);
+    expect(claimed?._id).toBe('job_review');
   });
 });
 

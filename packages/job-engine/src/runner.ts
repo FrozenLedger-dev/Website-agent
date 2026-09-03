@@ -1,5 +1,5 @@
 /**
- * In-process job runner (Phase 5c).
+ * In-process job runner (Phase 5c, narrowed by 5d).
  *
  * A runner claims one job at a fixed, harness-owned identity, runs the
  * harness-registered handler for its role, keeps the lease alive while the
@@ -9,9 +9,18 @@
  * so its transactions, guarded filters and audit writes stay authoritative.
  *
  * Deliberately absent: the handler never receives `JobEngine`, never submits,
- * fails or accepts a job itself, and never chooses its own identity or tier.
- * "Which worker am I, and what may I claim" is a control-plane fact fixed at
- * construction, not something a handler call can renegotiate per job.
+ * fails or accepts a job itself, and never chooses its own identity, tier or
+ * claimable roles. "Which worker am I, and what may I claim" is a
+ * control-plane fact fixed at construction, not something a handler call — or
+ * a `runOnce` caller — can renegotiate per job.
+ *
+ * `identity.tier` is the maximum authority a worker of this tier could ever
+ * have (5b's `rolesForTier`). `claimableRoles` is this *particular* worker's
+ * fixed subset of it — how a specialised worker (a Terra build worker that
+ * only knows `frontend_backend`, say) can exist without fake or
+ * throwing-stub handlers for every other role its tier is merely permitted
+ * to run. It can only narrow the tier's authority, never widen it; 5b's
+ * `ROLE_TIER` stays the one canonical permission table.
  */
 import { rolesForTier, type AgentTier, type WorkerRole } from '@statxai/contracts';
 import type { JobDocument } from '@statxai/state';
@@ -87,7 +96,19 @@ function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
 export interface JobRunnerOptions {
   engine: JobEngine;
   identity: JobWorkerIdentity;
-  /** Must cover every role {@link rolesForTier} grants this identity's tier. */
+  /**
+   * The non-empty subset of {@link rolesForTier}(`identity.tier`) this
+   * runner may claim. Fixed for its lifetime, exactly like `identity` — a
+   * `runOnce` caller cannot widen it per call. Duplicate entries are
+   * canonicalised, not rejected.
+   */
+  claimableRoles: readonly WorkerRole[];
+  /**
+   * Must cover every role in `claimableRoles` — not every role the tier
+   * merely permits. A handler for a role outside `claimableRoles` may be
+   * present; it is simply never reachable, since `claim` is never asked for
+   * that role, so registering one grants no authority.
+   */
   handlers: ReadonlyMap<WorkerRole, JobHandler>;
   leaseMs?: number;
   /** How often the lease is renewed while a handler runs. Default `leaseMs / 3`. */
@@ -101,6 +122,7 @@ type HeartbeatOutcome = { kind: 'ok' } | { kind: 'lost' } | { kind: 'error'; err
 export class JobRunner {
   private readonly engine: JobEngine;
   private readonly identity: JobWorkerIdentity;
+  private readonly claimableRoles: readonly WorkerRole[];
   private readonly handlers: ReadonlyMap<WorkerRole, JobHandler>;
   private readonly leaseMs: number;
   private readonly heartbeatEveryMs: number;
@@ -128,17 +150,33 @@ export class JobRunner {
 
     // `rolesForTier` is the same table 5b's `claim` filters candidates by; a
     // second, independent permission list here could only ever drift from it.
-    const requiredRoles = rolesForTier(this.identity.tier);
-    if (requiredRoles.length === 0) {
+    // This is the ceiling `claimableRoles` is checked against below, not the
+    // runner's own claim set — a tier with no executable roles (Sol) can
+    // never back a runner regardless of what `claimableRoles` requests.
+    const tierRoles = rolesForTier(this.identity.tier);
+    if (tierRoles.length === 0) {
       throw new JobRunnerConfigError(
         `Tier "${this.identity.tier}" has no executable roles; it cannot back a job runner`,
       );
     }
-    const missing = requiredRoles.filter((role) => !this.handlers.has(role));
-    if (missing.length > 0) {
+
+    if (options.claimableRoles.length === 0) {
+      throw new JobRunnerConfigError('claimableRoles must be non-empty');
+    }
+    const outsideTier = options.claimableRoles.filter((role) => !tierRoles.includes(role));
+    if (outsideTier.length > 0) {
       throw new JobRunnerConfigError(
-        `Missing handler(s) for role(s) tier "${this.identity.tier}" may claim: ${missing.join(', ')}`,
+        `claimableRoles must be a subset of what tier "${this.identity.tier}" may execute; ` +
+          `outside its authority: ${outsideTier.join(', ')}`,
       );
+    }
+    // Canonicalise duplicates rather than reject them: a repeated role is
+    // redundant configuration, not a conflicting one.
+    this.claimableRoles = [...new Set(options.claimableRoles)];
+
+    const missing = this.claimableRoles.filter((role) => !this.handlers.has(role));
+    if (missing.length > 0) {
+      throw new JobRunnerConfigError(`Missing handler(s) for claimable role(s): ${missing.join(', ')}`);
     }
   }
 
@@ -152,12 +190,15 @@ export class JobRunner {
       ...(options.projectId !== undefined ? { projectId: options.projectId } : {}),
       leaseMs: this.leaseMs,
       now: this.now(),
+      roles: this.claimableRoles,
     });
     if (!claimed) return { kind: 'idle' };
 
-    // Guaranteed by the constructor's coverage check plus 5b's own role
-    // filter on `claim`: a claimed job's role is always one this tier may
-    // run, and every such role has a handler. Defensive, not reachable.
+    // Guaranteed by the constructor's coverage check plus the role filter on
+    // `claim` (now `claimableRoles`, itself checked at construction to be a
+    // subset of 5b's tier authority): a claimed job's role is always one
+    // this runner may run, and every such role has a handler. Defensive, not
+    // reachable.
     const handler = this.handlers.get(claimed.role);
     if (!handler) {
       throw new Error(`No handler registered for claimed role "${claimed.role}"; this should be unreachable`);
