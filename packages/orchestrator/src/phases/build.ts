@@ -7,6 +7,16 @@
  * once entered by throwing a fabricated truncation error, which made "Sol chose
  * to decompose" and "one-shot was tried and did not fit" the same code path and
  * indistinguishable afterwards.
+ *
+ * `signal`, threaded optionally through every function here, is Phase 5e's:
+ * `JobRunner` may lose lease authority mid-build, and a model call it cannot
+ * cancel (`ModelClient` takes no signal today) can still resolve afterward.
+ * Every durable write — an artifact, a site file, the final commit — is
+ * preceded by `signal?.throwIfAborted()`, so a response that arrives after
+ * authority is gone is read, tracked for telemetry, and then discarded rather
+ * than persisted. The direct delivery loop never passes a signal, so `signal`
+ * is always `undefined` there and every check is a no-op — this changes
+ * nothing about the path §2's runProject still uses.
  */
 import { HOME_ROUTE, routeToSourcePath, type SitePlan } from '@statxai/contracts';
 import { buildAnchor, buildPage, buildSite, routeBuild } from '@statxai/agents';
@@ -36,7 +46,11 @@ async function recordRoute(
 }
 
 /** Persist an adjudication outcome as a versioned artifact. */
-async function decideStrategy(ctx: FixedContext, current: SitePlan): Promise<RoutingAuthorization> {
+async function decideStrategy(
+  ctx: FixedContext,
+  current: SitePlan,
+  signal?: AbortSignal,
+): Promise<RoutingAuthorization> {
   const { deps, facts } = ctx;
   const override = developerOverride();
   const permitted = permittedStrategies(current);
@@ -44,6 +58,8 @@ async function decideStrategy(ctx: FixedContext, current: SitePlan): Promise<Rou
   let authorization: RoutingAuthorization;
   let proposed: RouteDecisionRecord['proposed'] = null;
   let modelFailure: string | null = null;
+
+  signal?.throwIfAborted();
 
   try {
     const routed = await routeBuild(deps.model, facts.profile, current, {
@@ -75,6 +91,12 @@ async function decideStrategy(ctx: FixedContext, current: SitePlan): Promise<Rou
     };
   }
 
+  // Sol's routing call cannot be cancelled once sent (ModelClient takes no
+  // signal), so authority can already be gone by the time it answers. Check
+  // before the persisted route-decision artifact — the first durable write —
+  // rather than after it.
+  signal?.throwIfAborted();
+
   await recordRoute(ctx, authorization, proposed, modelFailure);
 
   deps.say({
@@ -97,12 +119,18 @@ async function decideStrategy(ctx: FixedContext, current: SitePlan): Promise<Rou
  * cannot drift between pages. It fails when the site does not fit the output
  * ceiling, which is a genuine runtime failure and is handled as one.
  */
-async function executeOneShot(ctx: FixedContext, current: SitePlan): Promise<void> {
+async function executeOneShot(ctx: FixedContext, current: SitePlan, signal?: AbortSignal): Promise<void> {
   const { deps, facts } = ctx;
   deps.say({ phase: 'build', detail: 'Terra is attempting the complete site in one pass' });
 
+  signal?.throwIfAborted();
   const built = await buildSite(deps.model, facts.profile, current);
   deps.track('terra', built);
+
+  // The call above cannot be cancelled once sent. Authority may have been
+  // lost while it was in flight, so the response is tracked for telemetry —
+  // it did happen — but must not reach the workspace as durable output.
+  signal?.throwIfAborted();
   await deps.workspace.writeSiteFiles(built.value.files);
 
   deps.say({
@@ -118,10 +146,12 @@ async function executeOneShot(ctx: FixedContext, current: SitePlan): Promise<voi
  * Each call stays well below the output ceiling, at the cost of later pages
  * being built to match a reference rather than written alongside it.
  */
-async function executeDecomposed(ctx: FixedContext, current: SitePlan): Promise<void> {
+async function executeDecomposed(ctx: FixedContext, current: SitePlan, signal?: AbortSignal): Promise<void> {
   const { deps, facts } = ctx;
+  signal?.throwIfAborted();
   const anchor = await buildAnchor(deps.model, facts.profile, current);
   deps.track('terra', anchor);
+  signal?.throwIfAborted();
   await deps.workspace.writeSiteFiles(anchor.value.files);
 
   // The homepage anchors the design system. Selecting by array order once put
@@ -135,9 +165,11 @@ async function executeDecomposed(ctx: FixedContext, current: SitePlan): Promise<
   // Pages are independent given the anchor, and each writes a distinct file,
   // so there is no output conflict to serialise — they can run concurrently.
   const rest = current.sitemap.pages.filter((p) => p.route !== home.route);
+  signal?.throwIfAborted();
   const pages = await Promise.all(
     rest.map((page) => buildPage(deps.model, facts.profile, current, page, anchorSource, layoutSource)),
   );
+  signal?.throwIfAborted();
   for (const page of pages) {
     deps.track('terra', page);
     await deps.workspace.writeSiteFiles(page.value.files);
@@ -145,8 +177,9 @@ async function executeDecomposed(ctx: FixedContext, current: SitePlan): Promise<
   deps.say({ phase: 'build', detail: `${rest.length} further pages built in parallel`, level: 'ok' });
 }
 
-export async function buildFromPlan(ctx: FixedContext, current: SitePlan): Promise<void> {
+export async function buildFromPlan(ctx: FixedContext, current: SitePlan, signal?: AbortSignal): Promise<void> {
   const { deps, facts } = ctx;
+  signal?.throwIfAborted();
   await deps.store.projects.updateOne(
     { _id: facts.projectId },
     { $set: { state: 'building', updatedAt: new Date() } },
@@ -166,16 +199,16 @@ export async function buildFromPlan(ctx: FixedContext, current: SitePlan): Promi
    * failure the same code path, and indistinguishable afterwards. Each
    * strategy now has its own function and its own call.
    */
-  const route = await decideStrategy(ctx, current);
+  const route = await decideStrategy(ctx, current, signal);
 
   await executeRoute(route, current, {
-    oneShot: () => executeOneShot(ctx, current),
+    oneShot: () => executeOneShot(ctx, current, signal),
     decomposed: async () => {
       deps.say({
         phase: 'build',
         detail: 'Building by decomposition: anchor first, then pages in parallel',
       });
-      await executeDecomposed(ctx, current);
+      await executeDecomposed(ctx, current, signal);
     },
     onRecovery: async (error) => {
       deps.say({
@@ -186,7 +219,7 @@ export async function buildFromPlan(ctx: FixedContext, current: SitePlan): Promi
       // A further version of the same artifact, so the trail reads "Sol chose
       // one-shot, then the harness recovered" rather than implying that
       // decomposition had been chosen.
-      await recordRoute(ctx, 
+      await recordRoute(ctx,
         {
           strategy: 'decompose',
           source: 'truncation-recovery',
@@ -198,5 +231,6 @@ export async function buildFromPlan(ctx: FixedContext, current: SitePlan): Promi
     },
   });
 
+  signal?.throwIfAborted();
   await deps.workspace.commit('Terra: build');
 }

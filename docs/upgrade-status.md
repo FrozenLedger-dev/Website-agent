@@ -1324,10 +1324,144 @@ type-unsafe path). Every mutation was killed by at least one test.
 
 **No production Terra or Luna skill is wired into `JobRunner` yet.**
 
+### Phase 5e — first real Terra frontend/backend job handler — **DONE**
+
+5d made a specialised worker constructible without fake handlers for roles it
+never claims. 5e is the first one that isn't a test double: a `JobHandler`
+for `frontend_backend` that runs the actual production Terra build — the same
+function the direct delivery loop calls, not a second implementation of it.
+
+**Production handler:** `packages/orchestrator/src/job-handlers/frontend-backend.ts`,
+`createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDeps): JobHandler`,
+where `deps` is `{ store, registry, model, workspacesRoot, say?, track? }` —
+harness-owned collaborators fixed once, the same way a `JobRunner`'s
+`identity` and `claimableRoles` are fixed. Exported from the package index.
+
+**Shared build primitive:** `buildFromPlan` (`packages/orchestrator/src/phases/build.ts`),
+**reused, not extracted** — it was already the one exported entry point for
+"Sol routes, Terra builds"; the handler imports it directly and both callers
+run the identical function. What *did* need extracting was cancellation
+safety (below), added to `buildFromPlan` itself as an optional third
+parameter, so both callers still share one function rather than one drifting
+from the other.
+
+**Required pinned inputs** (`JobSpec.inputs` keys, exported as
+`FRONTEND_BACKEND_INPUT`): `businessProfile` and `sitePlan`, each an
+`ArtifactRef`. Resolved with `registry.resolve(job.projectId, ref)` —
+`get(projectId, name, version)` addressed by exact `_id`, never
+`sort: version desc` — so a version accepted after the job was created cannot
+change what it builds from. Project ownership is structural, not a checked
+permission: the artifact `_id` is `artifactId(job.projectId, name, version)`,
+so a ref cannot address another project's artifact regardless of what a job
+claims. A missing required input throws `FrontendBackendInputInvalid` before
+any model call.
+
+**Output semantics:** exactly what the direct path already produces —
+`ProjectWorkspace.writeSiteFiles` (real Git-backed source files),
+`ArtifactRegistry.put`/`accept` for the `route-decision` record, and a real
+`workspace.commit('Terra: build')`. Nothing new invented — no output
+envelope, no second artifact kind.
+
+**Specialised runner configuration:**
+
+    identity: { workerId: 'terra-frontend-backend-1', tier: 'terra' }
+    claimableRoles: ['frontend_backend']
+    handlers: Map([['frontend_backend', createTerraFrontendBackendHandler(deps)]])
+
+No handler is registered for `business_strategy`, `ux_information_architecture`,
+`brand_ui_system`, `content_seo`, `crm_erp_integration`, `analytics_deployment`
+or `qa_review` — 5d's `claimableRoles` narrowing is what makes that legal.
+
+**The model is faked in tests; the handler is not.** Every test fakes only
+`Provider.complete` (`ModelClient` is real, `buildSite`/`routeBuild` are
+real). `createTerraFrontendBackendHandler` is never stubbed.
+
+**Cancellation.** `ModelClient` does not accept an `AbortSignal` today — 5e
+does not add one, per the brief's explicit instruction not to redesign it.
+`buildFromPlan`, `decideStrategy`, `executeOneShot` and `executeDecomposed`
+each take an optional `signal?: AbortSignal`, threaded from `ctx.signal`, and
+call `signal?.throwIfAborted()` before every durable write: before the
+project-state update, before the persisted route-decision artifact, before
+`writeSiteFiles` (both one-shot and decomposed), before the decomposed
+per-page write loop, and before the final commit. A response that arrives
+after authority is lost is still passed to `deps.track` for telemetry — the
+call really happened — but is checked against the signal immediately
+afterward and discarded before it can reach a write. The direct delivery
+loop never passes a signal, so every check is a no-op there; this changes
+nothing about the path `runProject` still uses.
+
+**When authority is lost while the model is in flight:** the handler's
+`buildFromPlan` call throws (from a `throwIfAborted()` checkpoint) once the
+pending response finally resolves; `JobRunner`'s existing 5c logic — which
+checks its own heartbeat result before ever looking at what the handler did —
+reports `authority_lost` without calling `submitForValidation` or `fail`, and
+the checkpoint means the generated content never reached `writeSiteFiles` or
+the workspace commit in the first place.
+
+**Success lifecycle:** `claim()` → handler resolves → `JobRunner.submitForValidation()`
+→ `validating`, lease cleared. **Not** `accepted` — acceptance stays separate
+harness authority this slice does not touch.
+
+**Build failure lifecycle:** the model boundary rejects → `buildFromPlan`
+throws → `JobRunner.fail()` → existing retry semantics (`ready` while
+attempts remain, `failed` once exhausted). No retry logic duplicated in the
+handler.
+
+**Files:** `packages/orchestrator/src/phases/build.ts` (optional `signal`
+threaded through, zero behaviour change when omitted — proven by
+`build.test.ts`'s own regression test), `packages/orchestrator/src/job-handlers/frontend-backend.ts`
+(new), `packages/orchestrator/src/index.ts` (export it),
+`packages/orchestrator/test/build.test.ts` (new, unit — the build
+primitive's five cancellation checkpoints, isolated one at a time with
+fakes, plus the direct-path regression),
+`packages/orchestrator/test/job-handlers-boundary.test.ts` (new, unit — a
+source-scan guard that the handler never imports `JobEngine` or calls a
+job-transition method, in the style of `policy-boundary.test.ts`),
+`packages/orchestrator/test/frontend-backend-job-handler.integration.test.ts`
+(new, integration — the real handler under a real `JobRunner` against the
+real replica set and a real temp Git workspace; only `Provider.complete` is
+faked).
+
+**Tests, end to end:** 469 unit, 147 integration, 616 total — up from the 5d
+figure of 462 + 140 = 602: +7 unit (`build.test.ts` ×6,
+`job-handlers-boundary.test.ts` ×1), +7 integration
+(`frontend-backend-job-handler.integration.test.ts`). Typecheck and lint
+both clean. Not claiming GitHub CI ran on this — it did not; these are local
+results on the commit described below.
+
+**Mutation checks, run manually and reverted after each** (not part of the
+committed diff): handler resolves inputs by name only, ignoring the pinned
+version (1/7 — the pinned-version test); handler replaced with a fake write
+instead of calling `buildFromPlan` (5/7); handler's role guard removed
+(1/7); a missing input silently falls back instead of failing closed (1/7);
+`executeOneShot`'s pre-model check removed (0/7 in the integration suite —
+the gap that motivated adding `build.test.ts`; 1/6 there, and the same
+mutation is 0-catch in the integration suite precisely *because* a later
+checkpoint in the same call happens to cover that scenario, which is itself
+the reason each checkpoint now has its own isolated proof); the matching
+post-model check removed (1/6 unit, and 1/7 integration — the stale content
+actually reached disk); the handler smuggling in `JobEngine` and calling
+`submitForValidation` directly (caught by the new structural boundary test);
+the direct path's call site diverging from the shared primitive (2/8 in the
+existing `delivery.parity.integration.test.ts`, unmodified — the artifact
+lineage and phase-order assertions written for Phase 4a); `JobRunner`
+auto-accepting after submit (1/7, re-verified at this layer though already
+proven at 5c's). Every mutation was killed by at least one test.
+
+**`runProject` still does not execute through `JobEngine`.**
+
+**No production job is automatically enqueued yet.**
+
+**No production Luna handler is wired yet.**
+
 ### Deliberately next, not now
 
-- **Later** — mapping Terra build work and Luna repair work onto persisted
-  jobs (turning plan output into real `JobSpec`s with real handlers), the
+- **Phase 5f** — cut the existing frontend/backend build phase over to one
+  persisted job: construct the real `frontend_backend` `JobSpec`, pin its
+  actual input `ArtifactRef`s, enqueue/release it, execute it through the
+  specialised Terra `JobRunner`, and deterministically validate/accept or
+  surface failure — without touching Luna repair or broad replan semantics.
+- **Later still** — mapping Luna repair work onto persisted jobs, the
   validation and acceptance lifecycle those jobs need, what a replan does to
   jobs from the superseded plan (`superseded` does not exist yet), and
   eventually a real process boundary (workers as separate processes, not
