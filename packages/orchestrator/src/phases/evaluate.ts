@@ -9,7 +9,7 @@
  * The phase measures and records. It decides nothing about what to do next:
  * that is the caller's loop, reading the outcome below.
  */
-import { routeToOutputPath, routeToSourcePath } from '@statxai/contracts';
+import { routeToOutputPath, routeToSourcePath, type BusinessProfile, type SitePlan } from '@statxai/contracts';
 import { reviewSite } from '@statxai/agents';
 import { isFrameworkPage, runGates } from '@statxai/gates';
 import {
@@ -21,6 +21,33 @@ import {
 } from '@statxai/workspace';
 import { blocking, buildFailureDefect, fromGateFinding, fromReviewIssue, mergeByFingerprint, type Defect } from '../defects.js';
 import type { RunContext } from '../run-context.js';
+
+/**
+ * §7's first deterministic gate, then the rest: compile, then — only if the
+ * export exists to inspect — run every gate against it. Extracted so a second
+ * caller (the isolated candidate validator, `job-validation/frontend-backend.js`)
+ * can run the exact same deterministic measurement `evaluateSite` does,
+ * against a site root of its own choosing, without duplicating the fallback
+ * shape a failed build produces or drifting from it over time. One
+ * implementation, two callers — this function knows nothing about which.
+ */
+export async function runDeterministicGates(siteRoot: string, profile: BusinessProfile, plan: SitePlan) {
+  const compiled = await compileSite(siteRoot);
+
+  // Gates read the static export — the markup a visitor and a crawler
+  // actually receive — rather than the TSX that produced it.
+  const files = compiled.ok ? await readBuiltFiles(siteRoot) : [];
+
+  // Every path in the export, so existence checks see the assets no gate
+  // parses — scripts, fonts, icons — instead of reporting them missing.
+  const assets = compiled.ok ? (await readExportFiles(siteRoot)).map((f) => f.path) : [];
+
+  const gateRun = compiled.ok
+    ? runGates({ files, profile, plan, assets })
+    : { passed: false, findings: [], gatesRun: ['build'] };
+
+  return { compiled, files, gateRun };
+}
 
 /**
  * The source files a repair may edit, as the workspace reports them.
@@ -85,7 +112,7 @@ export async function evaluateSite(ctx: RunContext): Promise<EvaluationOutcome> 
    * failure is the only finding worth reporting.
    */
   deps.say({ phase: 'evaluate', detail: 'Compiling the site' });
-  const compiled: BuildResult = await compileSite(deps.workspace.siteRoot);
+  const { compiled, files, gateRun } = await runDeterministicGates(deps.workspace.siteRoot, facts.profile, progress.plan);
 
   if (!compiled.ok) {
     /**
@@ -110,16 +137,6 @@ export async function evaluateSite(ctx: RunContext): Promise<EvaluationOutcome> 
     });
   }
 
-  // Gates read the static export — the markup a visitor and a crawler
-  // actually receive — rather than the TSX that produced it.
-  const files = compiled.ok ? await readBuiltFiles(deps.workspace.siteRoot) : [];
-
-  // Every path in the export, so existence checks see the assets no gate
-  // parses — scripts, fonts, icons — instead of reporting them missing.
-  const assets = compiled.ok
-    ? (await readExportFiles(deps.workspace.siteRoot)).map((f) => f.path)
-    : [];
-
   /**
    * Repairs edit source, never the export.
    *
@@ -134,10 +151,6 @@ export async function evaluateSite(ctx: RunContext): Promise<EvaluationOutcome> 
   const sourceOf = Object.fromEntries(
     progress.plan.sitemap.pages.map((page) => [routeToOutputPath(page.route), routeToSourcePath(page.route)]),
   );
-
-  const gateRun = compiled.ok
-    ? runGates({ files, profile: facts.profile, plan: progress.plan, assets })
-    : { passed: false, findings: [], gatesRun: ['build'] };
 
   const gatesCertified = compiled.ok ? ['build', ...gateRun.gatesRun] : ['build'];
 

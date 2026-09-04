@@ -1669,14 +1669,232 @@ promoted.**
 
 **No production Luna handler is wired yet.**
 
+### Phase 5g-1 — isolated deterministic validation of one fenced frontend/backend candidate — **DONE**
+
+5f fenced a `frontend_backend` execution's output — one `ArtifactRef`,
+namespaced under `jobOutputNamespace(jobId, attempt)`, attached atomically to
+`JobDocument.executionOutputs` by the same guarded transition that moved the
+job to `validating`. It proved nothing about whether that candidate is any
+good. 5g-1 closes that gap for exactly one job at a time, without touching
+anything 5g-2 (acceptance, promotion) still owns.
+
+**One new function, `validateFrontendBackendCandidate(job, deps)`,
+in `packages/orchestrator/src/job-validation/frontend-backend.ts`.** Deps are
+`{ registry: ArtifactRegistry; validationWorkspacesRoot: string }` — no
+`JobEngine`, no `store`, no `ModelClient`, no canonical `workspacesRoot`. That
+last omission is deliberate and structural, not merely behavioural: this
+module has no variable anywhere in it that could hold a reference to the
+canonical project workspace, so "validate against the canonical workspace
+instead of an isolated one" is not a bug this code could regress into by a
+local edit — there is nothing to point at.
+
+**Checks fail closed, in this exact order, before any resolution begins:**
+role (`frontend_backend`) → state (`validating`) → `executionOutputs`
+present and non-empty → exactly one ref (the handler's own contract; a count
+of zero or more than one is a hard error, never narrowed to "the first one")
+→ that ref namespaced under *this exact* `job._id` and `job.attempt`
+(`jobOutputNamespace`, the same Phase 5f helper — not a second
+implementation of the same check). Only once every one of those holds does
+`deps.registry.resolve(job.projectId, ref)` even run — always the job's own
+`projectId`, always the exact attached `(name, version)`, never `get()`'s
+"latest" form, and never derived from the candidate's own contents or from
+any other job's data. The pinned `businessProfile`/`sitePlan` inputs
+(`job.spec.inputs`, the same `FRONTEND_BACKEND_INPUT` keys the handler
+already uses) are resolved the same way, for the same reason: this module
+must build and gate exactly what the handler built and gated, nothing
+re-derived.
+
+**Pinned-input resolution, verified rather than assumed.** The paragraph
+above was true of the code from the first version of this phase — `resolve`
+takes a version-specific `ArtifactRef` for `businessProfile`/`sitePlan`
+exactly as it does for the candidate — but nothing had actually pinned that
+behaviour for the two *inputs* the way "exact-ref resolution — never latest"
+already pinned it for the candidate itself. Reviewed and closed in the same
+uncommitted tree, not deferred to a 5g-1.1: a dedicated integration test
+(`'pinned means pinned: businessProfile and sitePlan, not the handler's own
+inputs'`) stages a job pinned to v1 of both artifact names, creates and
+*accepts* v2 of each afterward, and asserts — via the same faked `runGates`
+already used to control pass/fail, now also capturing what it was called
+with — that the deterministic gates ran against v1's content, not v2's.
+Mutation-checked the same way as everything else in this phase: swapping
+`resolve()` for `get()`'s latest-version form on the two pinned-input calls
+was reverted after confirming exactly this one new test caught it (1/22
+integration), with every other test in the file unaffected — the narrowest
+possible kill for the narrowest possible gap.
+
+**Payload shape is checked before anything is written to disk.** A small
+`zod` object (`{ routeDecisions: z.array(z.unknown()), files:
+z.array(GeneratedFile) }`) reuses the one existing `GeneratedFile` schema
+from `@statxai/contracts` rather than inventing a second competing
+`BuildCandidate` schema; `routeDecisions` is checked only for being an array,
+since deterministic validation never reads it (it feeds nothing gates or the
+build step touch). A candidate that resolves fine but fails this check throws
+`CandidateValidationShapeInvalid` before any `mkdtemp` call — nothing is ever
+created for it to clean up.
+
+**Deterministic measurement is not reimplemented — it is reused.**
+`evaluateSite` (`phases/evaluate.ts`) already runs compile → read the export
+→ run gates as its own first deterministic pass. That sequence is now
+`runDeterministicGates(siteRoot, profile, plan)`, extracted verbatim (a pure
+refactor — same calls, same order, same build-failure fallback shape,
+`{ passed: false, findings: [], gatesRun: ['build'] }`) and exported for
+exactly this second caller. `evaluateSite` itself calls the extracted
+function now instead of the code that used to be inlined in it; every
+existing unit and integration test for the direct delivery path still passes
+unmodified, which is what proves the extraction changed nothing observable.
+5g-1's validator calls the same function, pointed at its own isolated
+`siteRoot` — one implementation, two callers, and 5g-1 has no idea what
+`evaluateSite` does with the result any more than `evaluateSite` knows 5g-1
+exists.
+
+**The workspace is genuinely disposable, not merely unaccepted.** A fresh
+directory is created with `mkdtemp(join(deps.validationWorkspacesRoot,
+`${job._id}-attempt${job.attempt}-`))` for every call — never reused across
+calls, never the same path twice — and a `ProjectWorkspace` is opened at it
+(reusing its existing `safeSitePath`/`writeSiteFiles`/`PathEscapesWorkspace`
+path-safety exactly as-is, not a second implementation of the same guard).
+`scaffoldSite` and `writeSiteFiles` populate it; `.commit()` is never called
+on it, so it never becomes a git-tracked history the way a real
+`ProjectWorkspace` is. The directory is removed in `finally` — on a pass, on
+a deterministic fail, and on a thrown platform error alike — so nothing
+disposable survives a call under any outcome.
+
+**Deterministic failure is a result; only genuine platform failure throws.**
+A build that does not compile, or a blocking gate finding, comes back as
+`{ ok: false, compiled, gateRun, ... }` — never converted to an exception,
+never silently retried. `compileSite`/`registry.resolve`/filesystem calls
+throwing for real (a crashed build tool, an unresolvable artifact, no space
+on the disposable root) propagate unconverted — not caught, not folded into
+`ok: false` — because "the candidate failed" and "the tooling could not even
+run" are different findings and this phase does not get to decide that a
+crash means rejection.
+
+**Nothing about the job, the candidate, or the canonical workspace changes,
+on pass or on fail.** The validator receives no store and no engine, so it
+cannot write to either even if it wanted to; a real Mongo-backed integration
+test additionally re-reads the job document afterward and separately asserts
+the exact same in-memory `JobDocument` object handed in is unchanged (deep
+equality against a snapshot taken before the call) — not just "the database
+still says validating," but "this function did not mutate its own
+parameter." The staged candidate artifact's `acceptedAt` stays `null` on
+both outcomes. No `registry.accept`, no `JobEngine.accept`, no
+`requestRepair`, no model call of any kind — proven by a structural
+boundary test (`frontend-backend-job-validation.test.ts`, in
+`job-handlers-boundary.test.ts`'s own style) that reads this module's source
+back and asserts none of `JobEngine`, `ModelClient`, `reviewSite`,
+`deploySite`, `.accept(`, `.submitForValidation(`, `.requestRepair(`,
+`.block(`, `.release(`, `.heartbeat(`, `.reclaimExpiredLeases(`, `.fail(`
+appear in it at all.
+
+**Legacy and adjacent-job candidates cannot be substituted for the real
+one.** A job whose `executionOutputs` predates this field (genuinely
+`undefined`, the same Phase 5f compatibility gap) fails closed exactly like
+a `null` one. Another job's staged candidate, even under the *same* project,
+is never reachable from a job whose own `executionOutputs` names something
+else — the namespace check is what prevents it, not luck about artifact
+names colliding. A newer version of the *same* artifact name, created after
+the job reached `validating`, is not what gets validated — the exact
+attached `(name, version)` is, pinned by a regression test that creates v2
+after staging v1 and asserts v1's content is what reached the (faked) build
+step.
+
+**Result type, in-process only, nothing new persisted:**
+
+    interface FrontendBackendCandidateValidation {
+      readonly jobId: string;
+      readonly attempt: number;
+      readonly candidate: ArtifactRef;       // job.executionOutputs[0], never "latest"
+      readonly ok: boolean;                  // compiled.ok && gateRun.passed
+      readonly compiled: BuildResult;
+      readonly gateRun: GateRun;             // reused from the extracted runDeterministicGates
+    }
+
+Not added to `@statxai/contracts` — no cross-package need for it is proven
+yet, and the brief this shipped under says not to add one speculatively. A
+`createFrontendBackendCandidateValidator(deps)` factory is also exported,
+matching `createTerraFrontendBackendHandler`'s shape for whatever eventually
+drives this per job, and does nothing 5g-1-specific beyond ensuring
+`validationWorkspacesRoot` exists once rather than on every call.
+
+**Files:** `packages/orchestrator/src/phases/evaluate.ts`
+(`runDeterministicGates` extracted, `evaluateSite` calls it — pure refactor),
+`packages/orchestrator/src/job-validation/frontend-backend.ts` (new),
+`packages/orchestrator/src/index.ts` (export), plus
+`packages/orchestrator/test/frontend-backend-job-validation.test.ts` (unit —
+structural fail-closed checks and the boundary test) and
+`packages/orchestrator/test/frontend-backend-job-validation.integration.test.ts`
+(real Mongo, real `ArtifactRegistry`, real isolated filesystem workspace;
+only the build pipeline itself — `compileSite`/`readBuiltFiles`/
+`readExportFiles`/`runGates` — is faked, the same boundary
+`delivery.parity.integration.test.ts` already fakes it at).
+
+**Tests, end to end:** 484 unit, 194 integration, 678 total — up from 5f's
+472 + 172 = 644 (+12 unit, +22 integration; the figure reported before the
+pinned-input review was 484 + 193 = 677, +1 integration since). Typecheck and
+lint both clean. Not claiming GitHub CI ran on this — it did not; these are
+local results on an uncommitted working tree, per this phase's own
+instruction not to commit.
+
+**Mutation checks, run manually against `job-validation/frontend-backend.ts`,
+each reverted after** (not part of the committed diff; kill counts are
+"tests failed / tests run" for the file(s) actually exercised by that
+mutation): exact-ref resolution replaced with `registry.get()`'s
+latest-version form — covers both "resolve latest instead of exact
+`executionOutputs` ref" and "choose newer candidate version instead of
+attached older one," the same code path (2/21 integration); `job.attempt`
+dropped from the namespace check (1/12 unit); `job._id` dropped from the
+namespace check (1/12 unit); candidate resolved under a hardcoded wrong
+project id (19/21 integration); a `running` job accepted by widening the
+state check (1/12 unit); the role check removed entirely (1/12 unit, same
+edit as the state-check widening above); `executionOutputs` null/undefined
+silently defaulted to a guessed ref instead of failing closed (2/12 unit);
+loss of per-call workspace isolation — `validationWorkspacesRoot` used
+directly instead of a fresh `mkdtemp` subdirectory per call, the closest
+expressible form of "use/write into a non-isolated, persistent workspace,"
+since no canonical-workspace reference exists anywhere in this module to
+mutate into use instead (8/21 integration, cascading `ENOENT`s once the
+shared root was deleted out from under later tests — the isolation failure
+made itself unmissable rather than merely wrong); `registry.accept`,
+`.requestRepair(`, `ModelClient`, and a model-call reference inserted
+together as dead code, to prove promotion/repair/review authority this
+module never legitimately reaches would still be caught structurally if a
+future edit ever added it (1/12 unit, the boundary test, one mutation
+covering all four); the `CandidateShape.safeParse` check skipped, resolving
+straight to a raw cast (1/21 integration); the `finally` cleanup removed
+(8/21 integration — every isolation-cleanup test, plus every test whose own
+assertions happen to include a temp-root emptiness check); the in-memory
+`job` parameter mutated in place after resolution (`job.updatedAt`
+reassigned) — caught only because the "job document is untouched" test was
+strengthened during this phase to assert deep equality against a snapshot of
+the exact object passed in, not merely the database record (1/21
+integration). An eighteenth mutation, added during the pinned-input review
+after the above were already run and reverted: `resolve()` replaced with
+`get()`'s latest-version form on the `businessProfile`/`sitePlan` lookups
+specifically, not the candidate's — killed by exactly the new
+pinned-input test and nothing else (1/22 integration, once that test
+existed). Every mutation attempted was killed by at least one test; none
+were left in the tree — each was reverted and the resulting file diffed
+clean against a backup before moving to the next.
+
+**5g-1 does not accept the job.** **5g-1 does not accept the candidate
+artifact.** **5g-1 does not promote output into the canonical workspace.**
+**`runProject` still does not execute through `JobEngine`.** **No production
+job is automatically enqueued yet.** **No production Luna handler is wired
+yet.**
+
 ### Deliberately next, not now
 
-- **Phase 5g** — validate, accept, and promote one `frontend_backend` job's
-  output: consume the `executionOutputs` refs attached to a validating job,
-  run the existing deterministic gates against the staged candidate, accept
-  the job only when they pass, and materialise/promote the accepted
-  candidate into the canonical workspace only after acceptance — still
-  without Luna or broad replan semantics.
+- **Phase 5g-2** — accept exactly the validated `frontend_backend` candidate:
+  re-prove the same `jobId`/`attempt`/`executionOutputs` binding 5g-1 proved
+  (never re-derive it from scratch, and fail closed if it has changed since),
+  accept only that exact candidate via a harness-owned validator actor,
+  `validating → accepted` through `JobEngine.accept`. Open question this
+  phase deliberately leaves open rather than guessing at: whether
+  `ArtifactRegistry.accept` and `JobEngine.accept` can share one Mongo
+  transaction/session, or whether they must be sequenced with an explicit
+  compensation path if the second call fails after the first succeeds. Still
+  not promoting into the canonical workspace — that stays deferred to a later
+  Phase 5h, same as 5g-1 left it.
 - **Later still** — mapping Luna repair work onto persisted jobs, what a
   replan does to jobs from the superseded plan (`superseded` does not exist
   yet), orphaned staging cleanup (deferred deliberately, not overlooked), and
