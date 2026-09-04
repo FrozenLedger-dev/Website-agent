@@ -12,3 +12,4 @@ export * from './replanning.js';
 export * from './release.js';
 export * from './job-handlers/frontend-backend.js';
 export * from './job-validation/frontend-backend.js';
+export * from './job-acceptance/frontend-backend.js';

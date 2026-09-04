@@ -221,9 +221,14 @@ describe('the happy path', () => {
     const result = await validateFrontendBackendCandidate(job, deps());
 
     expect(result).toEqual({
-      jobId: 'job_validate_happy',
-      attempt: 1,
-      candidate: candidateRef,
+      binding: {
+        projectId: 'proj_validate_happy',
+        jobId: 'job_validate_happy',
+        attempt: 1,
+        candidate: candidateRef,
+        businessProfile: job.spec.inputs[FRONTEND_BACKEND_INPUT.businessProfile],
+        sitePlan: job.spec.inputs[FRONTEND_BACKEND_INPUT.sitePlan],
+      },
       ok: true,
       compiled: { ok: true, durationMs: 5, output: '', outDir: expect.any(String) },
       gateRun: gateVerdict,
@@ -543,7 +548,7 @@ describe('validation is repeatable', () => {
     expect(compileSeen).toEqual(['repeatable content', 'repeatable content']);
 
     // No new artifact version was created by validating twice.
-    const versions = await store.artifacts.find({ projectId, name: first.candidate.name }).toArray();
+    const versions = await store.artifacts.find({ projectId, name: first.binding.candidate.name }).toArray();
     expect(versions).toHaveLength(1);
   });
 });

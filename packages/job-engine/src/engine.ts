@@ -110,6 +110,49 @@ export class JobAttemptConflict extends Error {
 }
 
 /**
+ * Raised by the guarded form of `accept` (Phase 5g-2) when a `validating`
+ * job's current `attempt` or `executionOutputs` no longer match what the
+ * caller has evidence for — the job moved on to a later execution, or its
+ * staged output changed, since whoever is accepting last knew about it.
+ *
+ * Distinct from {@link JobAttemptConflict} on purpose: that error belongs to
+ * the *running*-job authority domain (a worker's lease generation).
+ * `validating` has no lease to fence — this is a different fact, about
+ * whether accepted evidence still describes the job's current state at all.
+ */
+export class JobAcceptanceBindingConflict extends Error {
+  constructor(
+    readonly jobId: string,
+    readonly reason: 'attempt' | 'outputs',
+  ) {
+    super(`Job ${jobId}: current ${reason} no longer matches what this acceptance expected`);
+    this.name = 'JobAcceptanceBindingConflict';
+  }
+}
+
+/**
+ * Raised when `accept`'s guard options are supplied inconsistently — one of
+ * `expectedAttempt`/`expectedOutputs` given without the other. Together they
+ * identify one execution's binding; neither means anything alone, so a
+ * caller supplying only one is almost certainly a mistake, not a looser
+ * guard, and is rejected before anything is read or written.
+ */
+export class InvalidAcceptanceBinding extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidAcceptanceBinding';
+  }
+}
+
+function sameOutputs(current: readonly ArtifactRef[] | null, expected: readonly ArtifactRef[]): boolean {
+  if (current === null || current.length !== expected.length) return false;
+  return current.every((ref, i) => {
+    const other = expected[i]!;
+    return ref.name === other.name && ref.version === other.version && ref.contentHash === other.contentHash;
+  });
+}
+
+/**
  * Raised when `claim()` is asked to narrow to a role set that is not a
  * non-empty subset of what the supplied tier may execute (Phase 5d).
  *
@@ -314,9 +357,107 @@ export class JobEngine {
     return this.transitionOwnedRunning(jobId, workerId, attempt, 'validating', extra, options.now);
   }
 
-  /** Validation passed. Terminal. */
-  async accept(jobId: string, actor: string): Promise<JobDocument> {
-    return this.transition(jobId, ['validating'], 'accepted', actor, { lease: null });
+  /**
+   * Validation passed. Terminal.
+   *
+   * `options.expectedAttempt`/`options.expectedOutputs`, when both given
+   * (Phase 5g-2), additionally guard the transition on the job's *current*
+   * `attempt` and `executionOutputs` still matching exactly — proven by a
+   * read inside the same transaction this method performs, not merely
+   * checked beforehand and trusted. Omitted, `accept` behaves exactly as it
+   * always has: any `validating` job is accepted by state alone. Supplying
+   * only one of the pair is rejected outright, before anything is read or
+   * written — see {@link InvalidAcceptanceBinding}.
+   *
+   * `options.session`, when supplied, is used directly and no transaction is
+   * opened here — the caller already owns one, typically because it must
+   * also accept a candidate artifact this same acceptance is for,
+   * atomically, in the one Mongo transaction. Omitted, this opens its own,
+   * exactly like every other guarded method in this file.
+   */
+  async accept(
+    jobId: string,
+    actor: string,
+    options: {
+      expectedAttempt?: number;
+      expectedOutputs?: readonly ArtifactRef[];
+      session?: ClientSession;
+    } = {},
+  ): Promise<JobDocument> {
+    if ((options.expectedAttempt === undefined) !== (options.expectedOutputs === undefined)) {
+      throw new InvalidAcceptanceBinding(
+        'JobEngine.accept: expectedAttempt and expectedOutputs must be supplied together, or not at all',
+      );
+    }
+    if (options.expectedAttempt !== undefined) {
+      return this.acceptGuarded(jobId, actor, options.expectedAttempt, options.expectedOutputs!, options.session);
+    }
+    return this.transition(jobId, ['validating'], 'accepted', actor, { lease: null }, options.session);
+  }
+
+  /**
+   * The guarded half of {@link accept}. Reads the job first — inside the
+   * same transaction/session the write below uses — so a stale `attempt` or
+   * `executionOutputs` is caught by comparing values in code, not by trying
+   * to express array/document equality inside a Mongo filter (BSON compares
+   * embedded documents field-by-field in stored order, which this repo's own
+   * `ArtifactRef` objects have never needed to promise). Snapshot isolation
+   * inside one transaction is what keeps this safe: a concurrent write from
+   * *outside* it either lands before this transaction starts (so this read
+   * already sees it) or conflicts with it at commit time (so the write below
+   * fails and the whole transaction aborts) — never silently in between.
+   */
+  private async acceptGuarded(
+    jobId: string,
+    actor: string,
+    expectedAttempt: number,
+    expectedOutputs: readonly ArtifactRef[],
+    session?: ClientSession,
+  ): Promise<JobDocument> {
+    assertTransition('validating', 'accepted');
+
+    const run = async (session: ClientSession): Promise<JobDocument> => {
+      const now = new Date();
+
+      const current = await this.store.jobs.findOne({ _id: jobId }, { session });
+      if (!current) throw new JobNotFound(jobId);
+      if (current.state !== 'validating') throw new JobStateConflict(jobId, ['validating']);
+      if (current.attempt !== expectedAttempt) throw new JobAcceptanceBindingConflict(jobId, 'attempt');
+      if (!sameOutputs(current.executionOutputs, expectedOutputs)) {
+        throw new JobAcceptanceBindingConflict(jobId, 'outputs');
+      }
+
+      const updated = await this.store.jobs.findOneAndUpdate(
+        { _id: jobId, state: 'validating', attempt: expectedAttempt },
+        { $set: { state: 'accepted', updatedAt: now, lease: null } },
+        { session, returnDocument: 'after' },
+      );
+
+      if (!updated) {
+        // Something changed between the read above and this write, inside
+        // the same transaction — a concurrent transaction elsewhere must
+        // have committed first. Reclassified from what is actually there
+        // now, the same idiom every other guarded transition in this file
+        // uses on a failed match.
+        const exists = await this.store.jobs.findOne({ _id: jobId }, { session });
+        if (!exists) throw new JobNotFound(jobId);
+        if (exists.state !== 'validating') throw new JobStateConflict(jobId, ['validating']);
+        throw new JobAcceptanceBindingConflict(jobId, 'attempt');
+      }
+
+      await this.audit(session, {
+        projectId: updated.projectId,
+        jobId,
+        kind: 'job_transition',
+        actor,
+        detail: { to: 'accepted', attempt: updated.attempt },
+        at: now,
+      });
+      return updated;
+    };
+
+    if (session) return run(session);
+    return this.store.withTransaction(run);
   }
 
   /** Validation failed with a defect that warrants a repair job. */
@@ -523,16 +664,23 @@ export class JobEngine {
     });
   }
 
+  /**
+   * `session`, when supplied (Phase 5g-2), is used directly and no
+   * transaction is opened here — the caller already owns one. Every
+   * pre-5g-2 caller omits it and gets exactly the original behaviour: its
+   * own transaction, opened and committed by this call alone.
+   */
   private async transition(
     jobId: string,
     from: readonly JobState[],
     to: JobState,
     actor: string,
     extra: Record<string, unknown>,
+    session?: ClientSession,
   ): Promise<JobDocument> {
     for (const state of from) assertTransition(state, to);
 
-    return this.store.withTransaction(async (session) => {
+    const run = async (session: ClientSession): Promise<JobDocument> => {
       const now = new Date();
       const updated = await this.store.jobs.findOneAndUpdate(
         { _id: jobId, state: { $in: [...from] } },
@@ -555,7 +703,10 @@ export class JobEngine {
         at: now,
       });
       return updated;
-    });
+    };
+
+    if (session) return run(session);
+    return this.store.withTransaction(run);
   }
 
   private async audit(session: ClientSession, event: AuditEvent): Promise<void> {

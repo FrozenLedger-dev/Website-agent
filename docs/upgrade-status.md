@@ -1882,19 +1882,463 @@ artifact.** **5g-1 does not promote output into the canonical workspace.**
 job is automatically enqueued yet.** **No production Luna handler is wired
 yet.**
 
+### Phase 5g-2 — atomic acceptance of the exact validated frontend/backend candidate — **DONE**
+
+5g-1 produces evidence; it accepts nothing. 5g-2 is the separate, explicit
+step that consumes *successful* evidence and, in one Mongo transaction,
+accepts exactly the candidate artifact it describes and moves its job
+`validating → accepted` — never both, never neither, never one without the
+other.
+
+**5g-1 stays read-only, unchanged in behaviour.** `validateFrontendBackendCandidate`
+still does exactly what it did: pass → evidence, job stays `validating`; fail
+→ evidence, job stays `validating`. What changed is its result's *shape*, not
+its behaviour — extended (§5 of the brief this shipped under, which
+explicitly authorised extending it in this same commit) with a `binding`
+field:
+
+    interface FrontendBackendValidationBinding {
+      readonly projectId: string;
+      readonly jobId: string;
+      readonly attempt: number;
+      readonly candidate: ArtifactRef;
+      readonly businessProfile: ArtifactRef;
+      readonly sitePlan: ArtifactRef;
+    }
+    interface FrontendBackendCandidateValidation {
+      readonly binding: FrontendBackendValidationBinding;
+      readonly ok: boolean;
+      readonly compiled: BuildResult;
+      readonly gateRun: GateRun;
+    }
+
+The previously-flat `jobId`/`attempt`/`candidate` fields moved into `binding`
+alongside two new ones (`projectId`, `businessProfile`, `sitePlan`) rather
+than staying duplicated at both levels — every existing 5g-1 test that read
+them was updated to match the new shape; none had their assertions loosened
+to do it.
+
+**Transaction support, inspected before writing anything (§1).** `StateStore.withTransaction`
+is the one canonical transaction owner in this repo — every `JobEngine`
+mutation already opened its own via it, and `ArtifactRegistry.accept` and
+`ArtifactRegistry.put` already accepted an optional `ClientSession` (`.put`
+did; `.accept` did too, though nothing exercised it transactionally before
+now). Conclusion: a shared atomic transaction across both is achievable with
+small, additive session-propagation changes to existing methods — no new
+transaction system, no nested transactions, exactly the brief's preferred
+outcome. §2's "stop and report if impossible" branch was not needed.
+
+**`JobEngine.accept` gained a guarded form, additively (§11–§13).** The
+existing `accept(jobId, actor)` signature is unchanged in behaviour when
+called exactly as before — every pre-5g-2 caller does, and stays exactly as
+correct. A new optional third parameter,
+`{ expectedAttempt?, expectedOutputs?, session? }`, is checked first for
+all-or-nothing (`InvalidAcceptanceBinding` if only one of the pair is given,
+before anything is read); when both are given, `accept` re-reads the job
+fresh — inside the caller's own `session` when one is supplied, inside its
+own transaction otherwise — and independently re-proves `state === 'validating'`,
+`attempt === expectedAttempt`, and `executionOutputs` exactly equal to
+`expectedOutputs` (compared field-by-field — `name`/`version`/`contentHash`
+— rather than as a literal Mongo document/array match, which would have been
+silently sensitive to BSON key order) before the guarded write, or throws
+`JobAcceptanceBindingConflict`. `JobEngine` remains the sole owner of the
+`validating → accepted` mutation and its audit event; no transition logic
+was duplicated in the orchestrator.
+
+**Session propagation, added exactly where it was missing (§14).** `JobEngine`'s
+private `transition` helper (already shared by `accept`'s ungated form,
+`requestRepair`, `block`, `release`, and `fail`'s validating branch) gained
+an optional trailing `session` parameter: supplied, it runs directly against
+that session and opens no transaction of its own; omitted, it opens its own,
+byte-for-byte the pre-5g-2 behaviour. `ArtifactRegistry.accept` already had
+session support; it was extended only to *report* whether anything matched
+(`Promise<boolean>` instead of `Promise<void>` — every existing caller
+already ignored the return value, so this is source-compatible), since a
+`false` return is exactly the "the exact validated candidate no longer
+exists" fault this phase needs to distinguish from a silent no-op success.
+
+**The production acceptance function, `acceptValidatedFrontendBackendCandidate(validation, deps)`,
+in `packages/orchestrator/src/job-acceptance/frontend-backend.ts`.** Deps are
+`{ store: StateStore; registry: ArtifactRegistry; engine: JobEngine }` — no
+`ProjectWorkspace`, no canonical `workspacesRoot`, no `ModelClient`, exactly
+as 5g-1's own validator has none: "promote into the canonical workspace" and
+"invoke a model" are not merely avoided by convention here, there is nothing
+in scope that could reach either.
+
+**Refuses forged or reconstructed evidence, checked before anything else.**
+Reviewed and closed in this same uncommitted tree: nothing described above
+proved the `FrontendBackendCandidateValidation` object handed to acceptance
+was ever actually produced by the real validator — a hand-built object with
+a correct-looking, currently-matching `binding` and `ok: true` would have
+sailed through every check that follows, since all of them test whether the
+*content* is current, never whether the *object* is genuine. Closed with the
+smallest mechanism that fits an in-process handoff: a `WeakSet` in
+`job-validation/frontend-backend.ts`. No persistence, no signature, no
+database collection, no new job state — membership is keyed on object
+identity alone, which is exactly what "these two functions are still in the
+same process, in the same call" already guarantees and needs nothing more
+to prove. This check is orthogonal to `assertBindingCurrent`'s: authenticity
+says the evidence is real; the binding check says it is still current. An
+authentic object can still describe a job that has since moved on, and both
+must hold.
+
+Three tests below construct real evidence and then tamper its `.binding`
+*in place* (never by spreading a new top-level object) specifically so the
+authenticity check stays satisfied and the test exercises the binding check
+it was written for, not this one — spreading would have made every one of
+them fail for the wrong reason once this check existed.
+
+**Second review, same tree: the first version of this WeakSet registered
+every result — pass or fail — and that was a real gap, not merely a
+missed nicety.** It proved an object was genuinely the validator's own but
+said nothing about whether its `ok` could still be trusted, and `readonly`
+is a compile-time fiction: a genuinely failed result, mutated in place
+afterward (`(validation as { ok: boolean }).ok = true`), was still the exact
+object registered — same reference, so authenticity still passed, and then
+`validation.ok` read `true`. The fix moved the registration itself: only a
+*passing* result — `if (result.ok) AUTHENTIC_SUCCESSFUL_VALIDATIONS.add(result)`
+— is ever a member; a failed result is never registered at all, so no
+runtime mutation of any field on it after the fact can retroactively make it
+one. The decision is made exactly once, from the value `ok` actually held
+the moment deterministic validation finished, not from whatever it says if
+read again later. The checker was renamed to match —
+`isAuthenticSuccessfulFrontendBackendValidation(value: unknown): value is SuccessfulFrontendBackendCandidateValidation`,
+a proper type guard narrowing to a new exported type
+(`FrontendBackendCandidateValidation & { readonly ok: true }`) — and it is
+now the *only* gate in `acceptValidatedFrontendBackendCandidate`: the
+separate `if (!validation.ok)` check that used to follow it was deleted as
+dead code, since nothing reaching that point can have `ok` false by
+construction any more. `AcceptanceRequiresSuccessfulValidation` was removed
+with it; `AcceptanceEvidenceNotAuthentic` now covers every way evidence can
+fail to be an authenticated pass — forged, cloned, a genuine fail, or a
+genuine fail mutated after the fact — deliberately as one check and one
+error, since all four are indistinguishable once evidence stops being
+trustworthy on its own terms. `Object.freeze` was considered and
+deliberately not applied: it would have blocked the established
+in-place-`.binding`-tamper test technique used across five existing tests
+without restoring a way to construct "authentic evidence, deliberately
+stale binding," and the pass-only registry alone already gives the property
+that matters — proven directly by a test that mutates `ok` and lets the
+runtime permit it, precisely to exercise the registry rather than a freeze
+guard.
+
+**Refuses non-evidence outright.** `validation.ok !== true` throws
+`AcceptanceRequiresSuccessfulValidation` before any store, registry, or
+engine call — checked first, unconditionally (after authenticity).
+
+**Re-proves the complete binding, fresh, inside the transaction (§6–§9, §16).**
+A cheap, read-only pre-check (outside any transaction, permitted explicitly
+by §16) exists only to make an exact replay of an already-accepted job safe
+(below); every other path falls through to one Mongo transaction that reads
+the job *again*, inside the session, and independently checks — before
+either write — `projectId`, `role`, `state`, `attempt`, the candidate's
+namespace (via Phase 5f's own `jobOutputNamespace`, not a second
+implementation), the exact `executionOutputs` ref, and both pinned inputs
+(`businessProfile`, `sitePlan`) against the job's own `spec.inputs`, all via
+exact `ArtifactRef` field equality — never resolved by "latest," never
+inferred from the candidate's own contents. Any mismatch throws
+`AcceptanceBindingStale` with a `reason` naming which fact moved first — not
+necessarily the only one that did.
+
+**Only the exact validated candidate version is ever accepted.** `ArtifactRegistry.accept`
+is called once, addressed by the binding's exact `(projectId, name, version)`
+— never `get()`'s latest form, never every artifact under the attempt's
+namespace. Its `false` return (no document matched that exact identity) is a
+platform/data-integrity fault, `AcceptanceCandidateMissing` — never converted
+to a silent no-op, never a search for a substitute.
+
+**One shared transaction, proven, not assumed.** The central operation is:
+
+    return deps.store.withTransaction(async (session) => {
+      const currentJob = await deps.store.jobs.findOne({ _id: binding.jobId }, { session });
+      assertBindingCurrent(currentJob, binding);           // fails closed, throws
+      const accepted = await deps.registry.accept(currentJob.projectId, binding.candidate, session);
+      if (!accepted) throw new AcceptanceCandidateMissing(...);
+      const acceptedJob = await deps.engine.accept(binding.jobId, ACCEPTANCE_ACTOR, {
+        expectedAttempt: binding.attempt,
+        expectedOutputs: [binding.candidate],
+        session,
+      });
+      return { jobId: acceptedJob._id, attempt: acceptedJob.attempt, candidate: binding.candidate, state: 'accepted' };
+    });
+
+Proven, not merely inspected: one test spies on both `registry.accept` and
+`engine.accept` and asserts the exact same `ClientSession` object reached
+both — but that alone only proves what was *passed*, not what the callee
+*did* with it, so a second, sharper test lets the real `engine.accept`
+genuinely run (via a spy that calls through before throwing) and then forces
+a failure immediately after — proving the job write itself is undone when
+the transaction aborts, not merely that a session argument was accepted. Two
+further tests force `engine.accept` and `registry.accept` to fail in turn
+(fully mocked, no pass-through) and prove the other side's already-applied
+write rolls back too, with zero accepted-transition audit surviving either
+way.
+
+**Acceptance actor is fixed, never inherited.** `ACCEPTANCE_ACTOR = 'harness:validator'`
+— the same literal every generic `JobEngine.accept` test in this repo
+already used before 5g-2 existed. Never `sol`/`terra`/`luna`, and never the
+original build execution's `workerId`: this module receives no worker
+identity at all to inherit one from even if it wanted to.
+
+**Idempotent replay, implemented lightly (§22).** Before opening the
+transaction, if the job is already `accepted`, its binding and its
+candidate's `acceptedAt` are checked for consistency with the validation
+evidence; if they agree, the same success result is returned with no second
+transition, no second audit event, no second artifact write.
+Disagreement — an accepted job whose exact candidate is somehow still
+unaccepted, or whose binding no longer matches — is reported as
+`AcceptanceInconsistentState`, never silently repaired.
+
+**Files:** `packages/orchestrator/src/job-acceptance/frontend-backend.ts`
+(new), `packages/orchestrator/src/job-validation/frontend-backend.ts`
+(`binding` extension), `packages/orchestrator/src/index.ts` (export),
+`packages/job-engine/src/engine.ts` (`accept`'s guarded form,
+`JobAcceptanceBindingConflict`, `InvalidAcceptanceBinding`, `transition`'s
+optional `session`), `packages/workspace/src/registry.ts` (`accept` returns
+`Promise<boolean>`), plus `packages/job-engine/test/engine.test.ts` (a new
+"guarded acceptance" suite, 6 tests, exercising the extension directly and
+independently of the orchestrator), `packages/orchestrator/test/frontend-backend-job-validation.integration.test.ts`
+(assertions updated for the `binding` shape — behaviour unchanged),
+`packages/orchestrator/test/frontend-backend-job-acceptance.test.ts` (unit —
+the `validation.ok` gate and the structural boundary test) and
+`packages/orchestrator/test/frontend-backend-job-acceptance.integration.test.ts`
+(real Mongo transactions throughout — this is the one phase in this series
+where a mocked driver genuinely could not stand in for the property being
+proven).
+
+**Tests, end to end:** 487 unit, 228 integration, 715 total — up from 5g-1's
+484 + 194 = 678 (+3 unit, +34 integration: 28 in the acceptance integration
+suite — 25 from the initial pass, +2 for the forged-pass and cloned-evidence
+authenticity tests, +1 for the mutated-fail-to-pass regression test added in
+the second, pass-only-registry review — plus 6 in engine.test.ts's
+guarded-acceptance suite; the frontend-backend-job-validation.integration.test.ts
+count is unchanged since its assertions were edited, not added to).
+Typecheck and lint both clean. Not claiming GitHub CI ran on this — it did
+not; these are local results on an uncommitted working tree, per this
+phase's own instruction not to commit.
+
+**Mutation checks, run manually against `job-acceptance/frontend-backend.ts`,
+`job-engine/engine.ts`, and `workspace/registry.ts`, each reverted after**
+(not part of the committed diff; kill counts are "tests failed / tests run"
+for the file(s) actually exercised): (1) `validation.ok === false` accepted
+by deleting the guard — killed at both layers, the fake-deps unit test (1/2)
+and the real-evidence integration test (1/25); (2) the transactional job
+reread skipped, trusting the binding directly — 9/21 (run before two tests
+below existed; the redundant checks it also silently removed are covered
+individually next); (3) attempt mismatch ignored — 0/21 against the existing
+suite alone, because `jobOutputNamespace` is a pure function of attempt, so
+any attempt divergence reachable through real engine transitions is always
+also a namespace divergence; closed with a dedicated test constructing a
+binding whose declared attempt disagrees with its own still-correctly-
+namespaced candidate, isolating the check — 1/22 once that test existed; (4)
+executionOutputs mismatch ignored — 3/21; (5) businessProfile binding
+mismatch ignored — 1/22; (6) sitePlan binding mismatch ignored — 0/22
+against the existing suite (no test yet covered sitePlan specifically,
+mirroring businessProfile's own coverage exactly), 1/23 once a dedicated
+sitePlan-changed test was added, mirroring the businessProfile one; (7)
+latest candidate version accepted instead of the exact validated ref — 8/23;
+(8) whole attempt namespace accepted instead of the one exact ref — 3/23;
+(9) validation result's `projectId` used without comparing the current job's
+— 0/23 against the existing suite (every constructed cross-job/cross-project
+scenario also trips the namespace or outputs check first), 1/24 once a
+dedicated test held every other binding field genuinely consistent with the
+real job and varied only `projectId`; (10) artifact acceptance performed
+outside the transaction (session dropped from that one call) — 2/24, the
+rollback test and the shared-session identity test; (11) `JobEngine.accept`
+performed outside the transaction (session dropped from that one call) —
+0/24 against the existing suite, because `JobEngine.accept` without a
+session still opens its *own* transaction and still aborts when the
+caller's own transaction later fails for an unrelated reason in the same
+callback, so the *outer* rollback still empties the *inner* one by
+coincidence in every scenario those tests construct; caught only by the
+shared-session identity test (1/24, since it inspects what was passed, not
+what ran) and, more sharply, by a dedicated call-through-then-fail test
+added specifically to distinguish "session accepted" from "session used" —
+1/25 at the orchestrator layer, and independently 1/61 at `engine.test.ts`
+itself once the equivalent direct test was added there too; (12) shared-
+session propagation removed from `ArtifactRegistry.accept` itself (session
+parameter ignored) — 1/24, the rollback test, since the write now commits
+immediately instead of participating in the caller's transaction; (13)
+shared-session propagation removed from `JobEngine`'s guarded `accept`
+itself — see (11), same mutation, same two precise kills; (14) state-only
+`validating → accepted` used by omitting `expectedAttempt`/`expectedOutputs`
+from the orchestrator's own call — 0/25 behaviourally, for the same
+redundancy reason as (3): the orchestrator's own binding check, performed
+moments earlier in the same transaction, already guarantees nothing could
+have changed; closed with a structural test (in the unit suite) asserting
+the source's one `deps.engine.accept(` call literally contains both option
+names — 1/3 unit, since no behavioural test can see this one; (15) artifact
+accepted but a failed job transition silently swallowed (wrapped in
+try/catch, falling back to the pre-transition job) — 2/25; (16) job
+transitioned to accepted but artifact acceptance skipped entirely — 7/25;
+(17) acceptance actor changed to `'sol'` — 1/25, the happy-path test's own
+actor assertion; (18) acceptance actor changed to a hardcoded Terra
+`workerId` — 1/25, same assertion; (19–20) candidate promoted into the
+canonical workspace / repair invoked on validation failure — not
+independently expressible as a reachable code-path mutation, since the
+module holds no canonical-workspace or repair-capable dependency to promote
+or invoke through at all; demonstrated instead, as in 5g-1's equivalent
+case, by inserting the literal forbidden calls as dead code and confirming
+the structural boundary test catches all three markers
+(`ProjectWorkspace`/`.commit(`/`.requestRepair(`) in one shot — 1/3 unit.
+Every mutation attempted was killed by at least one test, once the two
+genuine coverage gaps mutations (6) and (9) surfaced were closed with
+dedicated tests rather than left as unexplained zero-kill results; none were
+left in the tree — each was reverted and the resulting file diffed clean
+against a backup before moving to the next.
+
+**A 21st mutation, added during the evidence-authenticity review after the
+above were already run and reverted:** the `isAuthenticFrontendBackendValidation`
+check deleted from `acceptValidatedFrontendBackendCandidate`, falling
+straight through to the `validation.ok` check as before this review. Killed
+by exactly three tests and nothing else — the forged-pass test (a
+hand-constructed `{ ok: true, ...correct binding }` object, directly, as
+required), the cloned-evidence test (`JSON.parse(JSON.stringify(real))`),
+and the unit-level hand-built-object test — 3/27 integration + 1/3 unit.
+Every other test in both suites stayed green, confirming the check's removal
+is invisible to everything that isn't specifically testing authenticity —
+exactly the property a correctly-scoped addition should have. Reverted and
+diffed clean against a backup, same as every other mutation in this phase.
+(`isAuthenticFrontendBackendValidation` was the checker's name at the time;
+the second review below renamed and narrowed it.)
+
+**A 22nd mutation, added during the second (pass-only-registry) review,
+after the fix above:** the registration guard —
+
+    if (result.ok) {
+      AUTHENTIC_SUCCESSFUL_VALIDATIONS.add(result);
+    }
+
+— changed to register unconditionally (`if (true) { ... }`), restoring the
+exact gap the review found: a failed result registered anyway, so mutating
+its `ok` field afterward would again read as an authenticated pass. Killed
+by exactly two tests: `'failed validation cannot accept'`'s own real-fail
+assertion, and — the one the review specifically required —
+`'a real FAIL result cannot be turned into acceptable evidence by mutating
+its own ok field, even if the runtime permits it'` — 2/28 integration.
+Every other test, including the forged-pass and cloned-evidence tests from
+the first review, stayed green: this mutation only reopens the
+pass-vs-fail-registration gap, nothing else. Reverted and diffed clean
+against a backup.
+
+**Third review, same tree: proving the result *object* was authentic still
+was not enough, because acceptance kept reading `validation.binding` — the
+same public, mutable field a caller holds a reference to — for every
+authority decision.** This was the serious one: `assertBindingCurrent`
+never checked whether the *object* was genuine, only whether its *binding*
+matched the live job — so mutating `result.binding` in place to describe a
+different candidate, after the fact, changed what every check compared
+against. If the live job had also (legitimately) moved on to describe that
+same candidate by the time acceptance ran, every check would agree with the
+tampered binding, and a candidate 5g-1 never actually ran deterministic
+validation against would be accepted. The `WeakSet` — which only ever
+recorded "is this the real object," never "does its binding still say what
+was actually validated" — could not have caught this by construction,
+regardless of which version of it was in place.
+
+Fixed by replacing the `WeakSet` with a `WeakMap<object, FrontendBackendValidationBinding>`:
+what it stores per result is not a bare membership flag but an independent
+*snapshot* of the binding, cloned field-by-field — including fresh
+`ArtifactRef` objects, not shared references — at the exact moment
+deterministic validation passed, into objects the public `result.binding`
+never points at and no caller outside `job-validation/frontend-backend.ts`
+ever sees. `authenticSuccessfulValidationBinding(value: unknown): FrontendBackendValidationBinding | null`
+is the only way to retrieve it, and `acceptValidatedFrontendBackendCandidate`
+uses *only* what it returns for every authority decision from that point on
+— it does not read `validation.binding` again for anything but composing
+the one error message when the lookup itself fails. Mutating the public
+field is now provably inert: it cannot change which job gets looked up,
+which candidate gets checked, or what any comparison is checked against,
+because none of those ever consult it again.
+
+`Object.freeze` was considered again here too and again set aside for the
+*public* binding, for the same reason as the second review — it would have
+broken the established in-place-tamper test technique with no full
+replacement for "authentic evidence, deliberately stale binding." The
+*private* snapshot, by contrast, is frozen (`Object.freeze` on the snapshot
+and on each cloned `ArtifactRef` inside it): nothing outside this module
+ever holds a reference to it to mutate in the first place, so freezing it
+costs nothing and closes the mutation path on the one copy that actually
+matters.
+
+Five existing tests that tampered `validation.binding` in place to prove a
+mismatch, expecting rejection, needed to change: with the public field no
+longer read for anything, tampering it to redirect acceptance toward
+another job or project no longer causes rejection — it causes acceptance to
+correctly ignore the tampering and proceed against the *original*, real
+binding instead, which is the stronger and now-correct property to assert.
+Two ("another job's candidate," "another project") were rewritten to prove
+exactly that: mutate the public binding to name a different job, and
+acceptance still resolves and accepts only the original. Two more
+(the attempt-only and projectId-only isolation tests) moved their tamper
+from the evidence to the live job document instead, via the same raw
+`store.jobs.updateOne` technique already used elsewhere for anomalies no
+real engine call can produce, since isolating one field of an
+*unreachable-to-tamper* binding no longer means anything at the evidence
+layer. The "candidate missing" test's construction — a namespaced-but-never-written
+ref simultaneously written into both the job's `executionOutputs` and the
+evidence's binding — could no longer reach the evidence side at all, and
+turned out to describe something now structurally impossible anyway: the
+private snapshot can only ever name an artifact that `validateFrontendBackendCandidate`
+itself already resolved successfully, and artifacts in this repo are
+immutable and never deleted, so a genuine snapshot's candidate cannot later
+stop existing. Rewritten to exercise the exact code path directly — `registry.accept`
+reporting no match, via a one-call mock — the same platform/data-integrity
+fault the error exists for, without fabricating a data shape genuine
+evidence could never actually have. A sixth test, "validation result cannot
+be mixed," was retired outright: its distinguishing construction (a
+same-namespace orphan substituted for the real candidate) became
+indistinguishable, once tamper had to move to the job, from the existing
+"executionOutputs changed after validation" test — keeping both would have
+meant one was a byte-for-byte duplicate of the other.
+
+The mandatory regression test proves the full attack directly: candidate A
+passes 5g-1; the job then *legitimately* advances — attempt 1 fails for
+real, is reclaimed, and attempt 2 stages and submits an entirely different
+candidate B, so the job's current state is exactly what a real retry
+produces, not a fabrication; the public `.binding` on A's original result is
+then mutated to describe that same attempt/candidate B, so the public field
+agrees with the live job perfectly. Acceptance still rejects it
+(`AcceptanceBindingStale`), because the private snapshot behind it still
+says attempt 1 / candidate A, and that is what gets checked against the live
+job instead — B is a candidate 5g-1 never ran deterministic validation
+against, and it is confirmed to remain unaccepted, alongside A, with the job
+still validating and no accepted audit.
+
+**A 23rd mutation, added during this third review, mandated directly:**
+`acceptValidatedFrontendBackendCandidate` changed to still call
+`authenticSuccessfulValidationBinding` for its existence check but then use
+`validation.binding` — the public field — for the `binding` variable every
+later check actually reads, restoring exactly the bug this review found.
+Killed by three tests: the mandatory provenance-attack regression test
+itself, and the two rewritten "another job"/"another project" tests whose
+entire point is that tampering the public field is inert — with the bug
+reintroduced, tampering it redirects acceptance again, which those two now
+correctly flag as a failure. 3/28 integration. Every other test, including
+every other test added or touched by the first two reviews, stayed green.
+Reverted and diffed clean against a backup.
+
+**Net test count is unchanged by this review — 487 unit, 228 integration,
+715 total — despite five tests being substantially rewritten and one
+retired:** the acceptance integration suite lost one test ("validation
+result cannot be mixed," retired as a now-exact duplicate of "executionOutputs
+changed after validation") and gained one (the provenance-attack regression
+test above), holding its own count at 28.
+
+**5g-2 does not promote the candidate into the canonical workspace.** **5g-2
+does not rerun deterministic validation.** **`runProject` still does not
+execute through `JobEngine`.** **No production job is automatically enqueued
+yet.** **No production Luna handler is wired yet.**
+
 ### Deliberately next, not now
 
-- **Phase 5g-2** — accept exactly the validated `frontend_backend` candidate:
-  re-prove the same `jobId`/`attempt`/`executionOutputs` binding 5g-1 proved
-  (never re-derive it from scratch, and fail closed if it has changed since),
-  accept only that exact candidate via a harness-owned validator actor,
-  `validating → accepted` through `JobEngine.accept`. Open question this
-  phase deliberately leaves open rather than guessing at: whether
-  `ArtifactRegistry.accept` and `JobEngine.accept` can share one Mongo
-  transaction/session, or whether they must be sequenced with an explicit
-  compensation path if the second call fails after the first succeeds. Still
-  not promoting into the canonical workspace — that stays deferred to a later
-  Phase 5h, same as 5g-1 left it.
+- **Phase 5h** — idempotent promotion of one accepted `frontend_backend`
+  candidate: starting only from an accepted job, resolve its exact accepted
+  `executionOutputs`, prove the candidate's acceptance state, materialise
+  exactly that candidate into the canonical project workspace, commit it
+  canonically, and make the whole promotion replay-safe — handling the
+  filesystem/Git crash boundary honestly rather than assuming it away. No
+  Luna, no deployment, no broad `runProject` cutover in that slice either.
 - **Later still** — mapping Luna repair work onto persisted jobs, what a
   replan does to jobs from the superseded plan (`superseded` does not exist
   yet), orphaned staging cleanup (deferred deliberately, not overlooked), and

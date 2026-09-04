@@ -126,16 +126,105 @@ export interface FrontendBackendCandidateValidationDeps {
   readonly validationWorkspacesRoot: string;
 }
 
-/** What one isolated, deterministic pass over a fenced candidate found. */
-export interface FrontendBackendCandidateValidation {
+/**
+ * Everything a later acceptance step (Phase 5g-2) needs to re-prove this
+ * evidence is still current, before trusting it: which project, which job,
+ * which exact execution ("attempt"), and the exact three artifact refs
+ * deterministic validation actually ran against — the staged candidate and
+ * the two pinned inputs it was built and gated with. Not persisted anywhere
+ * by this module; carried only in the in-process result below.
+ */
+export interface FrontendBackendValidationBinding {
+  readonly projectId: string;
   readonly jobId: string;
   readonly attempt: number;
   /** The exact ref validated — `job.executionOutputs[0]`, never "latest". */
   readonly candidate: ArtifactRef;
+  readonly businessProfile: ArtifactRef;
+  readonly sitePlan: ArtifactRef;
+}
+
+/** What one isolated, deterministic pass over a fenced candidate found. */
+export interface FrontendBackendCandidateValidation {
+  readonly binding: FrontendBackendValidationBinding;
   /** `compiled.ok && gateRun.passed`. */
   readonly ok: boolean;
   readonly compiled: BuildResult;
   readonly gateRun: DeterministicGateResult['gateRun'];
+}
+
+/** A {@link FrontendBackendCandidateValidation} narrowed to the branch acceptance may ever act on. */
+export type SuccessfulFrontendBackendCandidateValidation = FrontendBackendCandidateValidation & { readonly ok: true };
+
+function cloneArtifactRef(ref: ArtifactRef): ArtifactRef {
+  return Object.freeze(
+    ref.contentHash === undefined
+      ? { name: ref.name, version: ref.version }
+      : { name: ref.name, version: ref.version, contentHash: ref.contentHash },
+  );
+}
+
+/** A binding, copied field-by-field into fresh objects nothing outside this module ever holds a reference to. */
+function cloneValidationBinding(binding: FrontendBackendValidationBinding): FrontendBackendValidationBinding {
+  return Object.freeze({
+    projectId: binding.projectId,
+    jobId: binding.jobId,
+    attempt: binding.attempt,
+    candidate: cloneArtifactRef(binding.candidate),
+    businessProfile: cloneArtifactRef(binding.businessProfile),
+    sitePlan: cloneArtifactRef(binding.sitePlan),
+  });
+}
+
+/**
+ * In-process evidence authenticity (Phase 5g-2's requirement on this
+ * module's output, not a concern of validation itself) — and, deliberately,
+ * *only* for a pass, and *only* by a private, unreachable snapshot of the
+ * binding, never the public `result.binding` a caller can still mutate.
+ *
+ * This mechanism has already been through two narrower versions, each
+ * closing a gap the previous one left:
+ *
+ *   1. A `WeakSet` registering every result, pass or fail alike, keyed on
+ *      object identity. It proved an object was genuinely the validator's
+ *      own but nothing about whether `ok` could still be trusted —
+ *      `readonly` is a compile-time fiction, so a failed result mutated in
+ *      place (`(validation as { ok: boolean }).ok = true`) was still the
+ *      exact registered object.
+ *   2. Registering *only* a passing result closed that — a failed result is
+ *      never a member at all, so no mutation of `ok` after the fact can
+ *      retroactively add it. But `assertBindingCurrent` (in the acceptance
+ *      module) still read `validation.binding` — the same public, mutable
+ *      field a caller holds a reference to — for every authority decision.
+ *      Proving the *result object* was authentic said nothing about whether
+ *      its *binding* still described what was actually validated: mutate
+ *      `result.binding` in place to describe a different candidate, and if
+ *      the live job has *also* moved to describe that same candidate by
+ *      then, every check would agree with the tampered binding, and a
+ *      candidate that was never deterministically validated would be
+ *      accepted.
+ *
+ * This third version is a `WeakMap`, not a `WeakSet`: what it stores per
+ * result is not a bare "yes, registered" flag but an independent snapshot of
+ * the binding, cloned field-by-field at the moment validation actually
+ * passed, into objects the public `result.binding` never shares a reference
+ * with and no caller outside this module ever sees. Acceptance must use
+ * *this* snapshot for every authority decision — never `validation.binding`
+ * — so mutating the public copy changes nothing about what was actually
+ * authenticated: the two can now disagree, and when they do, the private
+ * snapshot is what acceptance still checks the live job against.
+ */
+const AUTHENTIC_SUCCESSFUL_VALIDATIONS = new WeakMap<object, FrontendBackendValidationBinding>();
+
+/**
+ * The private, authenticated binding snapshot for `value`, or `null` if
+ * `value` is not the exact passing object `validateFrontendBackendCandidate`
+ * returned in this process. This — never `(value as FrontendBackendCandidateValidation).binding`
+ * — is the only binding acceptance may ever use for an authority decision.
+ */
+export function authenticSuccessfulValidationBinding(value: unknown): FrontendBackendValidationBinding | null {
+  if (typeof value !== 'object' || value === null) return null;
+  return AUTHENTIC_SUCCESSFUL_VALIDATIONS.get(value) ?? null;
 }
 
 function requiredRef(job: JobDocument, key: string): ArtifactRef {
@@ -208,14 +297,32 @@ export async function validateFrontendBackendCandidate(
 
     const { compiled, gateRun } = await runDeterministicGates(ws.siteRoot, profile, plan);
 
-    return {
+    const binding: FrontendBackendValidationBinding = {
+      projectId: job.projectId,
       jobId: job._id,
       attempt: job.attempt,
       candidate: candidateRef,
+      businessProfile: profileRef,
+      sitePlan: planRef,
+    };
+    const result: FrontendBackendCandidateValidation = {
+      binding,
       ok: compiled.ok && gateRun.passed,
       compiled,
       gateRun,
     };
+
+    // A private snapshot, registered only on this exact branch — never for a
+    // fail — and cloned rather than pointed at the same `binding` object
+    // `result.binding` exposes: mutating the public field afterward, or the
+    // objects nested in it, changes nothing about what this snapshot says.
+    // See the module doc comment on the `WeakMap` itself for the two
+    // narrower designs this replaced and exactly what each one still let
+    // through.
+    if (result.ok) {
+      AUTHENTIC_SUCCESSFUL_VALIDATIONS.set(result, cloneValidationBinding(binding));
+    }
+    return result;
   } finally {
     await rm(validationRoot, { recursive: true, force: true });
   }

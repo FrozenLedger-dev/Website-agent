@@ -2,7 +2,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { AgentTier, JobSpec, WorkerRole } from '@statxai/contracts';
 import { StateStore } from '@statxai/state';
 import {
+  InvalidAcceptanceBinding,
   InvalidClaimRoles,
+  JobAcceptanceBindingConflict,
   JobAttemptConflict,
   JobEngine,
   JobLeaseConflict,
@@ -391,6 +393,89 @@ describe('lifecycle', () => {
 
     const events = await store.auditLog.find({ jobId: 'job_a' }).sort({ at: 1 }).toArray();
     expect(events.map((e) => e.detail['to'])).toEqual(['running', 'validating', 'accepted']);
+  });
+});
+
+describe('guarded acceptance (Phase 5g-2)', () => {
+  it('accepts when expectedAttempt and expectedOutputs both match the job’s current state', async () => {
+    await engine.enqueue({ spec: spec('job_ga', ['src/ga.tsx']), origin: { kind: 'plan' } });
+    const claim = await engine.claim('worker-1', TERRA);
+    const ref = { name: 'job-output/job_ga/1/build-candidate', version: 1 };
+    await engine.submitForValidation('job_ga', 'worker-1', claim!.attempt, { outputs: [ref] });
+
+    const accepted = await engine.accept('job_ga', 'harness:validator', {
+      expectedAttempt: claim!.attempt,
+      expectedOutputs: [ref],
+    });
+    expect(accepted.state).toBe('accepted');
+  });
+
+  it('rejects when expectedAttempt no longer matches the job’s current attempt', async () => {
+    await engine.enqueue({ spec: spec('job_gb', ['src/gb.tsx']), origin: { kind: 'plan' } });
+    const claim = await engine.claim('worker-1', TERRA);
+    const ref = { name: 'job-output/job_gb/1/build-candidate', version: 1 };
+    await engine.submitForValidation('job_gb', 'worker-1', claim!.attempt, { outputs: [ref] });
+
+    await expect(
+      engine.accept('job_gb', 'harness:validator', { expectedAttempt: claim!.attempt + 1, expectedOutputs: [ref] }),
+    ).rejects.toBeInstanceOf(JobAcceptanceBindingConflict);
+    expect((await store.jobs.findOne({ _id: 'job_gb' }))?.state).toBe('validating');
+  });
+
+  it('rejects when expectedOutputs no longer matches the job’s current executionOutputs', async () => {
+    await engine.enqueue({ spec: spec('job_gc', ['src/gc.tsx']), origin: { kind: 'plan' } });
+    const claim = await engine.claim('worker-1', TERRA);
+    const ref = { name: 'job-output/job_gc/1/build-candidate', version: 1 };
+    const otherRef = { name: 'job-output/job_gc/1/other', version: 1 };
+    await engine.submitForValidation('job_gc', 'worker-1', claim!.attempt, { outputs: [ref] });
+
+    await expect(
+      engine.accept('job_gc', 'harness:validator', { expectedAttempt: claim!.attempt, expectedOutputs: [otherRef] }),
+    ).rejects.toBeInstanceOf(JobAcceptanceBindingConflict);
+    expect((await store.jobs.findOne({ _id: 'job_gc' }))?.state).toBe('validating');
+  });
+
+  it('rejects expectedAttempt supplied without expectedOutputs, before anything is read', async () => {
+    await engine.enqueue({ spec: spec('job_gd', ['src/gd.tsx']), origin: { kind: 'plan' } });
+    await expect(engine.accept('job_gd', 'harness:validator', { expectedAttempt: 1 })).rejects.toBeInstanceOf(
+      InvalidAcceptanceBinding,
+    );
+    expect((await store.jobs.findOne({ _id: 'job_gd' }))?.state).toBe('ready');
+  });
+
+  it('rejects expectedOutputs supplied without expectedAttempt, before anything is read', async () => {
+    await engine.enqueue({ spec: spec('job_ge', ['src/ge.tsx']), origin: { kind: 'plan' } });
+    await expect(
+      engine.accept('job_ge', 'harness:validator', { expectedOutputs: [{ name: 'x', version: 1 }] }),
+    ).rejects.toBeInstanceOf(InvalidAcceptanceBinding);
+    expect((await store.jobs.findOne({ _id: 'job_ge' }))?.state).toBe('ready');
+  });
+
+  it('an externally supplied session genuinely participates in the caller’s own transaction — a later failure rolls the acceptance back too', async () => {
+    // A direct, engine-level proof that `session` is actually used, not
+    // merely accepted and ignored: unlike a test that only checks what was
+    // passed in, this lets the real guarded write happen and then forces a
+    // failure afterward, inside the same transaction — the write can only
+    // survive that if it was never really part of the transaction at all.
+    await engine.enqueue({ spec: spec('job_gf', ['src/gf.tsx']), origin: { kind: 'plan' } });
+    const claim = await engine.claim('worker-1', TERRA);
+    const ref = { name: 'job-output/job_gf/1/build-candidate', version: 1 };
+    await engine.submitForValidation('job_gf', 'worker-1', claim!.attempt, { outputs: [ref] });
+
+    await expect(
+      store.withTransaction(async (session) => {
+        await engine.accept('job_gf', 'harness:validator', {
+          expectedAttempt: claim!.attempt,
+          expectedOutputs: [ref],
+          session,
+        });
+        throw new Error('forced failure after the guarded accept, inside the caller’s own transaction');
+      }),
+    ).rejects.toThrow('forced failure after the guarded accept');
+
+    expect((await store.jobs.findOne({ _id: 'job_gf' }))?.state).toBe('validating');
+    const events = await store.auditLog.find({ jobId: 'job_gf' }).sort({ at: 1 }).toArray();
+    expect(events.map((e) => e.detail['to'])).not.toContain('accepted');
   });
 });
 

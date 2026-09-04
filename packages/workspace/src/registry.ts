@@ -107,13 +107,23 @@ export class ArtifactRegistry {
     return this.get<T>(projectId, ref.name, ref.version);
   }
 
-  /** Mark a version accepted; only accepted versions are valid job inputs. */
-  async accept(projectId: string, ref: ArtifactRef, session?: ClientSession): Promise<void> {
-    await this.store.artifacts.updateOne(
+  /**
+   * Mark a version accepted; only accepted versions are valid job inputs.
+   *
+   * Returns whether a document actually matched — `false` means no artifact
+   * exists under that exact `(projectId, name, version)`, which every
+   * existing caller has been able to ignore (they already know the artifact
+   * exists, having just written or resolved it) but which Phase 5g-2 checks
+   * explicitly: a candidate that vanished between validation and acceptance
+   * must not read as a silent no-op success.
+   */
+  async accept(projectId: string, ref: ArtifactRef, session?: ClientSession): Promise<boolean> {
+    const result = await this.store.artifacts.updateOne(
       { _id: artifactId(projectId, ref.name, ref.version) },
       { $set: { acceptedAt: new Date() } },
       session ? { session } : {},
     );
+    return result.matchedCount === 1;
   }
 
   /** Everything the project has, grouped by name. Not a history. */
