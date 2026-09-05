@@ -311,6 +311,29 @@ describe('fixed identity claims only its tier’s roles', () => {
     const elsewhere = await store.jobs.findOne({ _id: 'job_elsewhere' });
     expect(elsewhere?.state).toBe('ready');
   });
+
+  it('honours the jobId option (Phase 5i), claiming exactly that job over an older ready one', async () => {
+    await engine.enqueue({ spec: spec('job_older', ['src/older.tsx']), origin: { kind: 'plan' } });
+    await engine.enqueue({ spec: spec('job_target', ['src/target.tsx']), origin: { kind: 'plan' } });
+
+    const runner = new JobRunner({
+      engine,
+      identity: TERRA_ID,
+      claimableRoles: TERRA_ALL_ROLES,
+      handlers: fullTerraHandlers(),
+      leaseMs: LEASE_MS,
+      heartbeatEveryMs: HEARTBEAT_MS,
+      now: () => T0,
+      sleep: new ManualScheduler().sleep,
+    });
+
+    const result = await runner.runOnce({ jobId: 'job_target' });
+    expect(result).toMatchObject({ kind: 'submitted', jobId: 'job_target' });
+
+    const older = await store.jobs.findOne({ _id: 'job_older' });
+    expect(older?.state).toBe('ready');
+    expect(older?.attempt).toBe(0);
+  });
 });
 
 /**
@@ -427,9 +450,10 @@ describe('role-scoped worker capabilities', () => {
       sleep: new ManualScheduler().sleep,
     });
 
-    // The only parameter runOnce accepts is a project scope — see its type in
-    // runner.ts (`{ projectId?: string }`). There is no roles/tier/workerId
-    // field to pass here even if a caller wanted to widen this call.
+    // runOnce accepts a project scope and, since Phase 5i, an exact jobId —
+    // see its type in runner.ts (`{ projectId?: string; jobId?: string }`).
+    // Neither widens *what* this runner may claim: there is still no
+    // roles/tier/workerId field to pass here even if a caller wanted to.
     expect(await runner.runOnce({ projectId: PROJECT })).toEqual({ kind: 'idle' });
   });
 

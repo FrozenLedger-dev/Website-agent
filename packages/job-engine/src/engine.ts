@@ -240,20 +240,29 @@ export class JobEngine {
    * Condition (4) is what keeps parallel workers from corrupting a single
    * project repository. §2 promises parallel execution and §1 gives each
    * project one Git repo; the declared `output` list is what reconciles them.
+   *
+   * `options.jobId`, when given (Phase 5i), narrows condition (1) to that
+   * exact job — a caller driving one specific `JobSpec` needs "claim this
+   * job or nothing," never "claim whatever is oldest and ready." Every other
+   * condition still applies unchanged: a job outside the resolved role set,
+   * with an unmet dependency, or output-conflicted with something already
+   * running is still not claimed, exact match or not. Omitted, behaviour is
+   * exactly what it always has been — the oldest eligible `ready` job.
    */
   async claim(
     workerId: string,
     tier: AgentTier,
-    options: { projectId?: string; leaseMs?: number; now?: Date; roles?: readonly WorkerRole[] } = {},
+    options: { projectId?: string; leaseMs?: number; now?: Date; roles?: readonly WorkerRole[]; jobId?: string } = {},
   ): Promise<JobDocument | null> {
     const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
     const roles = this.resolveClaimRoles(tier, options.roles);
 
     return this.store.withTransaction(async (session) => {
       const scope = options.projectId ? { projectId: options.projectId } : {};
+      const exact = options.jobId !== undefined ? { _id: options.jobId } : {};
 
       const candidates = await this.store.jobs
-        .find({ ...scope, state: 'ready', role: { $in: roles } }, { session, sort: { createdAt: 1 } })
+        .find({ ...scope, ...exact, state: 'ready', role: { $in: roles } }, { session, sort: { createdAt: 1 } })
         .toArray();
       if (candidates.length === 0) return null;
 

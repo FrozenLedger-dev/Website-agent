@@ -257,10 +257,16 @@ export class JobRunner {
    * Claim and run at most one job. Never claims more than one, never retries
    * on `idle`, never loops — a caller composes repeated calls into whatever
    * scheduling policy it wants; this is only the unit it repeats.
+   *
+   * `options.jobId`, when given (Phase 5i), passes straight through to
+   * `JobEngine.claim`'s own exact-job narrowing — this runner still only
+   * claims within `claimableRoles`, and every existing dependency/conflict
+   * rule still decides whether that exact job is actually claimable.
    */
-  async runOnce(options: { projectId?: string } = {}): Promise<JobRunOnceResult> {
+  async runOnce(options: { projectId?: string; jobId?: string } = {}): Promise<JobRunOnceResult> {
     const claimed = await this.engine.claim(this.identity.workerId, this.identity.tier, {
       ...(options.projectId !== undefined ? { projectId: options.projectId } : {}),
+      ...(options.jobId !== undefined ? { jobId: options.jobId } : {}),
       leaseMs: this.leaseMs,
       now: this.now(),
       roles: this.claimableRoles,

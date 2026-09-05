@@ -2752,21 +2752,301 @@ files, the whole repo) stayed green throughout; three file checksums
 `workspace/site-build.ts`) confirmed clean against their pre-review backups
 after every mutation was reverted.
 
+### Phase 5i — harness-owned single frontend/backend job lifecycle — **DONE**
+
+Every individual Phase 5 piece already existed — a real Terra handler, 5g-1
+isolated validation, 5g-2 atomic acceptance, 5h replay-safe promotion — but
+nothing chained them together for one explicit job. 5i is that composition,
+and nothing else: it calls the existing production boundaries in sequence,
+driven by the job's own durable state, and reimplements none of them.
+
+**Production module and API.**
+`packages/orchestrator/src/job-lifecycle/frontend-backend.ts` —
+`createFrontendBackendLifecycleCoordinator(deps): FrontendBackendLifecycleCoordinator`,
+where the coordinator's one method is `run(spec: JobSpec):
+Promise<FrontendBackendLifecycleResult>`. `deps` is exactly what composing
+the existing lifecycle needs — `{ store, registry, engine, model,
+workerIdentity, workspacesRoot, validationWorkspacesRoot, say?, track?,
+leaseMs?, heartbeatEveryMs?, now?, sleep? }` — no Sol model, no Luna model,
+no deployment API, no policy engine.
+
+**Terra-only, one role.** Construction requires
+`deps.workerIdentity.tier === 'terra'`, checked explicitly with a clear
+`FrontendBackendLifecycleConfigError` rather than left to `JobRunner`'s own
+incidental rejection. The `JobRunner` this constructs internally is fixed to
+`claimableRoles: ['frontend_backend']` — never the tier's full role
+ceiling — using the real, unmodified `createTerraFrontendBackendHandler`.
+There is still exactly one Terra `frontend_backend` implementation; this
+module does not introduce a second one.
+
+**Input is the existing `JobSpec`, with a stable caller-supplied `jobId`.**
+`run(spec)` requires `spec.role === 'frontend_backend'`
+(`FrontendBackendLifecycleRoleMismatch` otherwise) and both pinned inputs
+present (`FrontendBackendLifecycleInputInvalid`, checked via
+`FRONTEND_BACKEND_INPUT`'s existing keys) before anything is enqueued. No
+new planning contract, no generated identity: an explicit rerun with the
+same `spec.jobId` addresses the same job.
+
+**Idempotent ensure/enqueue, never a raw insert.** At the start of `run`,
+`spec.jobId` is read from `store.jobs`; if absent, `JobEngine.enqueue`
+creates it (never a raw `store.jobs.insertOne` — pinned by a structural
+test); if present, its immutable `.spec` must structurally equal the
+supplied one or the call fails closed with
+`FrontendBackendLifecycleJobConflict` before touching anything else. Equality
+reuses the existing `contentHash` (`@statxai/workspace`) — the same
+canonical-JSON identity primitive Phase 5h's own promotion id already
+uses — rather than a second scheme; because `JobSpec` carries only immutable
+fields to begin with (`state`/`attempt`/`lease`/`failure`/`executionOutputs`
+all live as siblings on `JobDocument`, never nested inside `.spec`),
+comparing two `.spec` values this way can never accidentally compare mutable
+runtime state. A concurrent second caller that loses Mongo's own `_id`
+uniqueness race on `enqueue` re-reads and applies the identical equality
+check rather than ever producing a second job.
+
+**`JobEngine.claim` and `JobRunner.runOnce` needed a minimal, additive
+extension: exact-job scoping.** Both gained an optional `jobId?: string`.
+In `claim`, when given, it narrows the *candidate* query only —
+`{ ...scope, ...(jobId ? { _id: jobId } : {}), state: 'ready', role: { $in:
+roles } }` — never the separate query for already-`running` jobs used for
+output-conflict detection, and never weakens dependency checks, output-
+conflict checks, tier/role filtering, lease fencing, or attempt increment,
+all of which still run exactly as before against the (now single-candidate)
+set. Omitting `jobId` is byte-for-byte the original behaviour — pinned by a
+dedicated regression test, and by the entire pre-existing `job-engine` suite
+(108 tests, unmodified, staying green). `JobRunner.runOnce` simply threads
+`options.jobId` through to `engine.claim` alongside its existing
+`projectId`; the lifecycle's own `ready` handling always calls
+`runner.runOnce({ jobId: job._id })`.
+
+**State machine, from a freshly-read `JobDocument`, never a cached or
+runner-returned snapshot:**
+
+- **`draft`** — a fresh enqueue from this coordinator never sets `draft:
+  true`, so this state is only ever reached on a pre-existing job created
+  that way by something else. Never auto-released — `{ outcome: 'draft' }`.
+- **`ready`**, first time this call — exact-job `runOnce`; the job is
+  re-read fresh afterward regardless of outcome. If `runOnce` returned
+  `idle` and the fresh read still shows `ready`, an existing claim rule
+  (dependency, output conflict) genuinely refused it: `{ outcome:
+  'not_claimable' }`. If `idle` but the fresh state moved on, a concurrent
+  caller claimed it first — no worker execution happened in *this* call,
+  and the durable state is followed forward. Any real execution outcome
+  (`submitted`/`handler_failed`/`authority_lost`) sets `workerExecuted =
+  true` and continues from the fresh read.
+- **`ready`**, reached a *second* time in the same call (`workerExecuted`
+  already true) — stop: `{ outcome: 'retry_ready' }`. Never a second
+  `runner.runOnce` call in one invocation. This is the one-Terra-attempt
+  boundary; it holds regardless of how many times `advance` recurses
+  forward afterward.
+- **`running`** — never touched: no claim, no handler call, no mutation.
+  `{ outcome: 'in_progress' }`.
+- **`validating`** — reruns 5g-1 fresh every time
+  (`createFrontendBackendCandidateValidator` — real disposable workspace,
+  real deterministic gates), including on a brand-new coordinator instance
+  after a process restart, since 5g-1's evidence is process-local and 5i
+  persists none of it. `ok === false` stops the call outright — no accept,
+  promote, repair, fail, or reroute — `{ outcome: 'validation_failed',
+  report: { compiled, gateRun } }`, and the job stays exactly `validating`,
+  precisely as 5g-1 itself leaves it. `ok === true` passes the *exact*
+  object 5g-1 returned, untouched, directly into
+  `acceptValidatedFrontendBackendCandidate` in the same call, then re-reads
+  fresh and continues.
+- **`accepted`** — 5h alone: `promoteAcceptedFrontendBackendCandidate(jobId,
+  ...)`, exactly as it already is, with `{ outcome: 'promoted', jobId,
+  attempt, candidate, promotionId, commitSha }`. No re-validation, no
+  re-acceptance, no lifecycle-specific Git path — confirmed structurally:
+  the module imports no `ProjectWorkspace`, calls no `.commit(`/
+  `.writeSiteFiles(`, and never imports `scaffoldSite`.
+- **`failed`** — exhausted retries (or an equivalent pre-existing terminal
+  failure): no reset, no replacement job, no handler. `{ outcome: 'failed'
+  }`.
+- **`repair_requested`** / **`blocked`** — stop, unmutated. No repair-tier
+  handler is wired; blocking is policy/control-plane authority this module
+  does not hold.
+
+**Exactly one Terra worker attempt per invocation, proven, not merely
+documented.** A handler failure that JobEngine's own existing retry
+semantics return to `ready` stops the call at `retry_ready`, with the model
+called exactly once; a *second*, separate `run(spec)` call is required to
+execute the retry, and `attempt` increments only through `JobEngine.claim`'s
+own counter — this module never touches `attempt` itself (pinned: a raw
+`$inc` mutation is one of the killed mutations below).
+
+**5g-1 → 5g-2 handoff, in-process, unbroken.** The validation object is
+never cloned, spread, JSON round-tripped, or reconstructed between the two
+calls — a mutation that inserts `{ ...validation }` before
+`acceptValidatedFrontendBackendCandidate` fails eleven integration tests
+with `AcceptanceEvidenceNotAuthentic`, confirmed and reverted (§57/§84's
+mandated check). Nothing in this module holds a `validation` reference past
+that one call — the successful result type has no `validation`/`binding`
+field, pinned by both a structural regex check and by construction (nothing
+in the result-building code ever names either).
+
+**Restart/resume behaviour, each proved against a real Mongo replica set
+and a real temp Git workspace:**
+
+- **After enqueue, before any execution** — `ready`; the next call claims
+  and runs Terra exactly once.
+- **After `running -> validating`** — a brand-new coordinator instance
+  (no shared process state) reruns 5g-1 fresh, obtains fresh authentic
+  evidence, and proceeds straight through acceptance and promotion in that
+  one call.
+- **After acceptance** — 5h alone runs; no Terra, no validation, no
+  `registry.accept`, no `JobEngine.accept` call (asserted directly against
+  the acceptance module's own call count).
+- **After a real Git commit but before Mongo's promotion record
+  finalises** — simulated by scoping a `Collection.prototype.findOneAndUpdate`
+  failure to exactly the `job_promotions` collection (a blanket mock would
+  instead intercept one of `JobEngine`'s own earlier `findOneAndUpdate`
+  calls, since the whole pipeline runs in one invocation) — the retry
+  discovers the existing marker via 5h's own history search and finalises
+  onto it, with no duplicate commit.
+- **After full promotion** — a pure read-and-verify: same promotion id,
+  same commit SHA, no second job, model call, candidate, or acceptance;
+  `enqueued`/`workerExecuted` correctly report `false` for the replay call
+  specifically (identity fields are compared with those two excluded).
+
+**Result type** — a small orchestrator-local discriminated union,
+`FrontendBackendLifecycleResult`: `'promoted'` (`jobId, attempt, candidate,
+promotionId, commitSha, enqueued, workerExecuted`), `'validation_failed'`
+(`jobId, attempt, report, enqueued, workerExecuted`), and a shared shape for
+`'in_progress' | 'retry_ready' | 'not_claimable' | 'failed' |
+'repair_requested' | 'blocked' | 'draft'` (`jobId, state, enqueued,
+workerExecuted`).
+
+**Tests: 34 new (787 total, up from 748 at the close of the 5h review): 496
+unit (+6 lifecycle structural, +1 workspace/site-build boundary carried over
+from the 5h review), 291 integration (+26 lifecycle, +6 exact-job `claim()`,
++1 `runOnce({ jobId })`).**
+
+- `frontend-backend-job-lifecycle.test.ts` (6, unit/structural, no Mongo):
+  no `runProject`/direct-orchestrator import; no Sol routing/adjudication/
+  replan, Luna, or deployment reference; no raw
+  `jobs.updateOne`/`insertOne`/`findOneAndUpdate`, `registry.accept`, or
+  `engine.accept`/`submitForValidation`/`fail`/`requestRepair`/`block`/
+  `release` call; `claimableRoles: [ROLE]` literal present, `rolesForTier`
+  absent; no `ProjectWorkspace`/`scaffoldSite`/`.commit(`/`.writeSiteFiles(`;
+  no `validation`/`binding` field on the result type.
+- `frontend-backend-job-lifecycle.integration.test.ts` (26): the full happy
+  path (fresh enqueue through promotion, one invocation); role mismatch and
+  missing-input rejection before enqueue; exact job claim over an older
+  ready job of the same role; no other role executed; same-jobId/different-
+  spec conflict; pinned inputs surviving a newer accepted version; exact
+  replay after promotion; resume from `validating`/`accepted`/after full
+  promotion; validation failure; one-Terra-attempt-max and the legitimate
+  next-invocation retry; a running job never hijacked; dependency-not-
+  satisfied and output-conflicted `ready` jobs; a blocked job never
+  released; `repair_requested` never wired to anything; an exhausted failed
+  job stays failed; a pre-existing draft job never auto-released; authority
+  loss (the same-worker-reclaims-its-own-job scenario) followed forward from
+  durable state; acceptance failure surfaces without promoting; promotion
+  failure surfaces without deploying and remains retryable; the mandatory
+  post-Git/pre-Mongo recovery through the full lifecycle; a structural
+  assertion that the module source never mentions `runProject`.
+- `packages/job-engine/test/engine.test.ts` (+6): exact-job claim over an
+  older ready job; omitting `jobId` preserves original FIFO behaviour;
+  exact-job claim still respects role narrowing, dependency satisfaction,
+  and output-conflict serialisation; claiming a nonexistent/non-ready exact
+  job returns `null` without disturbing anything else.
+- `packages/job-engine/test/runner.integration.test.ts` (+1): `runOnce({
+  jobId })` claims exactly that job over an older ready one.
+
+**Mutation testing — 22 mutations applied one at a time (lifecycle module,
+plus `JobEngine.claim` for the two exact-job-scoping checks), each backed
+up/applied/tested/restored individually. 20 killed outright; 2 confirmed
+genuinely unreachable rather than gaps, given `JobEngine.claim`'s own
+`state: 'ready'` filter:**
+
+1. Remove the exact-jobId claim filter — killed (2 integration failures:
+   exact-job-claim, no-other-role).
+2. Widen `claimableRoles` to the full tier ceiling — killed, but only by the
+   structural test: with exact-job scoping intact, the integration-level
+   behaviour is unreachable regardless (confirmed defense-in-depth, not a
+   gap).
+3. Enqueue under a random jobId each invocation — killed, 12 integration
+   failures.
+4. Ignore an existing job's `JobSpec` mismatch — killed by the dedicated
+   conflict test.
+5. Raw-insert the job instead of `JobEngine.enqueue` — killed by the
+   structural test (behaviourally equivalent output; the boundary violation
+   is caught at the code level, exactly as intended).
+6. Bypass dependency checks for exact-job claims (`JobEngine.claim`) —
+   killed at both the lifecycle-integration and job-engine levels.
+7. Bypass output-conflict checks for exact-job claims (`JobEngine.claim`) —
+   killed at both levels.
+8. Execute a `running` job again — **survived**: `JobEngine.claim`'s own
+   `state: 'ready'` filter makes a claim attempt against a running job
+   inert regardless of this module's own dispatch, verified by inspection
+   rather than forcing an artificial test.
+9. Auto-release a blocked job — killed at both structural and integration
+   levels.
+10. Auto-release a pre-existing draft job — killed at both levels.
+11. Loop when the first execution returns the job to `ready` (remove the
+    one-attempt guard) — killed: both one-Terra-attempt-max tests fail.
+12. Manually increment `attempt` via a raw store write — killed massively
+    (structural test plus 11 integration tests).
+13. Skip the authoritative re-read after worker execution, synthesising
+    state from the `runOnce` result instead — killed (13 integration
+    failures; the synthesized document has no real `executionOutputs`, so
+    5g-1 fails closed with `CandidateValidationMissingOutputs`).
+14. Call 5g-1 validation on a `running` job — killed (2 failures).
+15. Continue to acceptance when `validation.ok === false` — killed,
+    surfaced as `AcceptanceEvidenceNotAuthentic` from 5g-2's own defense (a
+    failed result was never registered as acceptance-capable).
+16. Clone the successful validation object (`{ ...validation }`) before
+    5g-2 — **the mandated §57 check** — killed, 11 integration failures,
+    `AcceptanceEvidenceNotAuthentic`.
+17. Rerun Terra when the job is already `validating` — **survived**, same
+    reason as #8: `claim`'s `state: 'ready'` filter makes it inert.
+18. (Rerun Terra when already `accepted`) — not separately re-run; identical
+    unreachability to #8/#17 by the same mechanism.
+19. Rerun deterministic validation when the job is already `accepted` —
+    killed massively (11 failures; 5g-1's own state check rejects a
+    non-`validating` job).
+20. Call `registry.accept` directly in the lifecycle — killed by the
+    structural test (idempotent no-op at the integration level).
+21. Raw-update the job to `accepted` — killed massively (structural test
+    plus 12 integration tests).
+22. Call promotion before acceptance succeeds (reorder) — killed (12
+    failures; 5h's own `PromotionStateMismatch` on a still-`validating`
+    job).
+23. Duplicate 5h's Git publication — not independently reachable: the
+    module imports no `ProjectWorkspace` and calls no Git-write primitive at
+    all, pinned structurally.
+24. A second Terra retry attempt in the same invocation — identical to #11.
+25–28. Invoke Luna / Sol / deployment / `runProject` — none of these are
+    reachable: the module imports none of them, pinned structurally (the
+    boundary tests above).
+29. Return/persist the successful validation evidence — killed by the
+    dedicated structural regex check.
+30. Re-enqueue a second job on exact successful replay — covered by #3/#4's
+    protections; a naive "always call `enqueue`, rely on the duplicate-key
+    catch" variant is absorbed harmlessly by the same race-recovery path
+    that already exists for genuine concurrent callers, confirmed by
+    inspection rather than a separate forced test.
+
+**Phase 5i executes at most one Terra worker attempt per lifecycle
+invocation.** **Phase 5i does not persist successful 5g-1 validation
+evidence.** **Phase 5i does not route deterministic validation failure to
+Luna.** **Phase 5i does not deploy the promoted commit.** **`runProject`
+still does not execute through `JobEngine`.** **`runProject` still does not
+automatically enqueue production jobs.** **No production Luna handler is
+wired yet.**
+
 ### Deliberately next, not now
 
-- **A first real, harness-owned end-to-end job lifecycle for one
-  `frontend_backend` job** — enqueue, `JobRunner`/Terra execution, 5g-1
-  validation, 5g-2 acceptance, and 5h promotion, chained together by the
-  harness rather than exercised as isolated slices the way every Phase 5
-  test so far has. Not yet named "5i" — deliberately left open whether it is
-  one slice or several. Explicitly excludes: Luna, multi-role orchestration,
-  Sol replan/adjudication of job-engine-produced work, and deployment of the
-  promoted commit.
+- **Phase 5j (proposed, not implemented)** — route exactly one existing
+  `runProject`/direct-delivery `frontend_backend` build boundary through the
+  Phase 5i lifecycle: construct the `JobSpec` from already-authoritative
+  project artifacts, call `createFrontendBackendLifecycleCoordinator(...).run(spec)`,
+  and preserve a controlled legacy/direct fallback only if explicitly
+  designed — not a cutover of every role, still no Luna, still no
+  deployment.
 - **Later still** — mapping Luna repair work onto persisted jobs, what a
   replan does to jobs from the superseded plan (`superseded` does not exist
-  yet), orphaned staging cleanup (deferred deliberately, not overlooked), and
-  eventually a real process boundary (workers as separate processes, not
-  in-process handlers).
+  yet), orphaned staging cleanup (deferred deliberately, not overlooked),
+  and eventually a real process boundary (workers as separate processes,
+  not in-process handlers).
 
 None of these are implemented.
 

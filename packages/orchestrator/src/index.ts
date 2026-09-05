@@ -14,3 +14,4 @@ export * from './job-handlers/frontend-backend.js';
 export * from './job-validation/frontend-backend.js';
 export * from './job-acceptance/frontend-backend.js';
 export * from './job-promotion/frontend-backend.js';
+export * from './job-lifecycle/frontend-backend.js';

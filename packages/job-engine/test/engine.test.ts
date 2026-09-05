@@ -74,6 +74,80 @@ describe('claiming', () => {
 });
 
 /**
+ * Exact-job claim scoping (Phase 5i): a caller driving one specific
+ * `JobSpec` needs "claim this job or nothing," never "claim whatever is
+ * oldest and ready" — but every other claim rule (role, dependency,
+ * output-conflict) must still decide whether that exact job is claimable,
+ * exact match or not.
+ */
+describe('exact-job claiming', () => {
+  it('claims exactly the requested job, leaving an older ready job of the same role untouched', async () => {
+    await engine.enqueue({ spec: spec('job_older', ['src/older.tsx']), origin: { kind: 'plan' } });
+    await engine.enqueue({ spec: spec('job_target', ['src/target.tsx']), origin: { kind: 'plan' } });
+
+    const claimed = await engine.claim('worker-1', TERRA, { jobId: 'job_target' });
+    expect(claimed?._id).toBe('job_target');
+    expect(claimed?.state).toBe('running');
+
+    const older = await store.jobs.findOne({ _id: 'job_older' });
+    expect(older?.state).toBe('ready');
+    expect(older?.attempt).toBe(0);
+    expect(older?.lease).toBeNull();
+  });
+
+  it('omitting jobId preserves the original oldest-eligible-job behaviour', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+    await engine.enqueue({ spec: spec('job_b', ['src/b.tsx']), origin: { kind: 'plan' } });
+
+    const claimed = await engine.claim('worker-1', TERRA);
+    expect(claimed?._id).toBe('job_a');
+  });
+
+  it('does not claim the exact job when its role is outside the resolved claim set', async () => {
+    await engine.enqueue({ spec: spec('job_review', ['src/a.tsx'], 'qa_review'), origin: { kind: 'plan' } });
+
+    expect(await engine.claim('worker-1', TERRA, { jobId: 'job_review', roles: ['frontend_backend'] })).toBeNull();
+
+    const job = await store.jobs.findOne({ _id: 'job_review' });
+    expect(job?.state).toBe('ready');
+  });
+
+  it('does not claim the exact job while its dependency is unaccepted', async () => {
+    await engine.enqueue({ spec: spec('job_base', ['src/base.tsx']), origin: { kind: 'plan' } });
+    await engine.enqueue({
+      spec: spec('job_dependent', ['src/dependent.tsx']),
+      origin: { kind: 'plan' },
+      dependsOn: ['job_base'],
+    });
+
+    expect(await engine.claim('worker-1', TERRA, { jobId: 'job_dependent' })).toBeNull();
+
+    const job = await store.jobs.findOne({ _id: 'job_dependent' });
+    expect(job?.state).toBe('ready');
+  });
+
+  it('does not claim the exact job while it output-conflicts with something already running', async () => {
+    await engine.enqueue({ spec: spec('job_x', ['src/shared.tsx']), origin: { kind: 'plan' } });
+    await engine.enqueue({ spec: spec('job_y', ['src/shared.tsx']), origin: { kind: 'plan' } });
+
+    const x = await engine.claim('worker-1', TERRA, { jobId: 'job_x' });
+    expect(x?._id).toBe('job_x');
+
+    expect(await engine.claim('worker-2', TERRA, { jobId: 'job_y' })).toBeNull();
+    const y = await store.jobs.findOne({ _id: 'job_y' });
+    expect(y?.state).toBe('ready');
+  });
+
+  it('returns null, not a different job, when the exact job does not exist or is not ready', async () => {
+    await engine.enqueue({ spec: spec('job_other', ['src/other.tsx']), origin: { kind: 'plan' } });
+
+    expect(await engine.claim('worker-1', TERRA, { jobId: 'job_missing' })).toBeNull();
+    const other = await store.jobs.findOne({ _id: 'job_other' });
+    expect(other?.state).toBe('ready');
+  });
+});
+
+/**
  * `executionOutputs` (Phase 5f) is `.nullable().default(null)` in the shared
  * `JobRecord` zod schema — the same pattern `lease`/`failure` already use for
  * a field that must be safe to be absent. That default only ever applies
