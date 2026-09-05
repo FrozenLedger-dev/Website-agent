@@ -22,6 +22,7 @@ import { BudgetExhausted, spend, type StateStore } from '@statxai/state';
 import {
   ArtifactRegistry,
 } from '@statxai/workspace';
+import { JobEngine } from '@statxai/job-engine';
 import {
   decideTerminal,
   isReleaseBlocked,
@@ -37,6 +38,8 @@ import { producePlan, revisePlan } from './phases/planning.js';
 import { executeRepairs } from './phases/repair.js';
 import { publishRelease } from './phases/publish.js';
 import { seekRelease } from './phases/release.js';
+import { createFrontendBackendLifecycleCoordinator } from './job-lifecycle/frontend-backend.js';
+import { createFrontendBackendJobSpec } from './job-specs/frontend-backend.js';
 import {
   createRunProgress,
   snapshotProgress,
@@ -52,6 +55,17 @@ import {
   blocking,
 } from './defects.js';
 
+/**
+ * Which implementation executes the `frontend_backend` build boundary
+ * (Phase 5j). `legacy_direct` is `buildFromPlan`, unchanged from before this
+ * phase existed. `job_lifecycle` routes through Phase 5i — enqueue, the
+ * real Terra handler, 5g-1, 5g-2, 5h — and requires a `promoted` result
+ * before `runProject` continues past the build boundary; every other Phase
+ * 5i outcome stops this invocation through the existing non-delivery exit,
+ * never by falling back to `buildFromPlan`.
+ */
+export type FrontendBackendExecutionMode = 'legacy_direct' | 'job_lifecycle';
+
 
 export interface RunOptions {
   projectId: string;
@@ -60,11 +74,33 @@ export interface RunOptions {
   workspacesRoot: string;
   autonomyMode?: 'full_autonomous' | 'supervised_autonomous' | 'human_in_the_loop';
   onProgress?: Progress;
+  /**
+   * Which implementation runs the `frontend_backend` build boundary.
+   * Defaults to `'legacy_direct'` — Phase 5j establishes the cutover seam
+   * without making `job_lifecycle` the production default. No caller in
+   * this repository opts into it yet.
+   */
+  frontendBackendExecutionMode?: FrontendBackendExecutionMode;
+  /**
+   * Phase 5g-1's own disposable validation workspace root — required only
+   * when `frontendBackendExecutionMode` is `'job_lifecycle'`, and never the
+   * canonical `workspacesRoot`: 5g-1 creates and tears down a fresh
+   * directory under this root for every validation, and doing that inside
+   * the canonical project's own Git tree would leave temporary files in it.
+   */
+  validationWorkspacesRoot?: string;
 }
 
 export async function runProject(options: RunOptions): Promise<RunResult> {
   const { projectId, store, workspacesRoot } = options;
   const autonomyMode = options.autonomyMode ?? 'full_autonomous';
+  const frontendBackendExecutionMode: FrontendBackendExecutionMode =
+    options.frontendBackendExecutionMode ?? 'legacy_direct';
+  if (frontendBackendExecutionMode === 'job_lifecycle' && !options.validationWorkspacesRoot) {
+    throw new Error(
+      'runProject: frontendBackendExecutionMode "job_lifecycle" requires validationWorkspacesRoot.',
+    );
+  }
   const report: Progress = options.onProgress ?? (() => {});
   const say: Progress = (event) => {
     chargePhase(event.phase);
@@ -153,7 +189,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     });
   }
 
-  const { profile, workspace, budgetLimits } = discovery;
+  const { profile, businessProfileRef, workspace, budgetLimits } = discovery;
 
   /**
    * What a phase is handed.
@@ -173,8 +209,14 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   const facts: RunFacts = { projectId, profile, autonomyMode, budgetLimits };
 
   // -- Phase 2: Plan --------------------------------------------------------
-  const initialPlan = await producePlan({ deps, facts }, 0);
+  const { plan: initialPlan, sitePlanRef: initialSitePlanRef } = await producePlan({ deps, facts }, 0);
   progress.plan = initialPlan;
+
+  // Defined here, not after the build boundary: Phase 5j's job-mode exit
+  // needs a `RunContext` to report through `concluded` the same way every
+  // other non-delivery exit past this point already does, and `progress.plan`
+  // is set above, so `ctx()` is safe to call from either build path.
+  const ctx = (): RunContext => ({ deps, facts, progress: snapshotProgress(progress) });
 
   // -- Phase 3: Build (one-shot first) --------------------------------------
   /**
@@ -192,10 +234,84 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
    * be abandoned — rather than seeing only the strategy that finally ran.
    */
 
-  await buildFromPlan({ deps, facts }, initialPlan);
+  if (frontendBackendExecutionMode === 'job_lifecycle') {
+    // Phase 5j: the same build boundary, routed through Phase 5i instead of
+    // `buildFromPlan`. Constructed only here, never for `legacy_direct` — no
+    // `JobEngine`, no lifecycle coordinator, no job inspected or enqueued on
+    // the legacy path.
+    const engine = new JobEngine(store);
+    const coordinator = createFrontendBackendLifecycleCoordinator({
+      store,
+      registry,
+      engine,
+      model,
+      // Harness-owned identity, never derived from intake, model output, or
+      // the plan — one worker identity per project, fixed by this call site.
+      workerIdentity: { workerId: `run-project:${projectId}:frontend-backend`, tier: 'terra' },
+      workspacesRoot,
+      validationWorkspacesRoot: options.validationWorkspacesRoot!,
+      say,
+      track,
+    });
+    const spec = createFrontendBackendJobSpec({
+      projectId,
+      businessProfileRef,
+      sitePlanRef: initialSitePlanRef,
+    });
+
+    // Mirrors `buildFromPlan`'s own first write: the outer project-state
+    // transition belongs to `runProject`, the harness/run owner, not to the
+    // job handler or Phase 5i, neither of which touches project state at all.
+    await store.projects.updateOne(
+      { _id: projectId },
+      { $set: { state: 'building', updatedAt: new Date() } },
+    );
+
+    // `discoverProject`/`persistPlan` already materialised the business
+    // profile and the specification into this same canonical workspace —
+    // see their own doc comments — and left them uncommitted. On the
+    // `legacy_direct` path, `buildFromPlan`'s own `commit('Terra: build')`
+    // always swept them into the same commit as the generated site;
+    // `job_lifecycle` never calls that function, so nothing else ever
+    // commits them, and Phase 5h's own promotion refuses to commit while
+    // the working tree carries anything outside the candidate's own files
+    // (see job-promotion/frontend-backend.ts's dirty-tree guard). This is
+    // not a new write — it is retiming the same pre-existing harness
+    // materialisation into its own commit instead of relying on a
+    // site-file commit that never happens on this path. No site file is
+    // touched here: `writeSiteFiles`/`publishBuildDirectly` are never
+    // called from this branch, only 5h's own promotion writes `app/`.
+    await workspace.commit('Harness: specification');
+    say({ phase: 'build', detail: `Executing frontend_backend via job_lifecycle (job ${spec.jobId})` });
+
+    // Exactly one call. Every outcome but `promoted` stops this invocation
+    // through the existing non-delivery exit below — never a second call,
+    // never a fallback to `buildFromPlan`.
+    const result = await coordinator.run(spec);
+
+    if (result.outcome !== 'promoted') {
+      say({
+        phase: 'build',
+        detail: `frontend_backend job_lifecycle build did not complete this invocation (${result.outcome})`,
+        level: 'fail',
+      });
+      // `RunResult.outcome` has no vocabulary for "not yet promoted" beyond
+      // the existing `'blocked'` bucket (see docs/upgrade-status.md's Phase
+      // 5j section for why a broader outcome hierarchy was not added).
+      // `jobLifecycleOutcome` carries the exact Phase 5i outcome alongside
+      // it, so this never collapses "retry_ready" and "validation_failed"
+      // into an indistinguishable "blocked" — the bucket is the same, but
+      // what actually happened is not lost. No `terminalDecision` is set:
+      // no policy adjudication occurred here.
+      return { ...(await concluded(ctx(), 'blocked', undefined)), jobLifecycleOutcome: result.outcome };
+    }
+
+    say({ phase: 'build', detail: `frontend_backend promoted: commit ${result.commitSha}`, level: 'ok' });
+  } else {
+    await buildFromPlan({ deps, facts }, initialPlan);
+  }
 
   // -- Phases 4/5: Evaluate, repair, escalate -------------------------------
-  const ctx = (): RunContext => ({ deps, facts, progress: snapshotProgress(progress) });
 
   while (true) {
     const evaluation = await evaluateSite(ctx());
@@ -362,8 +478,15 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
       await workspace.clearSite();
       progress.replansUsed += 1;
-      progress.plan = revised;
-      await buildFromPlan(ctx(), revised);
+      progress.plan = revised.plan;
+      // A replan-triggered rebuild always uses the legacy direct path,
+      // regardless of `frontendBackendExecutionMode` — Phase 5j cuts over
+      // only the initial build boundary above. This is a documented scope
+      // limitation (see docs/upgrade-status.md's Phase 5j section), not a
+      // double-build: a replanned rebuild is a new request from a new plan
+      // version, not a second attempt at the request Phase 5i already
+      // handled.
+      await buildFromPlan(ctx(), revised.plan);
       progress.repairedSinceReview = [];
       continue;
     }

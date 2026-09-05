@@ -44,7 +44,13 @@ describe('the project state transition surface', () => {
 
     expect(counts).toEqual({
       planning: 1,
-      building: 1,
+      // Two, and they are mutually exclusive by construction (Phase 5j):
+      // `orchestrator.ts` writes it only on the `job_lifecycle` branch of the
+      // frontend_backend build boundary, `build.ts` only on the
+      // `legacy_direct` branch — exactly one of the two ever runs for a
+      // given build, the same "mutually exclusive" shape `blocked` below
+      // already has.
+      building: 2,
       validating: 1,
       releasing: 1,
       released: 1,
@@ -62,7 +68,9 @@ describe('the project state transition surface', () => {
     const writes = await stateWrites();
 
     expect(writes['validating']).toEqual(['evaluate.ts']);
-    expect(writes['building']).toEqual(['build.ts']);
+    // `.sort()`: which of the two mutually-exclusive owners `readdir` visits
+    // first is not a claim this test makes.
+    expect(writes['building']?.slice().sort()).toEqual(['build.ts', 'orchestrator.ts']);
     expect(writes['releasing']).toEqual(['publish.ts']);
     expect(writes['released']).toEqual(['publish.ts']);
   });
@@ -128,7 +136,10 @@ describe('the run has one owner for its progress', () => {
 
   it('lets phases keep their own immutable locals', async () => {
     // The rule is one *mutable* owner per fact, not a ban on named values.
+    // Destructured since Phase 5j threaded `sitePlanRef` alongside the plan
+    // itself — `initialPlan` is still one immutable local, just no longer
+    // the plain return value.
     const body = await runProject();
-    expect(body).toContain('const initialPlan = await producePlan');
+    expect(body).toContain('const { plan: initialPlan, sitePlanRef: initialSitePlanRef } = await producePlan');
   });
 });

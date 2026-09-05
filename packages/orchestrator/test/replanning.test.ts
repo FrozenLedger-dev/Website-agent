@@ -359,7 +359,11 @@ describe('a replan that cannot be produced', () => {
 
     // Exactly one call survives in the delivery loop: the initial plan.
     expect(code.match(/producePlan\(/g) ?? []).toHaveLength(1);
-    expect(code).toContain('const initialPlan = await producePlan({ deps, facts }, 0)');
+    // Destructured since Phase 5j threaded `sitePlanRef` out of `producePlan`
+    // alongside the plan itself.
+    expect(code).toContain(
+      'const { plan: initialPlan, sitePlanRef: initialSitePlanRef } = await producePlan({ deps, facts }, 0)',
+    );
 
     // And the replan branch reaches revisePlan, not the planner.
     const replanBranch = code.slice(code.indexOf("adjudication.action === 'replan'"));

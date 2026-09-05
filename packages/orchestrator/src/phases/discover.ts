@@ -17,7 +17,7 @@
  * Collapsing those would report a broken deployment as a customer's incomplete
  * form.
  */
-import { BusinessProfile, intakeGaps, type AutonomyMode } from '@statxai/contracts';
+import { BusinessProfile, intakeGaps, type ArtifactRef, type AutonomyMode } from '@statxai/contracts';
 import { createBudget, type BudgetLimits, type StateStore } from '@statxai/state';
 import { ProjectWorkspace, type ArtifactRegistry } from '@statxai/workspace';
 import type { Progress } from '../run-context.js';
@@ -39,6 +39,13 @@ export type DiscoverResult =
       ok: true;
       /** The canonical parsed profile. Everything downstream reads this. */
       profile: BusinessProfile;
+      /**
+       * The exact ref `registry.put` returned when `profile` was persisted —
+       * threaded through rather than discarded, so a caller that needs to pin
+       * this exact version (Phase 5j's job-mode build boundary) never has to
+       * re-resolve "latest" and risk a version accepted after discovery ran.
+       */
+      businessProfileRef: ArtifactRef;
       workspace: ProjectWorkspace;
       /** The ceilings, never the usage. */
       budgetLimits: BudgetLimits;
@@ -105,5 +112,5 @@ export async function discoverProject(input: DiscoverInput): Promise<DiscoverRes
     throw new Error(`Budget for ${projectId} is missing immediately after creation.`);
   }
 
-  return { ok: true, profile, workspace, budgetLimits: budget.limits };
+  return { ok: true, profile, businessProfileRef: profileRef, workspace, budgetLimits: budget.limits };
 }

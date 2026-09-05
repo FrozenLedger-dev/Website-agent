@@ -3033,15 +3033,296 @@ still does not execute through `JobEngine`.** **`runProject` still does not
 automatically enqueue production jobs.** **No production Luna handler is
 wired yet.**
 
+### Phase 5j — route one `runProject` frontend/backend build boundary through Phase 5i — **DONE**
+
+A controlled cutover seam, not a migration: `runProject` gains exactly one
+explicit choice of implementation for the `frontend_backend` build
+boundary — the existing direct builder, or Phase 5i's harness-owned
+lifecycle — selected per call, defaulting to the direct builder, with no
+dynamic fallback between the two once a mode is chosen.
+
+**The mode seam.** `packages/orchestrator/src/orchestrator.ts` exports
+`type FrontendBackendExecutionMode = 'legacy_direct' | 'job_lifecycle'`.
+`RunOptions` gains `frontendBackendExecutionMode?` (default
+`'legacy_direct'` — no caller in this repository opts into `'job_lifecycle'`
+yet) and `validationWorkspacesRoot?` (required, and validated with an
+explicit throw before any work starts, only when the mode is
+`'job_lifecycle'`; never the canonical `workspacesRoot`, since Phase 5g-1
+creates and tears down its own disposable directory under it per
+validation). The two modes share every phase except the one build-boundary
+call: `legacy_direct` calls `buildFromPlan({ deps, facts }, initialPlan)`,
+unchanged; `job_lifecycle` constructs a `JobEngine` and
+`createFrontendBackendLifecycleCoordinator(...)` — only in that branch, so
+legacy runs allocate neither — builds one `JobSpec`, and calls
+`coordinator.run(spec)` exactly once (one call site, confirmed by
+inspection). `promoted` is the only outcome that continues past the
+boundary; every other Phase 5i outcome
+(`validation_failed`/`retry_ready`/`in_progress`/`not_claimable`/`failed`/
+`repair_requested`/`blocked`/`draft`) stops the invocation immediately —
+never a second `coordinator.run` call, never a fallback to `buildFromPlan`.
+
+**Exact-ref threading, not "latest" resolution.** `DiscoverResult` gained
+`businessProfileRef: ArtifactRef` — the exact ref `registry.put` returned
+when the profile was persisted, threaded through rather than discarded.
+`planning.ts`'s `producePlan`/`revisePlan` now return `{ plan, sitePlanRef
+}` (a new exported `ProducedPlan`) instead of a bare `SitePlan`;
+`persistPlan` returns the `ArtifactRef` it wrote. `runProject` passes both
+refs straight into the `JobSpec` unchanged — never a fresh `registry.get`/
+"latest" lookup at spec-construction time. Proved, not just asserted: a
+version accepted for either artifact *after* discovery/planning already
+ran — including in the narrow window between `producePlan` returning and
+the `JobSpec` being built, which is the one moment that can actually
+distinguish "the exact value this run produced" from "whatever the
+registry now considers newest" — never changes what this run's job pins.
+
+**One production `JobSpec` factory.**
+`packages/orchestrator/src/job-specs/frontend-backend.ts` —
+`createFrontendBackendJobSpec({ projectId, businessProfileRef,
+sitePlanRef })`. Preserves every existing `frontend_backend` job convention
+untouched (`role`, `objective`, `acceptanceCriteria`, `allowedTools`,
+`output: ['app/']` — one fixed, non-parameterised literal per project,
+deliberately never made unique per job, since `JobEngine`'s
+output-conflict check is exact-string membership and a unique output would
+silently defeat the serialisation the shared literal exists to provide).
+`jobId` is `` `frontend-backend-${contentHash(identity)}` ``, where
+`identity` is the full `JobSpec` minus `jobId` itself — the same
+canonical-JSON primitive Phase 5i's own `sameJobSpec` already hashes a
+`JobSpec` with, reused rather than reinvented. Deliberately excluded from
+the preimage: anything that is runtime state rather than request intent —
+`createdAt`/`updatedAt`, a random id, `workerId`, `attempt`, `lease`,
+`failure`, `executionOutputs`, a promotion commit, a `lineageSeq`, a
+`RunRecorder` sequence, canonical `HEAD`. The same `(projectId,
+businessProfileRef, sitePlanRef)` always produces the exact same `JobSpec`
+— including `jobId` — so a second call with identical pinned inputs
+addresses Phase 5i's existing job rather than creating a second one; any
+one of the three changing changes the identity.
+
+**Worker identity is harness-owned, not content-derived.**
+`{ workerId: \`run-project:${projectId}:frontend-backend\`, tier: 'terra'
+}`, fixed at this one call site — never assembled from intake, model
+output, or the plan.
+
+**The one interaction this phase's own §1 inspection did not anticipate,
+found only by running the mandatory happy-path test against a real Mongo
+replica set and a real canonical Git workspace end to end (never exercised
+before this phase, since Phase 5i's own fixtures deliberately point
+discovery at a *separate* throwaway workspace — see the comment at
+`frontend-backend-job-lifecycle.integration.test.ts:97-104` — precisely to
+avoid this collision): `discoverProject`/`persistPlan` materialise
+`client/business-profile.json`, `design/brand-system.json`,
+`specs/sitemap.json`, and `specs/pages/*.json` into the same canonical
+`ProjectWorkspace` Phase 5h promotes into, and leave them uncommitted. On
+`legacy_direct`, `buildFromPlan`'s own `commit('Terra: build')` always
+swept them into the same commit as the generated site; `job_lifecycle`
+never calls that function, so nothing else ever committed them, and Phase
+5h's own dirty-tree guard — by design, not a bug — refused every promotion
+outright (`PromotionWorkingTreeDirty`) because it saw them as foreign
+changes. Resolved, after surfacing this to the user rather than silently
+choosing a fix, by having the `job_lifecycle` branch call
+`workspace.commit('Harness: specification')` once, immediately before
+`coordinator.run(spec)` — a narrow retiming of the exact same pre-existing
+harness materialisation into its own commit, never a new write, and never
+a site file: `writeSiteFiles`/`publishBuildDirectly` are still never called
+from this branch, and only Phase 5h's own promotion ever writes `app/`.
+This is the one exception to "no commit from `runProject` in job mode,"
+asserted directly by a dedicated structural test (exactly one `.commit(`
+call in the job-mode block, and it names this exact call).
+
+**The public-contract gap.** `RunResult.outcome` has only three values —
+`'released' | 'blocked' | 'intake_insufficient'` — none of which honestly
+represent "a Phase 5i job is not yet promoted." Rather than inventing a
+new outcome value per Phase 5i sub-state (explicitly out of scope) or
+silently collapsing the distinction, every non-`promoted` exit reuses the
+existing `'blocked'` outcome and adds exactly one new optional field,
+`jobLifecycleOutcome?: FrontendBackendLifecycleResult['outcome']`, carrying
+the precise sub-reason. `terminalDecision` is deliberately never set
+alongside it — no policy adjudication produced this exit, and setting one
+would misrepresent what happened. `jobLifecycleOutcome` is never set on a
+`legacy_direct` run (proved directly).
+
+**Downstream continuation and its one known duplication.** Once
+`promoted`, `runProject` continues exactly where the legacy path would
+have — `evaluateSite`, adjudication, repair, publish — completely
+unmodified. `evaluateSite` reads from the canonical `ProjectWorkspace` on
+disk, which now holds Phase 5h's promoted files regardless of which mode
+produced them, so it needs no awareness of the mode seam at all. This does
+mean Phase 5g-1's deterministic gates and `evaluateSite`'s own
+deterministic gates now run twice in `job_lifecycle` mode — once inside
+Phase 5i's validation, once again as part of the existing post-build
+evaluation — which is harmless (the second run is idempotent against the
+same promoted files) but real, and is recorded here rather than hidden.
+
+**Scope limitations, stated rather than solved:**
+
+- **Only the initial build call is cut over.** A replan-triggered rebuild
+  (`buildFromPlan(ctx(), revised.plan)` inside `runProject`'s replan loop)
+  always uses `buildFromPlan` regardless of
+  `frontendBackendExecutionMode` — a replanned rebuild is a new request
+  from a new plan version, not a second attempt at the request Phase 5i
+  already handled, and no mandatory test exercises replan × `job_lifecycle`
+  interaction.
+- **No restart resumability claim.** Nothing durable records which job a
+  given run is waiting on; a fresh `runProject` call does not know to
+  resume a specific in-flight Phase 5i job. Re-running with identical
+  pinned inputs happens to address the same job (proven), but discovery and
+  planning are not guaranteed to reproduce identical inputs on a fresh run,
+  so this is a property of the `JobSpec` factory, not a run-resume feature.
+- **No caller opts in yet.** `run-service.ts` is untouched; every
+  production `runProject` call still runs `legacy_direct`.
+
+**Tests: 34 new (821 total, up from 787 at the close of the 5i review): 510
+unit (+14 JobSpec factory), 311 integration (+20 build-boundary).**
+
+- `job-specs-frontend-backend.test.ts` (14, unit, no Mongo): fixed
+  `frontend_backend` conventions (role/objective/acceptanceCriteria/
+  allowedTools/output); pinned input keys; output identity stable across
+  different projects/refs; `jobId` prefix; deterministic identity
+  (identical input → identical `JobSpec`/`jobId`, 5 repeated calls collapse
+  to one id); `jobId` exactly `frontend-backend-` + `contentHash` of the
+  identity; a changed `projectId`/`businessProfileRef`
+  (name or version)/`sitePlanRef` (name or version) each changes `jobId`;
+  swapping which ref is which changes `jobId`; the result carries no field
+  beyond the fixed `JobSpec` surface.
+- `frontend-backend-build-boundary.integration.test.ts` (20): legacy mode
+  is the default and creates zero job-related side effects
+  (jobs/audit/candidates/promotions); the existing direct-parity behaviour
+  is unmodified; the full job-mode happy path (one job, one Terra
+  generation, staged → accepted → promoted, canonical commit, continuation
+  into release) against real Mongo/`ArtifactRegistry`/`JobEngine`/the
+  production Terra handler/5g-1/5g-2/5h/a real temp canonical Git
+  workspace; exact `businessProfile`/`sitePlan` ref pinning against a
+  competing newer version created both mid-Terra-build and in the
+  spec-construction-time window; the threaded value/ref correspondence
+  property against the real registry; deterministic `JobSpec`
+  reproducibility, cross-field identity sensitivity, and build-boundary job
+  reuse across two calls; no automatic fallback on
+  `validation_failed`/`retry_ready`/`in_progress`; the promoted-only
+  barrier, proved by spying on `evaluateSite` itself rather than a model
+  call inside it (the shared compiler mock that fails Phase 5i's own
+  validation also fails `evaluateSite`'s own compile step for the same
+  reason, which would silently mask a removed barrier if asserted any
+  other way); the direct build path is never called in job mode; platform
+  failure propagates with no fallback; worker identity is harness-derived
+  and immune to intake content; the `JobSpec` factory only ever produces
+  `frontend_backend`; `job_lifecycle` without `validationWorkspacesRoot`
+  rejects before touching discovery; structural absence of
+  `registry.accept`/`engine.accept`/`writeSiteFiles`/`scaffoldSite`/a
+  second `.commit(`/Luna/new Sol routing/deployment from the job-mode
+  branch.
+- `state-transitions.test.ts` / `replanning.test.ts` (pinned-shape updates,
+  no new tests): `building` is now written from two mutually exclusive
+  places (`orchestrator.ts`'s job-mode branch, `build.ts`'s legacy branch);
+  the `producePlan` call-site literal updated for its new destructured
+  return.
+
+**Mutation testing — 10 mutations applied one at a time to the new
+production code, each backed up/applied/tested/restored individually, all
+killed; the remaining items from the 30-check list are covered by
+construction, by a structural absence test, or fall on Phase 5i's own
+already-mutation-tested internals, as noted:**
+
+1. Default flips to `job_lifecycle` — killed (`legacy mode remains the
+   default` fails: the omitted `validationWorkspacesRoot` guard now
+   throws).
+2. Remove the promoted-only barrier (always continue downstream) — killed
+   twice over: `tsc` itself rejects `result.commitSha` on the non-`promoted`
+   union variants, and the runtime test (spying on `evaluateSite` directly,
+   not on a model call inside it) fails independently.
+3. Job mode also calls `buildFromPlan` after `promoted` (double build) —
+   killed.
+4. Worker identity includes `profile.businessName` — killed.
+5. `businessProfileRef` re-resolved as "latest" at spec-construction time
+   instead of using the threaded value — killed, but only after
+   strengthening the test: injecting the competing version *during* Terra's
+   build (the original test) coincides with the threaded value regardless
+   of this bug, since nothing changes between spec-construction and
+   generation in that scenario. Injecting it in the narrower window right
+   after `producePlan` returns, before the `JobSpec` is built, is what
+   actually distinguishes the two — added as its own test rather than
+   patching the existing one, since both properties are worth proving
+   independently. The identical code path makes this representative of the
+   `sitePlanRef` case too.
+6. Remove `sitePlanRef` from the `JobSpec` factory's identity — killed (3
+   unit test failures).
+7. Randomise `jobId` (append a timestamp) — killed by the exact-preimage
+   unit test; the "repeated calls collapse to one id" test is not reliable
+   against a millisecond-resolution timestamp on its own and is kept for
+   the property it does prove (idempotent reuse under normal conditions),
+   not as this mutation's kill.
+8. Make `output` unique per job (parameterise by `projectId`) — killed (2
+   unit test failures).
+9. `discoverProject` returns a `businessProfileRef` that does not match the
+   ref it actually just wrote — killed (job-mode happy path outcome flips
+   to `blocked`, since Phase 5i's own input resolution then fails against a
+   nonexistent version).
+10. `producePlan` returns a `sitePlanRef` that does not match the ref it
+    actually just wrote — killed, same mechanism as #9, confirming the
+    legacy path is unaffected (it never reads `producePlan`'s `sitePlanRef`
+    field at all).
+
+Not independently forced through a runtime mutation, with the reason each
+is still covered:
+
+- **Job mode calls direct build after a non-`promoted` outcome** — the two
+  build calls are mutually exclusive by construction (one `if`/`else`, one
+  `buildFromPlan` call site total, pinned by `state-transitions.test.ts`'s
+  `building: 2` count) and mutation #3 already proves the `else` branch is
+  load-bearing.
+- **Phase 5i invoked twice after `retry_ready`** — structurally impossible
+  by inspection: `coordinator.run(` appears exactly once in
+  `orchestrator.ts`.
+- **Resolve "latest" for `sitePlanRef` / remove `businessProfileRef` from
+  the identity preimage** — code-identical to mutations #5/#6 respectively
+  (the same object-literal shape, the same call site); not re-run
+  separately.
+- **Non-`terra` worker identity** — enforced by Phase 5i's own
+  `createFrontendBackendLifecycleCoordinator` constructor guard
+  (`FrontendBackendLifecycleConfigError`), already in that phase's own
+  mutation-tested history; not new Phase 5j code.
+- **Write canonical files directly / call `registry.accept`/`engine.accept`
+  from the adapter / bypass 5h and commit directly / invoke Luna / invoke
+  new Sol routing / call deployment** — each is a structural absence,
+  asserted directly (the job-mode block contains no such call, and contains
+  exactly one `.commit(`, which is asserted to be the one documented
+  exception) rather than forced and reverted.
+- **Skip downstream evaluation after `promoted`** — the positive-path
+  regression test (`evaluateSite` spied and asserted called) has the same
+  kill power a forced mutation would have here; not run as a separate
+  destructive edit.
+- **Route another role through job mode** — `ROLE` is a private, unexported
+  module constant with no parameter to override it; the "only ever
+  produces `frontend_backend`" tests already prove this by construction.
+- **Persist process-local 5g-1 validation evidence** — Phase 5i's own
+  internal responsibility, not new Phase 5j code; already killed in that
+  phase's own review (see mutation 29 above).
+- **Use `lineageSeq` as job identity** — not applicable: the identity
+  preimage never references it; there is no code path to mutate into using
+  it.
+- **Claim full restart resumability without a persistent binding** — a
+  documentation-honesty requirement, not a code guard; addressed by the
+  explicit scope-limitation prose above, not a test.
+
+**Phase 5j does not make `job_lifecycle` the global `runProject`
+default.** **Phase 5j never falls back to the direct builder after
+`job_lifecycle` has started.** **Phase 5j does not route deterministic
+validation failure to Luna.** **Phase 5j does not persist 5g-1 validation
+evidence.** **Phase 5j does not deploy the promoted commit.** **Phase 5j
+cuts over only the `frontend_backend` build boundary.** **The rest of
+`runProject` remains harness-owned and unchanged.**
+
 ### Deliberately next, not now
 
-- **Phase 5j (proposed, not implemented)** — route exactly one existing
-  `runProject`/direct-delivery `frontend_backend` build boundary through the
-  Phase 5i lifecycle: construct the `JobSpec` from already-authoritative
-  project artifacts, call `createFrontendBackendLifecycleCoordinator(...).run(spec)`,
-  and preserve a controlled legacy/direct fallback only if explicitly
-  designed — not a cutover of every role, still no Luna, still no
-  deployment.
+- **Proposed, not implemented — pick one:** (A) durable run-level build
+  binding/resume — record which Phase 5i `jobId` a run is waiting on, so a
+  fresh `runProject` call can discover and resume it instead of only
+  reusing it by coincidence of identical pinned inputs; or (B) activate
+  `job_lifecycle` for one real production `runProject` caller in
+  `run-service.ts`, keeping `legacy_direct` available as an explicit
+  rollback. Not both at once — (A) is a durable-state/schema change to
+  runs, (B) is a call-site/config change to who opts in; combining them
+  would make either one hard to attribute if something regresses. Which is
+  appropriate depends on inspecting `run-service.ts`'s current caller(s)
+  first, not assumed here.
 - **Later still** — mapping Luna repair work onto persisted jobs, what a
   replan does to jobs from the superseded plan (`superseded` does not exist
   yet), orphaned staging cleanup (deferred deliberately, not overlooked),

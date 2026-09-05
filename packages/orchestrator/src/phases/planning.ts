@@ -6,14 +6,20 @@
  * that replaced it, which is what makes the trail — plan v1 → evidence →
  * adjudication → replan decision → plan v2 — reconstructable afterwards.
  */
-import { HOME_ROUTE, type SitePlan } from '@statxai/contracts';
+import { HOME_ROUTE, type ArtifactRef, type SitePlan } from '@statxai/contracts';
 import { planSite, replanSite } from '@statxai/agents';
 import { authorizeReplanRevision, type ReplanScope } from '@statxai/policy-engine';
 import { planDelta, type ReplanRecord } from '../replanning.js';
 import type { Defect } from '../defects.js';
 import type { FixedContext, RunContext } from '../run-context.js';
 
-export async function producePlan(ctx: FixedContext, attempt: number): Promise<SitePlan> {
+/** The parsed plan, and the exact ref it was just persisted under — see {@link persistPlan}. */
+export interface ProducedPlan {
+  readonly plan: SitePlan;
+  readonly sitePlanRef: ArtifactRef;
+}
+
+export async function producePlan(ctx: FixedContext, attempt: number): Promise<ProducedPlan> {
   const { deps, facts } = ctx;
   deps.say({
     phase: 'plan',
@@ -29,8 +35,8 @@ export async function producePlan(ctx: FixedContext, attempt: number): Promise<S
     level: 'ok',
   });
 
-  await persistPlan(ctx, produced);
-  return produced;
+  const sitePlanRef = await persistPlan(ctx, produced);
+  return { plan: produced, sitePlanRef };
 }
 
 /**
@@ -42,7 +48,7 @@ export async function producePlan(ctx: FixedContext, attempt: number): Promise<S
  * plan v1 → evidence → adjudication → replan decision → plan v2 —
  * reconstructable.
  */
-export async function persistPlan(ctx: FixedContext, produced: SitePlan): Promise<void> {
+export async function persistPlan(ctx: FixedContext, produced: SitePlan): Promise<ArtifactRef> {
   const { deps, facts } = ctx;
   const ref = await deps.registry.put(facts.projectId, 'site-plan', produced);
   await deps.registry.accept(facts.projectId, ref);
@@ -52,6 +58,7 @@ export async function persistPlan(ctx: FixedContext, produced: SitePlan): Promis
     const slug = page.route === HOME_ROUTE ? 'home' : page.route.replace(/^\//, '').replace(/\//g, '_');
     await deps.workspace.materialiseArtifact(`specs/pages/${slug}.json`, page);
   }
+  return ref;
 }
 
 /**
@@ -74,7 +81,7 @@ export async function revisePlan(
     gateFindings: readonly string[];
     reviewSummary: string | null;
   },
-): Promise<SitePlan | null> {
+): Promise<ProducedPlan | null> {
   const { deps, facts, progress } = ctx;
   const budget = (await deps.store.budgets.findOne({ _id: facts.projectId }))!;
 
@@ -203,7 +210,7 @@ export async function revisePlan(
   // A new version of site-plan, never an overwrite: the plan that failed
   // stays readable next to the one that replaced it. Reached only by a
   // revision the harness accepted.
-  await persistPlan(ctx, revisedPlan!);
+  const sitePlanRef = await persistPlan(ctx, revisedPlan!);
 
   const d = record.delta!;
   deps.say({
@@ -215,5 +222,5 @@ export async function revisePlan(
     level: 'ok',
   });
 
-  return revisedPlan;
+  return { plan: revisedPlan!, sitePlanRef };
 }

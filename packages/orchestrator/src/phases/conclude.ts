@@ -14,11 +14,24 @@
 import type { RunContext, RunProgress, UsageByTier, UsageTotals } from '../run-context.js';
 import type { Defect } from '../defects.js';
 import type { DeploymentManifest, TerminalOutcome } from '@statxai/contracts';
+import type { FrontendBackendLifecycleResult } from '../job-lifecycle/frontend-backend.js';
 
 export interface RunResult {
   projectId: string;
   outcome: 'released' | 'blocked' | 'intake_insufficient';
   terminalDecision?: TerminalOutcome;
+  /**
+   * Set only when `outcome === 'blocked'` because the `job_lifecycle`
+   * frontend/backend build boundary (Phase 5j) did not reach `promoted` in
+   * this invocation — the exact Phase 5i outcome (`'validation_failed'`,
+   * `'retry_ready'`, `'in_progress'`, `'not_claimable'`, `'failed'`,
+   * `'repair_requested'`, `'blocked'`, or `'draft'`), so that a caller can
+   * tell these apart without the public `outcome` enum growing one value
+   * per Phase 5i sub-state. Never set on `legacy_direct` runs, and never
+   * set alongside `terminalDecision` — no policy adjudication produced this
+   * exit.
+   */
+  jobLifecycleOutcome?: FrontendBackendLifecycleResult['outcome'];
   qualityScore: number;
   reviewCycles: number;
   repairsApplied: number;
