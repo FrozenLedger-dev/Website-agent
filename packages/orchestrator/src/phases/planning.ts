@@ -48,6 +48,28 @@ export async function producePlan(ctx: FixedContext, attempt: number): Promise<P
  * plan v1 → evidence → adjudication → replan decision → plan v2 —
  * reconstructable.
  */
+function pageSlug(route: string): string {
+  return route === HOME_ROUTE ? 'home' : route.replace(/^\//, '').replace(/\//g, '_');
+}
+
+/**
+ * Repo-root-relative paths {@link persistPlan} materialises for `plan` —
+ * always the exact same slugging `persistPlan` itself uses, since both read
+ * from this one function. Exists so a caller that needs to know what
+ * `persistPlan` already wrote to the canonical workspace (Phase 5j's
+ * job-mode build boundary, checking the working tree carries nothing
+ * foreign before its own harness commit) never has to re-derive the
+ * slugging rule and risk it silently drifting from the one that actually
+ * writes the files.
+ */
+export function sitePlanArtifactPaths(plan: SitePlan): string[] {
+  return [
+    'design/brand-system.json',
+    'specs/sitemap.json',
+    ...plan.sitemap.pages.map((page) => `specs/pages/${pageSlug(page.route)}.json`),
+  ];
+}
+
 export async function persistPlan(ctx: FixedContext, produced: SitePlan): Promise<ArtifactRef> {
   const { deps, facts } = ctx;
   const ref = await deps.registry.put(facts.projectId, 'site-plan', produced);
@@ -55,8 +77,7 @@ export async function persistPlan(ctx: FixedContext, produced: SitePlan): Promis
   await deps.workspace.materialiseArtifact('design/brand-system.json', produced.brandSystem);
   await deps.workspace.materialiseArtifact('specs/sitemap.json', produced.sitemap);
   for (const page of produced.sitemap.pages) {
-    const slug = page.route === HOME_ROUTE ? 'home' : page.route.replace(/^\//, '').replace(/\//g, '_');
-    await deps.workspace.materialiseArtifact(`specs/pages/${slug}.json`, page);
+    await deps.workspace.materialiseArtifact(`specs/pages/${pageSlug(page.route)}.json`, page);
   }
   return ref;
 }

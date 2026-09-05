@@ -4,7 +4,12 @@ export * from './phases/conclude.js';
 export * from './phases/release.js';
 // `orchestrator.js` re-exports `Progress` and `RunResult` from the two modules
 // above; naming them here explicitly avoids a duplicate-export ambiguity.
-export { runProject, type RunOptions, type FrontendBackendExecutionMode } from './orchestrator.js';
+export {
+  runProject,
+  type RunOptions,
+  type FrontendBackendExecutionMode,
+  RunProjectSpecificationWorkingTreeDirty,
+} from './orchestrator.js';
 export * from './run-service.js';
 export * from './adjudication.js';
 export * from './routing.js';

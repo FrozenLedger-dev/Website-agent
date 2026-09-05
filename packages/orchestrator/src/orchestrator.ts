@@ -34,7 +34,7 @@ import { buildFromPlan } from './phases/build.js';
 import { discoverProject } from './phases/discover.js';
 import { adjudicateDefects } from './phases/adjudicate.js';
 import { evaluateSite } from './phases/evaluate.js';
-import { producePlan, revisePlan } from './phases/planning.js';
+import { producePlan, revisePlan, sitePlanArtifactPaths } from './phases/planning.js';
 import { executeRepairs } from './phases/repair.js';
 import { publishRelease } from './phases/publish.js';
 import { seekRelease } from './phases/release.js';
@@ -65,6 +65,26 @@ import {
  * never by falling back to `buildFromPlan`.
  */
 export type FrontendBackendExecutionMode = 'legacy_direct' | 'job_lifecycle';
+
+/**
+ * The canonical workspace carried an uncommitted change outside the exact
+ * set discovery/planning are known to have materialised, right before the
+ * job-mode branch's own harness commit — the same discipline Phase 5h's own
+ * promotion guard (`PromotionWorkingTreeDirty`) applies to its commit,
+ * applied here to this one. Never silently swept into a commit whose
+ * message claims to be only the specification: a stray file left by
+ * something else stays uncommitted, and this invocation stops before Phase
+ * 5i ever runs.
+ */
+export class RunProjectSpecificationWorkingTreeDirty extends Error {
+  constructor(projectId: string, paths: readonly string[]) {
+    super(
+      `runProject "${projectId}": the canonical working tree has uncommitted changes outside the ` +
+        `discovered/planned specification: ${paths.join(', ')}`,
+    );
+    this.name = 'RunProjectSpecificationWorkingTreeDirty';
+  }
+}
 
 
 export interface RunOptions {
@@ -281,6 +301,22 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     // site-file commit that never happens on this path. No site file is
     // touched here: `writeSiteFiles`/`publishBuildDirectly` are never
     // called from this branch, only 5h's own promotion writes `app/`.
+    //
+    // Before committing: the working tree must carry nothing beyond the
+    // exact specification discovery/planning are known to have written —
+    // the same "nothing foreign rides along" discipline Phase 5h's own
+    // promotion guard applies to its own commit. A stray file left by
+    // anything else stops this invocation here, uncommitted, before Phase
+    // 5i ever runs.
+    const expectedSpecificationPaths = new Set([
+      'client/business-profile.json',
+      ...sitePlanArtifactPaths(initialPlan),
+    ]);
+    const dirty = await workspace.dirtyPaths();
+    const unexpected = dirty.filter((path) => !expectedSpecificationPaths.has(path));
+    if (unexpected.length > 0) {
+      throw new RunProjectSpecificationWorkingTreeDirty(projectId, unexpected);
+    }
     await workspace.commit('Harness: specification');
     say({ phase: 'build', detail: `Executing frontend_backend via job_lifecycle (job ${spec.jobId})` });
 

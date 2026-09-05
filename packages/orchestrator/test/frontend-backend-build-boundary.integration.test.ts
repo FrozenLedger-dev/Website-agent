@@ -16,7 +16,7 @@
  * Integration: needs the Mongo replica set and a real (temp) filesystem.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type * as Agents from '@statxai/agents';
@@ -313,6 +313,34 @@ describe('job_lifecycle requires validationWorkspacesRoot', () => {
       }),
     ).rejects.toThrow('requires validationWorkspacesRoot');
     expect(await store.artifacts.countDocuments({ projectId })).toBe(0);
+  });
+});
+
+describe('an unrelated dirty file rejects before Phase 5i starts', () => {
+  it('rejects the run, before the file is committed and before any job exists', async () => {
+    const { RunProjectSpecificationWorkingTreeDirty } = await import('../src/orchestrator.js');
+    const projectId = 'proj_5j_foreign_dirty_file';
+    const foreignPath = join(workspacesRoot, projectId, 'unexpected-foreign-file.txt');
+    // Written from inside the mocked `planSite` — after discovery has opened
+    // the canonical workspace, before the job-mode branch's own dirty-tree
+    // check runs — simulating a stray file left by something else entirely,
+    // unrelated to the specification discovery/planning are known to write.
+    onPlanProduced = async () => {
+      await writeFile(foreignPath, 'not part of the specification\n', 'utf8');
+    };
+
+    await expect(runJobMode(projectId)).rejects.toThrow(RunProjectSpecificationWorkingTreeDirty);
+
+    // Rejected before Phase 5i ever started: no job, no promotion.
+    expect(await store.jobs.countDocuments({ projectId })).toBe(0);
+    expect(await store.promotions.countDocuments({ projectId })).toBe(0);
+    expect(terraBuildCalls).toBe(0);
+
+    // The foreign file itself was never swept into a commit — it is still
+    // sitting there, dirty, exactly as it was left.
+    const ws = await canonicalWorkspace(projectId);
+    expect(await ws.dirtyPaths()).toContain('unexpected-foreign-file.txt');
+    expect(await ws.currentCommit()).toBeNull();
   });
 });
 

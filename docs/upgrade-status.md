@@ -3128,6 +3128,32 @@ This is the one exception to "no commit from `runProject` in job mode,"
 asserted directly by a dedicated structural test (exactly one `.commit(`
 call in the job-mode block, and it names this exact call).
 
+**That commit carries the same "nothing foreign rides along" guard Phase
+5h's own promotion applies to itself — not a bare `git add -A`.** Initially
+shipped without one (a real gap, caught after review): the harness commit
+would have silently swept up any stray uncommitted file already sitting in
+the canonical workspace, under a message that claims to be only the
+specification. Fixed by computing the exact set of paths
+`discoverProject`/`persistPlan` are known to have written —
+`client/business-profile.json` plus `sitePlanArtifactPaths(initialPlan)`, a
+newly exported helper in `planning.ts` that `persistPlan` itself now also
+uses for its own page-slug loop, so the allow-list and the writer can never
+independently drift — and checking `workspace.dirtyPaths()` against it
+before committing. Anything outside that set throws a new
+`RunProjectSpecificationWorkingTreeDirty(projectId, unexpectedPaths)`,
+mirroring `PromotionWorkingTreeDirty`'s own shape and reasoning exactly,
+*before* Phase 5i ever runs and before the foreign file is committed.
+Proved with a dedicated regression test (a foreign file written into the
+canonical workspace between `producePlan` returning and the guard running)
+and two mutations, both killed: removing the guard entirely (the
+foreign-file regression test fails, and the happy path silently succeeds
+with the stray file committed instead of rejecting), and narrowing
+`sitePlanArtifactPaths` to omit a path `persistPlan` still writes — which
+correctly resurfaces as every job-mode test failing with
+`RunProjectSpecificationWorkingTreeDirty`, confirming the shared-helper
+design actually catches the drift it exists to prevent, not merely asserts
+it away.
+
 **The public-contract gap.** `RunResult.outcome` has only three values —
 `'released' | 'blocked' | 'intake_insufficient'` — none of which honestly
 represent "a Phase 5i job is not yet promoted." Rather than inventing a
@@ -3170,8 +3196,8 @@ same promoted files) but real, and is recorded here rather than hidden.
 - **No caller opts in yet.** `run-service.ts` is untouched; every
   production `runProject` call still runs `legacy_direct`.
 
-**Tests: 34 new (821 total, up from 787 at the close of the 5i review): 510
-unit (+14 JobSpec factory), 311 integration (+20 build-boundary).**
+**Tests: 35 new (822 total, up from 787 at the close of the 5i review): 510
+unit (+14 JobSpec factory), 312 integration (+21 build-boundary).**
 
 - `job-specs-frontend-backend.test.ts` (14, unit, no Mongo): fixed
   `frontend_backend` conventions (role/objective/acceptanceCriteria/
@@ -3183,7 +3209,7 @@ unit (+14 JobSpec factory), 311 integration (+20 build-boundary).**
   (name or version)/`sitePlanRef` (name or version) each changes `jobId`;
   swapping which ref is which changes `jobId`; the result carries no field
   beyond the fixed `JobSpec` surface.
-- `frontend-backend-build-boundary.integration.test.ts` (20): legacy mode
+- `frontend-backend-build-boundary.integration.test.ts` (21): legacy mode
   is the default and creates zero job-related side effects
   (jobs/audit/candidates/promotions); the existing direct-parity behaviour
   is unmodified; the full job-mode happy path (one job, one Terra
@@ -3208,14 +3234,16 @@ unit (+14 JobSpec factory), 311 integration (+20 build-boundary).**
   rejects before touching discovery; structural absence of
   `registry.accept`/`engine.accept`/`writeSiteFiles`/`scaffoldSite`/a
   second `.commit(`/Luna/new Sol routing/deployment from the job-mode
-  branch.
+  branch; an unrelated dirty file in the canonical workspace rejects with
+  `RunProjectSpecificationWorkingTreeDirty` before any job exists and
+  before that file is committed.
 - `state-transitions.test.ts` / `replanning.test.ts` (pinned-shape updates,
   no new tests): `building` is now written from two mutually exclusive
   places (`orchestrator.ts`'s job-mode branch, `build.ts`'s legacy branch);
   the `producePlan` call-site literal updated for its new destructured
   return.
 
-**Mutation testing — 10 mutations applied one at a time to the new
+**Mutation testing — 12 mutations applied one at a time to the new
 production code, each backed up/applied/tested/restored individually, all
 killed; the remaining items from the 30-check list are covered by
 construction, by a structural absence test, or fall on Phase 5i's own
@@ -3259,6 +3287,20 @@ already-mutation-tested internals, as noted:**
     actually just wrote — killed, same mechanism as #9, confirming the
     legacy path is unaffected (it never reads `producePlan`'s `sitePlanRef`
     field at all).
+11. Remove the pre-commit dirty-tree guard entirely (added after review
+    flagged its absence — the harness commit originally did a bare
+    `git add -A` with no allow-list, unlike Phase 5h's own promotion) —
+    killed: the dedicated foreign-file regression fails, and the run
+    silently succeeds with the stray file committed under the
+    specification message instead of rejecting.
+12. Narrow `sitePlanArtifactPaths` to omit a path `persistPlan` still
+    writes (`specs/sitemap.json`) — killed massively: every job-mode test
+    now fails with `RunProjectSpecificationWorkingTreeDirty`, since the
+    guard's own allow-list falls out of step with what was actually
+    written. Confirms the shared-helper design (`persistPlan` and
+    `sitePlanArtifactPaths` both read the same `pageSlug`, and the guard
+    reads the same exported path list `persistPlan` uses) genuinely
+    prevents this class of drift rather than merely asserting it away.
 
 Not independently forced through a runtime mutation, with the reason each
 is still covered:
