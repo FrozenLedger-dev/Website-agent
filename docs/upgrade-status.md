@@ -2330,15 +2330,438 @@ does not rerun deterministic validation.** **`runProject` still does not
 execute through `JobEngine`.** **No production job is automatically enqueued
 yet.** **No production Luna handler is wired yet.**
 
+### Phase 5h — replay-safe canonical promotion of one accepted frontend/backend candidate — **DONE**
+
+5g-2 accepts a candidate — `ArtifactRegistry.accept` plus `validating →
+accepted`, atomically — but never touches the canonical project workspace at
+all. 5h is the separate, explicit step that takes an already-accepted job's
+exact execution output and materialises it into the canonical workspace, as
+one Git commit, and does so in a way that survives a crash at any point and
+is safe to retry indefinitely.
+
+**Production entry point.** `promoteAcceptedFrontendBackendCandidate(jobId,
+deps)` in `packages/orchestrator/src/job-promotion/frontend-backend.ts`, with
+
+    interface FrontendBackendPromotionDeps {
+      readonly store: StateStore;
+      readonly registry: ArtifactRegistry;
+      readonly workspacesRoot: string;
+    }
+    interface FrontendBackendPromotionResult {
+      readonly jobId: string;
+      readonly attempt: number;
+      readonly candidate: ArtifactRef;
+      readonly promotionId: string;
+      readonly commitSha: string;
+    }
+
+No `ModelClient`, `JobRunner`, Terra, Sol, Luna, or deployment dependency —
+confirmed both by the module never importing any of them and by a dedicated
+structural test (below) that greps the module source for the forbidden names
+and forbidden method calls.
+
+**Deliberately does not depend on 5g-1's evidence (§2).** 5g-1's
+`AUTHENTIC_SUCCESSFUL_VALIDATIONS` `WeakMap` is process-local and gone the
+moment that process exits; 5h never imports or references it. Everything 5h
+needs comes from durable state alone — the accepted `JobDocument` and its
+already-accepted candidate artifact — so promotion works identically whether
+it runs a second after acceptance or after a full process restart days
+later. This is also why every integration test's fixture (`stageAcceptedJob`)
+builds its accepted job via raw `JobEngine`/`ArtifactRegistry` calls rather
+than by running 5g-1/5g-2 first: 5h's own correctness must not depend on
+having run through them in the same process.
+
+**Authoritative job resolution, before any canonical mutation (§4).** `jobId`
+is re-read fresh from `store.jobs` on every call — never a caller-supplied
+`JobDocument` — and must satisfy, in order: exists (`PromotionJobNotFound`);
+`role === 'frontend_backend'` (`PromotionRoleMismatch`); `state === 'accepted'`
+(`PromotionStateMismatch` — `validating`, `running`, and `failed` are all
+refused, with a dedicated test for each); `executionOutputs` present and
+non-empty (`PromotionMissingOutputs`); exactly one ref, never narrowed from
+more (`PromotionOutputCountMismatch`); that ref namespaced under this exact
+job and attempt via the existing Phase 5f `jobOutputNamespace(jobId, attempt)`
+(`PromotionNamespaceMismatch` — covers both "wrong attempt of this job" and
+"another job's output" as the same check). The ref is then resolved via a new
+`ArtifactRegistry.getDocument(projectId, ref)` (§6) — project-scoped, exact
+`(name, version)`, never "latest," added because `resolve`/`get` only return
+`.data` and discard the `acceptedAt` metadata this module needs — and must
+resolve (`PromotionCandidateMissing`) and be accepted
+(`doc.acceptedAt !== null`, else `PromotionCandidateNotAccepted` — §7, 5h
+does not repair or re-accept). Its payload is then parsed with the *existing*
+`CandidateShape` (exported from `job-validation/frontend-backend.ts`
+specifically for this reuse — §8, no new schema, no revalidation of the
+build or gates) into a `PromotionCandidateShapeInvalid` on failure.
+
+**Deterministic promotion identity (§12–§13).** `computePromotionId` hashes
+`{ projectId, jobId, attempt, outputName, outputVersion, outputContentHash }`
+through the *existing* `contentHash` (`@statxai/workspace`) — the same
+canonical-JSON SHA-256 `ArtifactRegistry.put` already hashes artifact content
+with, not a second hashing scheme. No `createdAt`, no `lineageSeq`, no
+random id, no filesystem path — mutation-tested directly (below).
+
+**Durable receipt: a new `promotions` collection (§11, §15).**
+`JobPromotionRecord` in `packages/state/src/documents.ts` —
+`{ _id, projectId, jobId, attempt, output, baseCommit, status: 'prepared' |
+'committed', commitSha, createdAt, updatedAt }` — stored via a new
+`StateStore.promotions` getter (`job_promotions` collection). Two indexes,
+added in `ensureIndexes()`: a **partial unique index on `{ projectId: 1 }`
+filtered to `status: 'prepared'`** — the same "partial unique index"
+technique this repository already uses for `artifacts`' `lineageSeq`
+uniqueness, reused rather than reinvented, and the entire mechanism behind
+project-scoped promotion serialization (§15's "no new lock service"); and a
+plain `{ projectId: 1, jobId: 1 }` index for lookup. No new `JobState`, no
+field added to `JobSpec` (§11).
+
+**Distinguishing a self-race from a blocked concurrent promotion (§15).**
+On the unique-index `E11000` from `insertOne`, the code does not parse
+`error.keyPattern` — instead it re-reads `findOne({ _id: promotionId })`:
+found means this exact promotion raced with itself and the existing record is
+recovered and validated; not found means the partial project-scoped index
+blocked a *different* in-progress promotion, and `PromotionInProgress` is
+thrown. Simpler and driver-shape-independent.
+
+**Recovered/racing records are never trusted blindly
+(`assertRecordMatchesBinding`).** Every field the current binding cares about
+— `projectId`, `jobId`, `attempt`, `output.name`, `output.version` — is
+checked against any record found under the same `_id`, and a `committed`
+record with no `commitSha` is rejected too; any mismatch is
+`PromotionReceiptCorrupt`, never silently repaired. Two distinct corruption
+shapes are mutation-tested and each has its own dedicated regression test —
+see below.
+
+**The Git marker (§18).** Exactly
+
+    Promote accepted frontend/backend candidate
+
+    Statx-Promotion-Id: <promotionId>
+
+as the commit message, with the second line required to appear *verbatim, on
+its own line* — not merely as a substring anywhere in the message.
+
+**Exact marker search, full history, no HEAD dependency (§19, §26).** A new
+`ProjectWorkspace.findCommitByMarker(marker)` — `git log --all --format=%H\x01%B\x02`
+(`\x01`/`\x02` chosen as field/entry separators because a real commit message
+containing either is not a byte sequence any commit, this repo's own or a
+plausible unrelated one, would ever produce), then each entry's message is
+split on newlines and each line trimmed and compared for **exact equality**
+to the marker — never `.includes()`. `--all`, not merely `HEAD`, deliberately:
+a promotion commit that a later, unrelated canonical commit has since been
+built on top of is still found (§26's "may become an ancestor" — it is never
+required to stay `HEAD`, and this lookup never changes which commit *is*
+`HEAD`).
+
+**The crash/replay state machine (§20–§27), all in one function body, no
+Mongo transaction (§10):**
+
+  - **A.** Resolve and prove the accepted job/candidate (above).
+  - **B.** Find-or-create the durable `prepared` record; `baseCommit` is
+    canonical `HEAD` *at this moment* — `null` is a valid, correctly-handled
+    first-build base, not a placeholder (dedicated test).
+  - **C.** Search the *whole* of canonical history for a commit carrying this
+    exact promotion's marker.
+  - **D1. Found:** verify it agrees with the record (or the record's own
+    `commitSha`, if already `committed`), finalise Mongo to `committed` if it
+    was still `prepared`, and return — **no second commit is ever created.**
+    This is what makes "Git commit succeeded, process died before Mongo
+    finalised" (§21's most-important scenario) recoverable: the commit itself
+    is the evidence, and this is exactly where a retry finds it.
+  - **D2. Not found:** verify canonical `HEAD` still equals the record's
+    `baseCommit` — else `PromotionBaseConflict`, fail closed, no silent
+    rebase (§16, §27) — then materialise the exact candidate (idempotent:
+    `scaffoldSite` never overwrites existing files, and `writeSiteFiles`
+    writing the same accepted candidate again is a no-op if some of it is
+    already on disk from a prior crashed attempt — §22's scenario) and commit
+    once with the marker.
+  - **E.** Finalise the record to `committed` with the commit this attempt
+    just created.
+
+Once `committed` and the marker is found, calling this again is a pure
+read-and-verify — same promotion id, same record, same marker, same result —
+no new commit, no new record, no touch to job or artifact-acceptance state
+(§23's replay scenario).
+
+**No Mongo transaction spans Mongo, the filesystem, and Git, and none is
+pretended (§10).** Every durable write is a single-document Mongo operation,
+already atomic on its own (`insertOne` with unique-index conflict detection,
+or `findOneAndUpdate`); cross-system consistency comes from the state machine
+above plus the Git marker as recovery evidence, not from a distributed
+transaction spanning three different systems. **Once a Git commit succeeds,
+it is never `git reset --hard`'d away on a later Mongo failure** — confirmed
+by a dedicated structural test (below) and by the mandatory crash test:
+Mongo's `findOneAndUpdate` is made to throw *after* a real `scaffoldSite` +
+`writeSiteFiles` + `commit()` has already produced a real commit with the
+real marker; the failure is required to propagate (a swallow-and-report-success
+mutation was tried and killed — see the mutation-testing table below), and a
+second, unmocked call is required to discover the existing commit via
+`findCommitByMarker` and finalise onto it, without creating a duplicate.
+
+**Reused, not duplicated, canonical-write primitives (§9, §35).**
+`ProjectWorkspace.writeSiteFiles`/`.commit`/`scaffoldSite` — the same
+underlying primitives `buildFromPlan`'s direct path already uses via
+`publishBuildDirectly` — are called directly by the promotion module.
+`packages/orchestrator/src/phases/build.ts` (`publishBuildDirectly`,
+`runProject`) is **not touched at all** — the strongest possible proof that
+the direct delivery path's behaviour is unchanged is that the file was never
+edited, confirmed by the full, unmodified `refusal`/`delivery.parity`
+integration suites staying green throughout (§59's direct-path regression
+requirement).
+
+**Explicit, stated assumption (per the brief's own requirement not to hide
+one):** the canonical workspace is exclusively harness-owned for the
+duration of a `prepared` promotion — the same assumption every other
+canonical writer in this repository already makes, written into the code
+comment above the materialisation step rather than left implicit.
+
+**Structural boundary self-scan (recurring pattern, §67).** The module's own
+doc comment originally described 5g-2 as running "a `JobEngine` audit,"
+which the new `'does not import JobEngine'` structural test's `/JobEngine/`
+regex would have flagged as a false positive on its own prose — caught and
+reworded ("its own lifecycle audit") before the test was ever run, the same
+class of self-matching issue that has recurred in most Phase 5 slices.
+
+**Tests — 30 new, 746 total (up from 715 at the close of 5g-2), all
+green: 490 unit (+3), 256 integration (+27).**
+
+- `frontend-backend-job-promotion.test.ts` (3, unit/structural, no Mongo): the
+  module imports none of `ModelClient`/`reviewSite`/`deploySite`/`DeployResult`/
+  `hosting_release`/`runDeterministicGates`/`evaluateSite`/`routeBuild`/
+  `buildAnchor`/`buildPage`/`repairDefect`, and calls none of
+  `.accept(`/`.submitForValidation(`/`.requestRepair(`/`.block(`/`.release(`/
+  `.claim(`/`.heartbeat(`; the module never imports `JobEngine`; the module
+  never uses `'reset'`/`--hard` as post-failure compensation.
+- `frontend-backend-job-promotion.integration.test.ts` (27, real Mongo +
+  real temp Git workspace, no build pipeline faked — promotion never
+  compiles/gates/reviews anything, so every dependency is real): the happy
+  path (first, null-base commit); exact ref promoted even after a newer,
+  unaccepted version of the same candidate name exists; candidate-must-be-accepted
+  fails before any canonical mutation; wrong job state (`validating`,
+  `running`, `failed`, each its own case) and nonexistent job; wrong role;
+  output-count mismatch (more than one `executionOutputs` ref is refused, not
+  narrowed to the first); wrong attempt namespace; another job's output;
+  another project (resolution is scoped through `job.projectId` alone);
+  malformed accepted candidate; file path traversal safety; replay after
+  `prepared`/before any file write; replay after partial file materialisation;
+  **the mandatory crash-after-Git-commit-before-Mongo-finalize scenario**;
+  exact completed replay is idempotent; prepared base-commit conflict (a
+  legitimate canonical write lands in between, `HEAD` is never mutated by the
+  failed retry); a promotion commit may become an ancestor of later, unrelated
+  canonical commits without ever being rewound to or requiring it stay `HEAD`;
+  a second, different job's promotion for the same project is refused while
+  the first is still `prepared`; a `committed` receipt whose binding
+  disagrees with the real job; a `committed` receipt whose binding matches
+  exactly but whose marker is nowhere in history; a `prepared` receipt whose
+  binding partially disagrees (matching `_id`, mismatched `attempt`); exact
+  Git marker matching (a decoy commit merely mentioning the marker text
+  inline, not as its own line, is ignored); job/candidate acceptance state is
+  provably unchanged (full deep-equal of both documents, not just the fields
+  promotion happens to read); no repair/deployment/model side effect.
+- `packages/workspace/test/workspace.test.ts` gained one new test
+  (`commit marker lookup`) proving `findCommitByMarker` exact-line matching
+  directly against a decoy commit whose message embeds the marker text only
+  as a substring within a longer line.
+
+**Mutation testing — 20 mutations applied one at a time to the production
+promotion module (plus one to `ProjectWorkspace.findCommitByMarker`), each
+backed up first and restored after, diffed clean at the end. 17 killed
+outright by the existing suite; 3 exposed real gaps, each closed with a new,
+dedicated regression test confirmed to kill the same mutation on replay:**
+
+1. Resolving the wrong artifact version (not the exact pinned ref) — killed,
+   16 integration failures.
+2. Skipping the "candidate must be accepted" check — killed by the dedicated
+   §39 test.
+3. Allowing `job.state === 'validating'` to promote — killed by the wrong-job-state
+   test (via a different exception type, still a real failure).
+4. Skipping the attempt/namespace check entirely — killed, 2 integration
+   failures.
+5. **Skipping the output-count check (silently taking the first of several
+   refs) — survived. Gap: no existing test staged a job with more than one
+   `executionOutputs` ref.** Closed with the new "output count mismatch"
+   test; re-run confirmed the kill.
+6. Using the job's own id instead of `job.projectId` to resolve the candidate
+   — killed, 16 integration failures.
+7. A non-deterministic (`Math.random`) promotion id — killed, 6 integration
+   failures (idempotent replay, ancestor, crash-recovery, corrupt-receipt, and
+   others all depend on the id being stable across calls).
+8. Omitting the candidate's own identity from the promotion-id hash (keeping
+   only `projectId`/`jobId`/`attempt`) — killed via the corrupt-committed-receipt
+   test's precomputed colliding id, which depends on the exact hash formula.
+9. The commit marker omitting the promotion id (a generic, non-identifying
+   marker) — killed, 6 integration failures.
+10. **`findCommitByMarker` doing substring matching (`.includes`) instead of
+    exact-line matching — survived against the promotion suite's existing
+    marker test, because that test's decoy embedded a *different* id as a
+    substring, not the real one. Gap: no test proved a marker that legitimately
+    appears, but only inline within a longer line, is rejected.** Closed with
+    the new `commit marker lookup` test in `workspace.test.ts`; re-run
+    confirmed the kill.
+11. Ignoring a found marker and always re-materialising/re-committing (second
+    commit on retry after success) — killed, 4 integration failures.
+12. Skipping the base-commit conflict check entirely — killed by the dedicated
+    "prepared base commit conflict" test.
+13. Treating every duplicate-key error as a self-race, never as
+    `PromotionInProgress` — killed by the "cannot race" test.
+14. **`assertRecordMatchesBinding` reduced to a no-op — survived against the
+    existing "corrupt committed receipt" test, because that test's decoy has
+    a mismatched `jobId`, which a *different*, later check (committed-with-no-marker)
+    also happens to catch on its own. Gap: no test isolated the
+    binding-mismatch check itself from that later check.** Closed with the
+    new "prepared receipt binding mismatch" test (matching `_id`, correct
+    `jobId`, mismatched `attempt`, status still `prepared` so the later check
+    can't fire); re-run confirmed the kill.
+15. Finalising Mongo to `committed` *before* the Git commit is attempted —
+    killed, 5 integration failures.
+16. **Skipping the "`committed` status but no marker found" check — survived
+    against the full suite. Gap: the only existing decoy with `status:
+    'committed'` had a mismatched `jobId` and was already caught earlier by
+    `assertRecordMatchesBinding`, so this specific later check was never
+    isolated.** Closed with the new "committed receipt with no matching
+    commit" test (an exactly-matching binding, `status: 'committed'`, a
+    plausible-looking but fake `commitSha`, no real commit anywhere); without
+    the check, this mutation demonstrably let promotion silently create a
+    second, unlinked commit and report success. Re-run confirmed the kill.
+17. A spurious `registry.accept` call inside promotion — killed twice over:
+    the unit/structural test's forbidden-call list, and the acceptance-unchanged
+    integration test.
+18. A stray write onto the job document (`{ promotedAt: ... }`) as a side
+    effect — **survived against the original acceptance-unchanged test,
+    which checked only the specific fields promotion is known to read, not
+    the whole document.** Strengthened that test to a full deep-equal of
+    both the job and artifact documents; re-run confirmed the kill.
+19. Removing the "commit produced nothing" guard — killed by `tsc`, not the
+    runtime suite (the guard's removal breaks `commitSha`'s `string | null`
+    vs. `string` return type) — a legitimate catch, since typecheck is part
+    of the required verification gate for every change in this repository.
+20. Swallowing a Mongo finalize failure after a successful Git commit instead
+    of surfacing it — killed by the mandatory crash test and the ancestor
+    test, both of which require the failure to propagate.
+
+**Phase 5h does not change `JobState`.** **Phase 5h does not rerun
+deterministic validation.** **Phase 5h does not accept or re-accept the
+candidate.** **Phase 5h does not deploy the canonical commit.**
+**`runProject` still does not execute through `JobEngine`.** **No production
+job is automatically enqueued yet.** **No production Luna handler is wired
+yet.**
+
+**Review, same tree: two promotion-safety invariants pinned explicitly.**
+
+**First — the completion report's own phrase "project-scoped-unique
+promotions collection" was imprecise enough to read as a *permanent* unique
+index on `{ projectId: 1 }`, which would have meant a project could only
+ever be promoted once. That was never the actual index — `store.ts`'s
+`{ key: { projectId: 1 }, unique: true, partialFilterExpression: { status:
+'prepared' } }` (documented correctly above, at "Durable receipt") only
+enforces uniqueness while a promotion is `prepared`; a `committed` one
+drops out of the filter and is invisible to it — but it was only checked
+against the source and never against a real, live index, so the report's
+prose was unverified.** Checked directly against the running replica set
+(`db.job_promotions.getIndexes()`): the live index matches the source
+exactly, filter and all. A dedicated regression test was still missing —
+nothing proved a project could be promoted a *second* time after its first
+promotion committed, only that a *second, concurrent* one is refused while
+the first is still `prepared` ("different promotion for the same project
+cannot race"). Added: "a project may be promoted again once the prior
+promotion has committed" — job A for project P promotes fully to
+`committed`; a different accepted job B for the same P then prepares and
+commits its own receipt with no collision, A's historical `committed`
+record is read back unchanged, and both commits' markers are found exactly
+once each in canonical history. Uses the real, single production entry
+point for both A and B rather than a separate mechanism for exercising
+receipt allocation alone — the function has no partial/pausable form to
+call instead, so this is the minimal way to prove the property.
+
+**Second — a real gap: nothing characterised, let alone enforced, what
+`ProjectWorkspace.commit()`'s `git add -A` actually stages.** It stages the
+*whole* working tree, not merely what an attempt itself just wrote. Every
+crash/replay/base-conflict test proves the receipt and the marker are
+correct; none of them proved the working tree contained *only* what this
+candidate was supposed to contribute. Given `HEAD` at the recorded base and
+a tree that also happens to hold some unrelated uncommitted change, nothing
+stopped that change from riding along into the promotion commit.
+
+Two new `ProjectWorkspace` primitives (`packages/workspace/src/project-workspace.ts`):
+`dirtyPaths()` — `git status --porcelain -z --untracked-files=all` (`-z` so
+a path is never subject to git's own quoting; `--untracked-files=all` so a
+wholly-new untracked directory, the ordinary case for `app/` on a project's
+first-ever promotion, is reported file-by-file rather than collapsed into
+one `app/` entry — the first version of this omitted that flag and every
+first-build-shaped test failed against a false "app/ is unexpected," caught
+immediately by the existing suite) — and `siteFileRepoPath(path)`, the same
+containment-checked resolution `writeSiteFiles` already uses, exposed so a
+caller can compare a candidate's site-relative paths against `dirtyPaths`'
+repo-root-relative output.
+
+The promotion module (`job-promotion/frontend-backend.ts`) uses both, plus a
+new `scaffoldTemplatePaths()` (`packages/workspace/src/site-build.ts` — the
+same recursive walk-and-filter `scaffoldSite`'s own `cp` runs internally,
+factored out and exposed) to compute one closed set — this candidate's own
+files, union the platform scaffold's own deterministic, never
+model-influenced template output — and checks the tree's dirty paths are a
+subset of it, **twice**: once before this attempt touches the tree at all
+(catching a foreign change already sitting there — the review's exact
+scenario), and once more after scaffolding and writing the candidate
+(a consistency guard against the same class of problem from the other side,
+not expected to ever actually fire, since nothing either call does can dirty
+a path outside that set on its own). Either violation is
+`PromotionWorkingTreeDirty`, thrown before any commit is attempted.
+
+The first version of this check compared only against `candidate.files`,
+without accounting for the scaffold's own legitimate output at all, and
+failed nearly every existing test — including the established "replay after
+partial file materialization" one, whose fixture (deliberately) leaves both
+the scaffold's template tree *and* the candidate's own files dirty to
+simulate a prior crashed attempt. That failure is what surfaced the need for
+`scaffoldTemplatePaths()`: a snapshot-diff approach (dirty-before-scaffold
+vs. dirty-after-scaffold, trusting whatever delta scaffolding itself
+introduces) was considered and rejected — it cannot tell a foreign file
+already dirty *before* scaffolding ran apart from the scaffold's own
+legitimate contribution, since both would already be present in the
+"before" baseline; only knowing scaffold's actual file set, independent of
+when anything became dirty, closes that gap.
+
+Two new tests in `frontend-backend-job-promotion.integration.test.ts`:
+"unrelated dirty canonical file blocks promotion" (a file written outside
+any candidate's own paths, before the real promotion call runs, refuses the
+commit with `PromotionWorkingTreeDirty`, leaves the promotion `prepared`,
+and leaves the dirty file exactly as it was) and its counterpoint is the
+pre-existing "replay after partial file materialization" test, now doubling
+as proof that a replay's own expected dirty candidate files (and the
+scaffold's) do **not** trip the same check.
+
+**Three new mutations, each backed up/applied/tested/restored individually,
+all killed by the existing suite with no gaps found:**
+
+21. Removing both dirty-tree checks entirely — killed; with only the first
+    disabled, the second (after-write) check still catches it on its own,
+    proving the two checks are independently sufficient, not merely
+    redundant; with both disabled, the unrelated file is swept into a real
+    commit and reported as success — exactly the vulnerability this review
+    named.
+22. Dropping `--untracked-files=all` from the `dirtyPaths()` git invocation
+    (regressing the collapsed-directory bug found while building the fix
+    itself) — killed, 10 integration failures, every one a false "app/ is
+    unexpected."
+23. `scaffoldTemplatePaths()` returning nothing (as if the scaffold's own
+    output were never accounted for) — killed, 10 integration failures,
+    identical shape to mutation 22's.
+
+**Tests: 2 new (748 total, up from 746): 490 unit (unchanged), 258
+integration (+2).** Typecheck, lint, and the full suite (both promotion
+files, the whole repo) stayed green throughout; three file checksums
+(`job-promotion/frontend-backend.ts`, `workspace/project-workspace.ts`,
+`workspace/site-build.ts`) confirmed clean against their pre-review backups
+after every mutation was reverted.
+
 ### Deliberately next, not now
 
-- **Phase 5h** — idempotent promotion of one accepted `frontend_backend`
-  candidate: starting only from an accepted job, resolve its exact accepted
-  `executionOutputs`, prove the candidate's acceptance state, materialise
-  exactly that candidate into the canonical project workspace, commit it
-  canonically, and make the whole promotion replay-safe — handling the
-  filesystem/Git crash boundary honestly rather than assuming it away. No
-  Luna, no deployment, no broad `runProject` cutover in that slice either.
+- **A first real, harness-owned end-to-end job lifecycle for one
+  `frontend_backend` job** — enqueue, `JobRunner`/Terra execution, 5g-1
+  validation, 5g-2 acceptance, and 5h promotion, chained together by the
+  harness rather than exercised as isolated slices the way every Phase 5
+  test so far has. Not yet named "5i" — deliberately left open whether it is
+  one slice or several. Explicitly excludes: Luna, multi-role orchestration,
+  Sol replan/adjudication of job-engine-produced work, and deployment of the
+  promoted commit.
 - **Later still** — mapping Luna repair work onto persisted jobs, what a
   replan does to jobs from the superseded plan (`superseded` does not exist
   yet), orphaned staging cleanup (deferred deliberately, not overlooked), and

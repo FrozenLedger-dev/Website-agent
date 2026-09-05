@@ -109,8 +109,13 @@ export class CandidateValidationShapeInvalid extends Error {
  * so it is checked only for presence as an array, not deeply — `files` is
  * what materialises, and reuses the one existing `GeneratedFile` schema
  * (`@statxai/contracts`) rather than inventing a second one.
+ *
+ * Exported for Phase 5h's reuse: promotion parses the same staged
+ * `BuildCandidate` payload before ever writing it into the canonical
+ * workspace, and must fail closed on the same malformed shapes this module
+ * already fails closed on — not a second, competing schema.
  */
-const CandidateShape = z.object({
+export const CandidateShape = z.object({
   routeDecisions: z.array(z.unknown()),
   files: z.array(GeneratedFile),
 });

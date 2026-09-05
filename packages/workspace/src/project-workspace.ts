@@ -85,6 +85,16 @@ export class ProjectWorkspace {
     return target;
   }
 
+  /**
+   * The exact repo-root-relative path `path` resolves to — the same
+   * containment-checked resolution `writeSiteFiles`/`readSiteFile` use,
+   * exposed so a caller can compare a site-relative candidate path against
+   * repo-root-relative output like {@link dirtyPaths}.
+   */
+  siteFileRepoPath(path: string): string {
+    return relative(this.root, this.safeSitePath(path));
+  }
+
   /** Write generated site files. Returns the paths actually written. */
   async writeSiteFiles(files: readonly GeneratedFile[]): Promise<string[]> {
     const written: string[] = [];
@@ -130,6 +140,42 @@ export class ProjectWorkspace {
     await writeFile(target, JSON.stringify(data, null, 2) + '\n', 'utf8');
   }
 
+  /**
+   * Every path with an uncommitted change in the working tree, repo-root
+   * relative — `git status --porcelain -z` (`-z` so a path is never subject
+   * to git's own quoting/escaping, unlike the plain porcelain format
+   * `commit()` uses for its own simpler empty-vs-nonempty check). A rename
+   * or copy entry is reported by its destination path only; git does not
+   * detect renames in unstaged working-tree status by default, so this is a
+   * defensive allowance rather than behaviour anything here currently
+   * exercises.
+   */
+  async dirtyPaths(): Promise<string[]> {
+    // `--untracked-files=all`: without it, a wholly-new untracked directory
+    // (the common case for `app/` on a first-ever promotion, before
+    // anything has committed it) is reported as one collapsed `app/` entry
+    // rather than each file inside it — which would make every individual
+    // file this method is meant to recognise look "unexpected."
+    const { stdout } = await exec(
+      'git',
+      [
+        '-c', `safe.directory=${this.root}`,
+        '-C', this.root,
+        'status', '--porcelain', '-z', '--untracked-files=all',
+      ],
+      { maxBuffer: 16 * 1024 * 1024 },
+    );
+    const fields = stdout.split('\0').filter((field) => field.length > 0);
+    const paths: string[] = [];
+    for (let i = 0; i < fields.length; i++) {
+      const entry = fields[i]!;
+      paths.push(entry.slice(3));
+      // Rename/copy entries carry the original path as a second field.
+      if (entry[0] === 'R' || entry[0] === 'C') i++;
+    }
+    return paths;
+  }
+
   /** Commit the working tree. Returns the commit SHA, or null if nothing changed. */
   async commit(message: string): Promise<string | null> {
     await this.git('add', '-A');
@@ -141,5 +187,44 @@ export class ProjectWorkspace {
 
   async currentCommit(): Promise<string | null> {
     return this.git('rev-parse', 'HEAD').catch(() => null);
+  }
+
+  /**
+   * The exact commit SHA whose message contains `marker` as a full line, or
+   * `null` if no such commit exists — including when the workspace has no
+   * commits at all yet. Searches the whole of history (`--all`), not merely
+   * whatever is currently checked out: a commit a later one has since been
+   * built on top of is still found here, deliberately (Phase 5h's own
+   * "promotion commit may become an ancestor" requirement) — this never
+   * looks at, and never changes, which commit is HEAD.
+   *
+   * Matching is exact-line, not substring: `%B` (the raw commit message) is
+   * split on newlines, and `marker` must equal one of those lines exactly.
+   * A commit whose message merely *mentions* the marker text as part of a
+   * longer line does not match. `\x01`/`\x02` are used as field/record
+   * separators in git's own `--format`, chosen because a real commit message
+   * containing either is not a byte sequence any of this codebase's own
+   * commits (or a plausible unrelated one) would ever produce.
+   */
+  async findCommitByMarker(marker: string): Promise<string | null> {
+    const FIELD_SEP = '\x01';
+    const ENTRY_SEP = '\x02';
+    let stdout: string;
+    try {
+      stdout = await this.git('log', '--all', `--format=%H${FIELD_SEP}%B${ENTRY_SEP}`);
+    } catch {
+      // No commits yet — `git log` on an empty repository exits non-zero.
+      return null;
+    }
+    for (const rawEntry of stdout.split(ENTRY_SEP)) {
+      const entry = rawEntry.trim();
+      if (entry === '') continue;
+      const sep = entry.indexOf(FIELD_SEP);
+      if (sep === -1) continue;
+      const sha = entry.slice(0, sep);
+      const message = entry.slice(sep + FIELD_SEP.length);
+      if (message.split('\n').some((line) => line.trim() === marker)) return sha;
+    }
+    return null;
   }
 }

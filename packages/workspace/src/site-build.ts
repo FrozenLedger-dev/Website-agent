@@ -59,6 +59,8 @@ export function assertModelWritable(path: string): void {
   if (!isModelWritable(path)) throw new WriteOutsideModelScope(path);
 }
 
+const SCAFFOLD_EXCLUDE = /(^|[/\\])(node_modules|\.next|out)([/\\]|$)/;
+
 /** Copy the scaffold into a project, leaving any already-generated files alone. */
 export async function scaffoldSite(siteRoot: string, templateRoot = defaultTemplateRoot()): Promise<void> {
   const exists = await stat(templateRoot).catch(() => null);
@@ -67,8 +69,36 @@ export async function scaffoldSite(siteRoot: string, templateRoot = defaultTempl
   await cp(templateRoot, siteRoot, {
     recursive: true,
     force: false, // never clobber generated pages on a re-scaffold
-    filter: (source) => !/(^|[/\\])(node_modules|\.next|out)([/\\]|$)/.test(source),
+    filter: (source) => !SCAFFOLD_EXCLUDE.test(source),
   });
+}
+
+/**
+ * Every site-relative path `scaffoldSite` would place under `siteRoot` —
+ * the same walk-and-filter `cp` runs internally, exposed so a caller can
+ * tell the platform scaffold's own legitimate output apart from anything
+ * else that might be sitting in a workspace. `scaffoldSite` is
+ * deterministic and never model- or candidate-influenced, so this listing
+ * changes only when the bundled template itself does.
+ */
+export async function scaffoldTemplatePaths(templateRoot = defaultTemplateRoot()): Promise<string[]> {
+  const paths: string[] = [];
+
+  const walk = async (dir: string): Promise<void> => {
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (SCAFFOLD_EXCLUDE.test(full)) continue;
+      if (entry.isDirectory()) {
+        await walk(full);
+        continue;
+      }
+      paths.push(full.slice(templateRoot.length + 1).split(sep).join('/'));
+    }
+  };
+
+  await walk(templateRoot);
+  return paths;
 }
 
 /** The line without which the stylesheet contains no Tailwind at all. */

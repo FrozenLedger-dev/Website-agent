@@ -11,6 +11,7 @@ import type {
   BudgetDocument,
   DefectBudgetDocument,
   JobDocument,
+  JobPromotionRecord,
   ProjectDocument,
   ReviewDocument,
 } from './documents.js';
@@ -81,6 +82,14 @@ export class StateStore {
   get runEvents(): Collection<RunEventDocument> {
     return this.db.collection<RunEventDocument>('run_events');
   }
+  /**
+   * Durable canonical-promotion receipts (Phase 5h). `_id` is the
+   * deterministic promotion identity, so this collection is itself the
+   * idempotency ledger — no separate lock or lease collection exists.
+   */
+  get promotions(): Collection<JobPromotionRecord> {
+    return this.db.collection<JobPromotionRecord>('job_promotions');
+  }
 
   /**
    * Run `fn` inside a multi-document transaction.
@@ -149,6 +158,16 @@ export class StateStore {
 
     await this.runs.createIndexes([{ key: { startedAt: -1 } }, { key: { projectId: 1 } }]);
     await this.runEvents.createIndexes([{ key: { runId: 1, seq: 1 }, unique: true }]);
+
+    // At most one in-progress (`prepared`) canonical promotion per project —
+    // the project-scoped serialization Phase 5h needs, enforced by Mongo
+    // itself rather than a separate lock service. Partial, the same way the
+    // artifact lineage index is: a `committed` promotion no longer
+    // participates, freeing the project for the next one.
+    await this.promotions.createIndexes([
+      { key: { projectId: 1 }, unique: true, partialFilterExpression: { status: 'prepared' } },
+      { key: { projectId: 1, jobId: 1 } },
+    ]);
   }
 
   async close(): Promise<void> {

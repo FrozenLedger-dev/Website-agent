@@ -108,6 +108,17 @@ export class ArtifactRegistry {
   }
 
   /**
+   * The full stored document for an exact ref, or `null` if it does not
+   * exist — unlike `get`/`resolve`, which throw. For a caller that needs
+   * more than the artifact's own data (Phase 5h needs `acceptedAt`, which
+   * `resolve` does not expose), reading the one document once here is the
+   * existing project-relative identity path, not a second lookup mechanism.
+   */
+  async getDocument(projectId: string, ref: ArtifactRef): Promise<ArtifactDocument | null> {
+    return this.store.artifacts.findOne({ _id: artifactId(projectId, ref.name, ref.version) });
+  }
+
+  /**
    * Mark a version accepted; only accepted versions are valid job inputs.
    *
    * Returns whether a document actually matched — `false` means no artifact

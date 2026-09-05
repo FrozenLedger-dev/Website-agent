@@ -5,7 +5,7 @@
  * authors and cannot influence (Appendix B: "state belongs to the platform,
  * reasoning belongs to the model").
  */
-import type { AutonomyMode, JobRecord, ReviewOutcomeRecord, WorkerRole } from '@statxai/contracts';
+import type { ArtifactRef, AutonomyMode, JobRecord, ReviewOutcomeRecord, WorkerRole } from '@statxai/contracts';
 
 /** Project lifecycle, distinct from job lifecycle. */
 export type ProjectState =
@@ -171,4 +171,48 @@ export interface AuditEvent {
   actor: string;
   detail: Record<string, unknown>;
   at: Date;
+}
+
+export type JobPromotionStatus = 'prepared' | 'committed';
+
+/**
+ * Durable receipt for one canonical promotion of an accepted job's exact
+ * execution output (Phase 5h).
+ *
+ * `_id` is the deterministic promotion identity: the same accepted
+ * execution (project, job, attempt, exact candidate ref) always derives the
+ * same one, so a retry after any crash — mid-write, after the canonical Git
+ * commit but before this record is finalized, or long after — finds and
+ * resumes this exact record rather than ever creating a second one. This is
+ * the durable half of promotion's replay safety; the other half is the
+ * machine-readable marker Phase 5h writes into the promotion commit itself,
+ * since a crash between the Git commit succeeding and this record being
+ * finalized means Mongo alone cannot yet know the commit happened at all —
+ * only the commit can prove that on the next attempt.
+ *
+ * `status` only ever moves `prepared -> committed`, once, by whichever
+ * caller's retry is first to either create the canonical commit or discover
+ * one already exists. There is no `promoted` `JobState`: acceptance and
+ * canonical promotion are separate lifecycle dimensions, and this record —
+ * not `JobDocument` — is where promotion's own state lives.
+ */
+export interface JobPromotionRecord {
+  _id: string;
+  projectId: string;
+  jobId: string;
+  attempt: number;
+  output: ArtifactRef;
+  /**
+   * The canonical workspace commit this promotion was prepared against —
+   * `null` when the workspace had no commit at all yet (a legitimate first
+   * build, not a placeholder). Before applying a still-`prepared` promotion,
+   * current canonical HEAD must still equal this, or promotion fails closed
+   * rather than silently building on an unexpected lineage.
+   */
+  baseCommit: string | null;
+  status: JobPromotionStatus;
+  /** Set only once, the moment the canonical promotion commit is known — created by this attempt, or discovered already there. */
+  commitSha: string | null;
+  createdAt: Date;
+  updatedAt: Date;
 }

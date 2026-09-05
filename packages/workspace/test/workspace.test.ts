@@ -140,3 +140,22 @@ describe('artifact registry', () => {
     expect(contentHash({ a: 1 })).not.toBe(contentHash({ a: 2 }));
   });
 });
+
+describe('commit marker lookup', () => {
+  it('matches only an exact marker line, never a marker embedded as a substring within a longer line', async () => {
+    // Phase 5h's promotion marker search depends on this being exact: a
+    // commit message that merely mentions the marker text in passing must
+    // never be mistaken for the real promotion commit it names.
+    const ws = await ProjectWorkspace.open(`${PROJECT}_marker_exact`, root);
+    const marker = 'Statx-Promotion-Id: abc123';
+
+    await ws.writeSiteFiles([{ path: 'index.html', contents: '<h1>decoy</h1>' }]);
+    const decoySha = await ws.commit(`unrelated work\n\nsee also ${marker} for context`);
+    expect(decoySha).not.toBeNull();
+    expect(await ws.findCommitByMarker(marker)).toBeNull();
+
+    await ws.writeSiteFiles([{ path: 'other.html', contents: '<h1>real</h1>' }]);
+    const realSha = await ws.commit(`Promote accepted frontend/backend candidate\n\n${marker}`);
+    expect(await ws.findCommitByMarker(marker)).toBe(realSha);
+  });
+});
