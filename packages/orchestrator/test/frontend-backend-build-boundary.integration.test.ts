@@ -242,6 +242,7 @@ beforeEach(async () => {
   await store.projects.deleteMany({});
   await store.budgets.deleteMany({});
   await store.promotions.deleteMany({});
+  await store.frontendBackendBuildBindings.deleteMany({});
 });
 
 afterEach(() => {
@@ -661,12 +662,15 @@ describe('structural boundaries', () => {
     for (const call of ['registry.accept(', 'engine.accept(', '.writeSiteFiles(', 'scaffoldSite(']) {
       expect(jobModeBlock).not.toContain(call);
     }
-    // The one exception: `workspace.commit('Harness: specification')` — a
-    // narrow sweep-up of discover/plan's own pre-existing, already-written
-    // spec docs (never site files), required so Phase 5h's dirty-tree guard
-    // does not see them as foreign. See the code comment at that call site.
-    expect(jobModeBlock).toContain("workspace.commit('Harness: specification')");
-    expect((jobModeBlock.match(/\.commit\(/g) ?? [])).toHaveLength(1);
+    // Phase 5k moved the one narrow exception — the pre-existing
+    // "Harness: specification" sweep-up commit (never a site file) — into
+    // `ensureSpecificationCommitted` (`run-binding/frontend-backend.ts`),
+    // which now also owns the replay-safe marker search/recovery that
+    // commit needs on resume. `orchestrator.ts` itself calls that function
+    // and never calls `.commit(`/`.dirtyPaths(` directly any more.
+    expect(jobModeBlock).toContain('await ensureSpecificationCommitted(store, workspace, binding, initialPlan);');
+    expect(jobModeBlock).not.toContain('.commit(');
+    expect(jobModeBlock).not.toContain('.dirtyPaths(');
   });
 
   it('does not invoke Luna, Sol replan/adjudicate, or deployment as part of mode selection', async () => {

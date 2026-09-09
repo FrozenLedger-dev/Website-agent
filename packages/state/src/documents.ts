@@ -5,7 +5,7 @@
  * authors and cannot influence (Appendix B: "state belongs to the platform,
  * reasoning belongs to the model").
  */
-import type { ArtifactRef, AutonomyMode, JobRecord, ReviewOutcomeRecord, WorkerRole } from '@statxai/contracts';
+import type { ArtifactRef, AutonomyMode, JobRecord, JobSpec, ReviewOutcomeRecord, WorkerRole } from '@statxai/contracts';
 
 /** Project lifecycle, distinct from job lifecycle. */
 export type ProjectState =
@@ -213,6 +213,58 @@ export interface JobPromotionRecord {
   status: JobPromotionStatus;
   /** Set only once, the moment the canonical promotion commit is known — created by this attempt, or discovered already there. */
   commitSha: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export type FrontendBackendBuildBindingStatus = 'prepared' | 'promoted';
+
+/**
+ * The durable record that lets a fresh `runProject` invocation (Phase 5k)
+ * resume an incomplete `frontend_backend` job-mode build after a restart,
+ * rather than starting discovery/planning again and producing a different
+ * `businessProfile`/`sitePlan` version — and therefore a different
+ * deterministic `JobSpec`/`jobId` — for a build Phase 5i may already be
+ * partway through.
+ *
+ * `_id` is deterministic (see `computeBindingId`,
+ * `run-binding/frontend-backend.ts`), so a second fresh invocation for the
+ * same logical request always derives the same record rather than ever
+ * creating a second one. `jobSpec` is stored in full, not only as a hash: a
+ * future code deployment could change the factory's defaults (objective
+ * wording, `allowedTools`, output conventions), and reconstructing the spec
+ * from new code on resume could silently address a different request than
+ * the one Phase 5i is actually partway through executing. The stored spec
+ * is authoritative for resume; `jobSpecHash` is an integrity/indexing aid,
+ * never a substitute for it.
+ *
+ * `status` moves `prepared -> promoted` exactly once, the moment Phase 5i
+ * returns `promoted` — mirroring `JobPromotionRecord`'s own
+ * `prepared -> committed` shape. A `promoted` binding is retained as
+ * historical control-plane evidence, never deleted, and no longer occupies
+ * the project's one-active-binding slot (see the partial unique index on
+ * `{ projectId }` in `StateStore.ensureIndexes`), so a later, genuinely new
+ * build generation for the same project is free to prepare a new one.
+ */
+export interface FrontendBackendBuildBindingDocument {
+  _id: string;
+  projectId: string;
+  status: FrontendBackendBuildBindingStatus;
+  /** Identifies the logical request this binding answers — see `computeRunIntentHash`. */
+  runIntentHash: string;
+  businessProfile: ArtifactRef;
+  sitePlan: ArtifactRef;
+  /** The exact immutable request Phase 5i must resume — authoritative on resume, never reconstructed from current code. */
+  jobSpec: JobSpec;
+  jobSpecHash: string;
+  jobId: string;
+  /** Canonical HEAD at the moment this binding was prepared, before its specification commit — `null` for a project's first-ever commit. */
+  specificationBaseCommit: string | null;
+  /** Set once the specification commit is known to exist — created by this invocation, or discovered already there via its marker. */
+  specificationCommitSha: string | null;
+  /** Set only once `status` becomes `promoted`, from Phase 5i/5h's own returned values. */
+  promotionId: string | null;
+  promotionCommitSha: string | null;
   createdAt: Date;
   updatedAt: Date;
 }

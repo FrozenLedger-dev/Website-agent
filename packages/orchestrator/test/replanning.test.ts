@@ -359,11 +359,16 @@ describe('a replan that cannot be produced', () => {
 
     // Exactly one call survives in the delivery loop: the initial plan.
     expect(code.match(/producePlan\(/g) ?? []).toHaveLength(1);
-    // Destructured since Phase 5j threaded `sitePlanRef` out of `producePlan`
-    // alongside the plan itself.
+    // Still one destructured `const`, unchanged since Phase 5j — Phase 5k
+    // adds a resume source in the same `ProducedPlan` shape ahead of it
+    // (`activeBinding ? { plan, sitePlanRef } : await producePlan(...)`), so
+    // a resumed invocation never calls `producePlan` while the destructuring
+    // itself, and the immutability it gives `initialPlan`, stay exactly as
+    // they were.
     expect(code).toContain(
-      'const { plan: initialPlan, sitePlanRef: initialSitePlanRef } = await producePlan({ deps, facts }, 0)',
+      'const { plan: initialPlan, sitePlanRef: initialSitePlanRef } = activeBinding',
     );
+    expect(code).toContain(': await producePlan({ deps, facts }, 0);');
 
     // And the replan branch reaches revisePlan, not the planner.
     const replanBranch = code.slice(code.indexOf("adjudication.action === 'replan'"));

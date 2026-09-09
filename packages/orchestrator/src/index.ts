@@ -8,7 +8,6 @@ export {
   runProject,
   type RunOptions,
   type FrontendBackendExecutionMode,
-  RunProjectSpecificationWorkingTreeDirty,
 } from './orchestrator.js';
 export * from './run-service.js';
 export * from './adjudication.js';
@@ -21,3 +20,4 @@ export * from './job-acceptance/frontend-backend.js';
 export * from './job-promotion/frontend-backend.js';
 export * from './job-lifecycle/frontend-backend.js';
 export * from './job-specs/frontend-backend.js';
+export * from './run-binding/frontend-backend.js';

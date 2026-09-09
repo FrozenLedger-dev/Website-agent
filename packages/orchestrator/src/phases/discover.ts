@@ -51,15 +51,23 @@ export type DiscoverResult =
       budgetLimits: BudgetLimits;
     };
 
-export async function discoverProject(input: DiscoverInput): Promise<DiscoverResult> {
-  const { projectId, store, registry, autonomyMode, say } = input;
+/**
+ * Whether `intake` is usable, and nothing else — no store, no registry, no
+ * workspace, no `say`. The pure half of discovery (Phase 4e's guarantee:
+ * malformed or insufficient intake has zero startup side effects), pulled
+ * out so a second caller (Phase 5k's active-binding preflight, which must
+ * run this exact check before deciding whether to skip discovery's own
+ * durable side effects) can reuse it rather than re-deriving it and risking
+ * drift from what `discoverProject` itself actually enforces.
+ */
+export type ValidatedIntake =
+  | { readonly ok: true; readonly profile: BusinessProfile }
+  | { readonly ok: false; readonly reason: string };
 
-  say({ phase: 'discover', detail: 'Validating intake against the canonical schema' });
-
-  const parsed = BusinessProfile.safeParse(input.intake);
+export function validateIntake(intake: unknown): ValidatedIntake {
+  const parsed = BusinessProfile.safeParse(intake);
   if (!parsed.success) {
-    say({ phase: 'discover', detail: `Intake rejected: ${parsed.error.issues[0]?.message}`, level: 'fail' });
-    return { ok: false, outcome: 'intake_insufficient' };
+    return { ok: false, reason: `Intake rejected: ${parsed.error.issues[0]?.message}` };
   }
   const profile = parsed.data;
 
@@ -67,9 +75,39 @@ export async function discoverProject(input: DiscoverInput): Promise<DiscoverRes
   // then rejects forever. Catch it before spending a single token.
   const gaps = intakeGaps(profile);
   if (gaps.length > 0) {
-    say({ phase: 'discover', detail: `Intake insufficient: ${gaps.join('; ')}`, level: 'fail' });
+    return { ok: false, reason: `Intake insufficient: ${gaps.join('; ')}` };
+  }
+  return { ok: true, profile };
+}
+
+/**
+ * Where {@link discoverProject} materialises the canonical profile in the
+ * project workspace — exported so a second writer (Phase 5k's resume-
+ * recovery path, re-materialising a bound profile that this invocation
+ * never ran discovery for) never has to duplicate the literal path and risk
+ * it drifting from the one `discoverProject` actually writes.
+ */
+export const BUSINESS_PROFILE_ARTIFACT_PATH = 'client/business-profile.json';
+
+/** Write the canonical profile into its one fixed workspace location. */
+export async function materialiseBusinessProfileFile(
+  workspace: ProjectWorkspace,
+  profile: BusinessProfile,
+): Promise<void> {
+  await workspace.materialiseArtifact(BUSINESS_PROFILE_ARTIFACT_PATH, profile);
+}
+
+export async function discoverProject(input: DiscoverInput): Promise<DiscoverResult> {
+  const { projectId, store, registry, autonomyMode, say } = input;
+
+  say({ phase: 'discover', detail: 'Validating intake against the canonical schema' });
+
+  const validated = validateIntake(input.intake);
+  if (!validated.ok) {
+    say({ phase: 'discover', detail: validated.reason, level: 'fail' });
     return { ok: false, outcome: 'intake_insufficient' };
   }
+  const { profile } = validated;
   say({ phase: 'discover', detail: `${profile.businessName} — ${profile.services.length} services`, level: 'ok' });
 
   /**
@@ -103,7 +141,7 @@ export async function discoverProject(input: DiscoverInput): Promise<DiscoverRes
   // planner, the claims gate, the reviewer — measures against what was parsed.
   const profileRef = await registry.put(projectId, 'business-profile', profile);
   await registry.accept(projectId, profileRef);
-  await workspace.materialiseArtifact('client/business-profile.json', profile);
+  await materialiseBusinessProfileFile(workspace, profile);
 
   const budget = await store.budgets.findOne({ _id: projectId });
   if (!budget) {

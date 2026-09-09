@@ -69,7 +69,15 @@ function computeJobId(identity: FrontendBackendJobIdentity): string {
   // field that primitive would later compare except `jobId` itself, which
   // cannot be part of its own preimage. Two calls with the same identity
   // always produce the same id; any field changing changes it.
-  return `frontend-backend-${contentHash(identity)}`;
+  //
+  // `job_` prefix, underscores only: `@statxai/contracts`' own `JobId`
+  // schema requires `/^job_[a-z0-9_]+$/`. Nothing in the runtime path
+  // (`JobEngine.enqueue`, `JobRunner`) ever calls `JobSpec.safeParse` on a
+  // produced spec, so an earlier `frontend-backend-<hash>` id (hyphenated,
+  // no `job_` prefix) never actually failed at runtime — until Phase 5k's
+  // own build-binding resume, which must parse a *stored* spec through the
+  // real contract and therefore was the first caller to ever validate this.
+  return `job_frontend_backend_${contentHash(identity)}`;
 }
 
 /**

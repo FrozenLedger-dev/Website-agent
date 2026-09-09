@@ -8,6 +8,7 @@
  */
 import { HOME_ROUTE, type ArtifactRef, type SitePlan } from '@statxai/contracts';
 import { planSite, replanSite } from '@statxai/agents';
+import type { ProjectWorkspace } from '@statxai/workspace';
 import { authorizeReplanRevision, type ReplanScope } from '@statxai/policy-engine';
 import { planDelta, type ReplanRecord } from '../replanning.js';
 import type { Defect } from '../defects.js';
@@ -70,15 +71,26 @@ export function sitePlanArtifactPaths(plan: SitePlan): string[] {
   ];
 }
 
+/**
+ * Write `plan`'s files into their fixed workspace locations — exactly
+ * {@link sitePlanArtifactPaths}' own paths, since both read from
+ * {@link pageSlug}. Exported so a second writer (Phase 5k's resume-recovery
+ * path, re-materialising a bound plan that this invocation never ran
+ * planning for) reuses this instead of duplicating it and risking drift.
+ */
+export async function materialiseSitePlanFiles(workspace: ProjectWorkspace, plan: SitePlan): Promise<void> {
+  await workspace.materialiseArtifact('design/brand-system.json', plan.brandSystem);
+  await workspace.materialiseArtifact('specs/sitemap.json', plan.sitemap);
+  for (const page of plan.sitemap.pages) {
+    await workspace.materialiseArtifact(`specs/pages/${pageSlug(page.route)}.json`, page);
+  }
+}
+
 export async function persistPlan(ctx: FixedContext, produced: SitePlan): Promise<ArtifactRef> {
   const { deps, facts } = ctx;
   const ref = await deps.registry.put(facts.projectId, 'site-plan', produced);
   await deps.registry.accept(facts.projectId, ref);
-  await deps.workspace.materialiseArtifact('design/brand-system.json', produced.brandSystem);
-  await deps.workspace.materialiseArtifact('specs/sitemap.json', produced.sitemap);
-  for (const page of produced.sitemap.pages) {
-    await deps.workspace.materialiseArtifact(`specs/pages/${pageSlug(page.route)}.json`, page);
-  }
+  await materialiseSitePlanFiles(deps.workspace, produced);
   return ref;
 }
 

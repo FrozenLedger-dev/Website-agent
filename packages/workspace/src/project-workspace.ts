@@ -190,13 +190,19 @@ export class ProjectWorkspace {
   }
 
   /**
-   * The exact commit SHA whose message contains `marker` as a full line, or
-   * `null` if no such commit exists — including when the workspace has no
-   * commits at all yet. Searches the whole of history (`--all`), not merely
-   * whatever is currently checked out: a commit a later one has since been
-   * built on top of is still found here, deliberately (Phase 5h's own
-   * "promotion commit may become an ancestor" requirement) — this never
-   * looks at, and never changes, which commit is HEAD.
+   * Every commit SHA whose message contains `marker` as a full line, oldest
+   * first as `git log` itself orders them — the general form, generalised
+   * from Phase 5h's own single-match {@link findCommitByMarker} so a second
+   * caller with its own deterministic marker (Phase 5k's build-binding
+   * specification commit) can detect the "more than one exists" case that a
+   * single match can't distinguish from "found the only one" — genuine
+   * corruption, since this workspace's own callers only ever create at most
+   * one commit per exact deterministic marker, by construction. Searches
+   * the whole of history (`--all`), not merely whatever is currently
+   * checked out: a commit a later one has since been built on top of is
+   * still found here, deliberately (Phase 5h's own "promotion commit may
+   * become an ancestor" requirement) — this never looks at, and never
+   * changes, which commit is HEAD.
    *
    * Matching is exact-line, not substring: `%B` (the raw commit message) is
    * split on newlines, and `marker` must equal one of those lines exactly.
@@ -206,7 +212,7 @@ export class ProjectWorkspace {
    * containing either is not a byte sequence any of this codebase's own
    * commits (or a plausible unrelated one) would ever produce.
    */
-  async findCommitByMarker(marker: string): Promise<string | null> {
+  async findCommitsByMarker(marker: string): Promise<string[]> {
     const FIELD_SEP = '\x01';
     const ENTRY_SEP = '\x02';
     let stdout: string;
@@ -214,8 +220,9 @@ export class ProjectWorkspace {
       stdout = await this.git('log', '--all', `--format=%H${FIELD_SEP}%B${ENTRY_SEP}`);
     } catch {
       // No commits yet — `git log` on an empty repository exits non-zero.
-      return null;
+      return [];
     }
+    const shas: string[] = [];
     for (const rawEntry of stdout.split(ENTRY_SEP)) {
       const entry = rawEntry.trim();
       if (entry === '') continue;
@@ -223,8 +230,22 @@ export class ProjectWorkspace {
       if (sep === -1) continue;
       const sha = entry.slice(0, sep);
       const message = entry.slice(sep + FIELD_SEP.length);
-      if (message.split('\n').some((line) => line.trim() === marker)) return sha;
+      if (message.split('\n').some((line) => line.trim() === marker)) shas.push(sha);
     }
-    return null;
+    return shas;
+  }
+
+  /**
+   * The exact commit SHA whose message contains `marker` as a full line, or
+   * `null` if no such commit exists. The first match from
+   * {@link findCommitsByMarker} — every existing caller's markers are
+   * deterministic and expected to identify at most one commit, so "first"
+   * and "only" already coincide for them; a caller that must also tell
+   * "exactly one" apart from "more than one" (genuine corruption) uses
+   * {@link findCommitsByMarker} directly instead.
+   */
+  async findCommitByMarker(marker: string): Promise<string | null> {
+    const shas = await this.findCommitsByMarker(marker);
+    return shas[0] ?? null;
   }
 }

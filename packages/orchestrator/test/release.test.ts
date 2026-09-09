@@ -238,8 +238,15 @@ describe('what a refused release reports to its caller', () => {
     expect(code).toContain('if (!discovery.ok)');
     expect(code).toContain('withoutDelivery(projectId, discovery.outcome');
 
+    // One, not two: Phase 5k pulled the schema-parse and intake-gap checks
+    // into the pure, shared `validateIntake` (a second caller — the
+    // job-mode active-binding preflight — needs the exact same check
+    // before deciding whether to skip discovery's own durable side
+    // effects, and must not re-derive it). `discoverProject` now has one
+    // shared `intake_insufficient` return for whichever of the two
+    // `validateIntake` finds.
     const discover = strip(await read('phases/discover.ts'));
-    expect(discover.match(/ok: false, outcome: 'intake_insufficient'/g) ?? []).toHaveLength(2);
+    expect(discover.match(/ok: false, outcome: 'intake_insufficient'/g) ?? []).toHaveLength(1);
   });
 
   it('reports the delivery that actually happened', async () => {

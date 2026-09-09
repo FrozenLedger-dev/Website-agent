@@ -3205,7 +3205,10 @@ unit (+14 JobSpec factory), 312 integration (+21 build-boundary).**
   different projects/refs; `jobId` prefix; deterministic identity
   (identical input → identical `JobSpec`/`jobId`, 5 repeated calls collapse
   to one id); `jobId` exactly `frontend-backend-` + `contentHash` of the
-  identity; a changed `projectId`/`businessProfileRef`
+  identity (superseded by Phase 5k — see that section: the format shipped
+  here never actually satisfied `@statxai/contracts`' own `JobId` schema,
+  uncaught because nothing in the runtime path validates a produced spec
+  against it); a changed `projectId`/`businessProfileRef`
   (name or version)/`sitePlanRef` (name or version) each changes `jobId`;
   swapping which ref is which changes `jobId`; the result carries no field
   beyond the fixed `JobSpec` surface.
@@ -3352,19 +3355,384 @@ evidence.** **Phase 5j does not deploy the promoted commit.** **Phase 5j
 cuts over only the `frontend_backend` build boundary.** **The rest of
 `runProject` remains harness-owned and unchanged.**
 
+### Phase 5k — durable active frontend/backend build binding / restart resume — **DONE**
+
+Closes the gap Phase 5j's own "deliberately next" note named: a fresh
+`runProject` invocation had no durable record of *which* Phase 5i job an
+unfinished job-mode build belonged to, so a restart re-ran discovery and
+planning — legitimately producing new `businessProfile`/`sitePlan`
+versions, and therefore a different deterministic `JobSpec`/`jobId` — for a
+build Phase 5i might already be partway through under the old one. Applies
+only to `job_lifecycle`; `legacy_direct` is byte-for-byte unchanged and
+remains the default.
+
+**A durable active build binding, one per project.** New collection
+`frontend_backend_build_bindings`
+(`FrontendBackendBuildBindingDocument`, `packages/state/src/documents.ts`),
+mirroring `JobPromotionRecord`'s own shape exactly: `status: 'prepared' |
+'promoted'`, a project-scoped partial unique index on `{ projectId }` where
+`status: 'prepared'` (`StateStore.ensureIndexes`) — at most one unfinished
+binding per project, enforced by Mongo itself, while `promoted` bindings
+are retained as historical evidence and no longer occupy the slot, freeing
+the project for a genuinely new build generation. A document carries:
+`runIntentHash`, the exact `businessProfile`/`sitePlan` `ArtifactRef`s, the
+**exact `JobSpec`** (not only its hash — a future code deployment could
+change the factory's objective wording, `allowedTools`, or output
+conventions, and reconstructing the spec from new code on resume could
+silently address a different request than the one already in flight; the
+stored spec is authoritative, the hash is an integrity/indexing aid only),
+`jobSpecHash`, `jobId`, `specificationBaseCommit`/`specificationCommitSha`,
+and `promotionId`/`promotionCommitSha` (set only once `promoted`).
+
+**No pre-existing durable run identity survives restart, so none was
+reused.** `run-service.ts`'s `RunRecorder`/`RunDocument` exist, but their
+`runId` is generated fresh per call
+(`` `run_${suffix}${Date.now().toString(36)}` ``, `Math.random()`-derived)
+and `runProject` itself never receives or threads one — inspected first,
+per the brief's own instruction, rather than assumed. A project-scoped
+binding with an immutable run-intent fingerprint is the smallest correct
+primitive; inventing a fake stable run id would have been worse than not
+solving the problem.
+
+**`bindingId` is deterministic**, from immutable authority only:
+`` `frontend-backend-build-${contentHash({ projectId, runIntentHash, jobSpecHash })}` ``
+— never `Date.now()`, a random id, `attempt`, `workerId`, a lease, an
+artifact `lineageSeq`, a `RunRecorder` sequence, or a promotion commit SHA.
+Two racing fresh invocations deriving the *same* exact binding converge on
+one durable record (idempotent ensure, mirroring `prepareFrontendBackendBuildBinding`
+against `JobPromotionRecord`'s own race-recovery shape); two deriving
+*different* bindings for the same project get
+`FrontendBackendBuildBindingConflict` for the loser, never a silent
+overwrite.
+
+**`runIntentHash` is the canonical, schema-validated profile — never raw
+JSON.** `computeRunIntentHash({ projectId, profile })` hashes the exact
+`BusinessProfile` `discoverProject` itself operates on, so two raw payloads
+that parse to the same canonical profile (stripped unknown fields, reordered
+properties) hash identically. Deliberately excludes `autonomyMode`: inspected
+first, and it affects only post-build adjudication/terminal-decision policy —
+never discovery's persistence, planning, or `JobSpec` construction — so
+including it would make the fingerprint distinguish requests that build
+identically. Also excluded, per the brief's own explicit list: callbacks,
+the `ModelClient` instance, `workspacesRoot`/`validationWorkspacesRoot`,
+the clock, worker lease timings.
+
+**Preflight ordering — the core Phase 5k cutover.** For `job_lifecycle`
+only, `runProject` now runs the *exact same* pure `validateIntake` check
+`discoverProject` itself runs (extracted into a shared function so the two
+callers can never drift — see below) before anything durable, then — only
+on success — looks up an active `prepared` binding for the project,
+*strictly before* discovery's own reset/write side effects (project
+delete/reinsert, budget delete/recreate, profile `put`/`accept`/materialise)
+and before planning. No matching binding: the fresh path, identical to
+before Phase 5k in every respect. A binding for a *different* `runIntentHash`:
+`FrontendBackendBuildBindingConflict`, thrown before any side effect — the
+existing binding is never resumed silently, destroyed, or raced past. A
+binding for the *same* `runIntentHash`: resume.
+
+**Phase 4e's zero-side-effect intake-failure guarantee, preserved by
+construction, not convention.** `discoverProject`'s own schema-parse +
+intake-gap check was extracted into `validateIntake` (`phases/discover.ts`),
+called by both `discoverProject` and the job-mode preflight — one
+implementation, not two hand-kept-in-sync copies. Malformed or
+schema-valid-but-insufficient intake fails exactly as it always has, with
+zero startup side effects, *even when a `prepared` binding already exists*
+— an existing binding is never used to bypass current request validation.
+
+**Resume rehydrates durable state; it never recreates it.** On a matching
+binding: `parseStoredJobSpec` parses the stored spec through the real
+`JobSpec` zod contract (fails closed, `FrontendBackendBuildBindingCorrupt`,
+on anything that does not parse — never trusted as arbitrary Mongo shape);
+`verifyBindingConsistency` re-proves `binding.projectId === spec.projectId`,
+`binding.jobId === spec.jobId`, `spec.role === 'frontend_backend'`,
+`contentHash(spec) === binding.jobSpecHash`, and both pinned inputs against
+`binding.businessProfile`/`binding.sitePlan` by exact `ArtifactRef` field
+equality (`name`/`version` always, `contentHash` when both sides carry one
+— never object identity); `registry.resolve` reads the *exact* bound
+profile/plan (never "latest" — a missing artifact throws `ArtifactNotFound`,
+never silently substituted); both are re-parsed through their own real
+schemas (`BusinessProfile`/`SitePlan`, never trusted as raw artifact JSON);
+the project document and budget document are read directly
+(`store.projects.findOne`/`store.budgets.findOne` — `createBudget`/a
+project reset are never called on this path; either missing throws
+`FrontendBackendBuildBindingResumeStateMissing`, since their absence is
+control-plane corruption a resume does not repair by rerunning discovery);
+`ProjectWorkspace.open` is idempotent. Discovery and planning are not
+called at all on this path — proved directly (no new `business-profile`/
+`site-plan` artifact version, no additional `planSite` call) rather than
+inferred from their absence in the diff.
+
+**The stored spec is authority on resume — the factory is only for new
+bindings.** `createFrontendBackendJobSpec` is called (and a binding
+prepared for its output) only on the fresh path; a resumed invocation
+never calls it and never treats its output as authority, proved by mocking
+the factory and asserting zero additional calls across a resume.
+
+**The specification commit is now itself replay-safe, marker-aware, and
+crash-recoverable — Phase 5h's own promotion pattern, applied one step
+earlier.** `ensureSpecificationCommitted` (`run-binding/frontend-backend.ts`)
+replaces the plain `workspace.commit('Harness: specification')` Phase 5j's
+corrective follow-up left in place: search canonical history (the whole of
+it, `ProjectWorkspace.findCommitsByMarker` — generalised, in a minimal
+refactor, from Phase 5h's own single-match `findCommitByMarker`, which is
+now a thin wrapper over it) for commits carrying this binding's exact
+marker, `` `Statx-Build-Binding-Id: <bindingId>` ``, before ever writing
+one.
+
+- **Found, exactly one** — verify it agrees with any already-recorded
+  `specificationCommitSha`, finalise the binding's own record if it was
+  still unset, and return. No second commit is ever created — this is what
+  makes "Git commit succeeded, process died before the Mongo SHA update"
+  recoverable.
+- **Found, more than one** — `FrontendBackendBuildBindingMarkerCorrupt`.
+  This binding's deterministic identity is only ever committed once by
+  construction; never resolved by choosing the newest.
+- **Not found** — canonical HEAD must still equal
+  `binding.specificationBaseCommit` (recorded at prepare-time, before any
+  commit; `null` is a legitimate first-ever-commit base, not a placeholder)
+  or `FrontendBackendBuildBindingBaseConflict` — someone else's canonical
+  write landed first. The working tree must carry nothing beyond the exact
+  expected specification paths (`RunProjectSpecificationWorkingTreeDirty`
+  otherwise — Phase 5j's corrective guard, untouched, reused here rather
+  than weakened). Only then: commit once with the marker, and finalise the
+  record.
+
+On resume, before this runs, `rehydrateSpecificationFiles` re-materialises
+the exact bound `businessProfile`/`sitePlan` content into the same fixed
+workspace paths `discoverProject`/`persistPlan` themselves write to
+(`materialiseBusinessProfileFile`/`materialiseSitePlanFiles`, both newly
+exported and reused by their original callers too — one writer, not two)
+— idempotent, and never a new `ArtifactRegistry` version. Needed because a
+resumed invocation never ran discovery/planning in *this* process, so
+nothing wrote those files to *this* workspace open yet; harmless on the
+already-committed case, since re-writing byte-identical content dirties
+nothing.
+
+**`RunProjectSpecificationWorkingTreeDirty` moved** from `orchestrator.ts`
+into `run-binding/frontend-backend.ts`, which now owns the whole
+specification-commit sequence; re-exported from `orchestrator.ts` so no
+existing import site changed.
+
+**Phase 5i is invoked with the stored spec, unchanged in every other
+respect.** No modification to Phase 5i's authority model, `JobEngine`
+execution authority, 5g-1, 5g-2, or 5h. Every non-`promoted` outcome
+(`validation_failed`/`retry_ready`/`in_progress`/`not_claimable`/`failed`/
+`repair_requested`/`blocked`/`draft`) leaves the binding exactly `prepared`
+— nothing to do, since that is already its state; a thrown platform
+failure leaves it `prepared` too, since the failure occurs before
+finalisation is ever reached.
+
+**Binding finalisation is a separate, guarded step — never inside Phase
+5h's own Mongo/Git sequence, and never claimed to be atomic with it.** Only
+once Phase 5i itself returns `promoted` does `finalizeBindingPromoted`
+guardedly move `prepared -> promoted`, recording `promotionId`/
+`promotionCommitSha` from Phase 5i's own returned values. If that write
+fails, the real Git promotion and the real committed `JobPromotionRecord`
+are never undone — the binding stays `prepared`, and a later invocation
+resumes it: Phase 5i/5h's own replay safety means this is a pure
+read-and-verify (no second Terra attempt, validation, acceptance, or
+promotion commit — the same accepted job, the same committed promotion
+record, the same commit SHA), after which finalisation retries and
+succeeds. Proved end-to-end: mocking `finalizeBindingPromoted` to fail once
+after a real promotion, then resuming for real.
+
+**A found, real bug from Phase 5j, corrected here.** `createFrontendBackendJobSpec`'s
+`computeJobId` produced `` `frontend-backend-${contentHash(identity)}` ``
+— hyphenated, no `job_` prefix — which never actually satisfied
+`@statxai/contracts`' own `JobId` schema (`/^job_[a-z0-9_]+$/`; existing
+fixtures elsewhere in this codebase already use `job_<slug>`). Uncaught
+because nothing in the runtime path (`JobEngine.enqueue`, `JobRunner`) ever
+calls `JobSpec.safeParse`/`.parse` on a produced spec — only compile-time
+TypeScript trusted it. Phase 5k's own §5 requirement — parse the *stored*
+spec through the real contract on resume, fail closed if corrupt — was the
+first caller ever to validate this at runtime, and it failed on every spec
+the factory could produce. Reported to the user before fixing (a
+previously-shipped, committed Phase 5j file), per their explicit direction:
+`computeJobId` now returns `` `job_frontend_backend_${contentHash(identity)}` ``
+— same deterministic, content-hash-derived design, corrected string format
+only. `job-specs-frontend-backend.test.ts` now asserts the produced spec
+parses through the real `JobSpec` schema directly, not only that it has the
+expected shape.
+
+**Scope, held exactly where the brief drew it:**
+
+- No general workflow cursor. No `currentPhase`/`nextPhase`/`workflowPC` or
+  resumable-graph concept added to `runProject`.
+- `runs`/`RunRecorder` untouched — not broadened into job scheduling.
+- No Luna, no repair-cycle resume. `validation_failed`/`repair_requested`/
+  `blocked`/`failed` behave exactly as Phase 5i/5j already left them.
+- **Phase 5k does not implement a whole-run post-promotion cursor.** Once a
+  binding reaches `promoted`, Phase 5k's own capability is complete. If a
+  process dies *after* `promoted` but *before* `runProject` concludes
+  (evaluation, review, repair, release), a fresh invocation does **not**
+  resume that part — `evaluateSite`, Terra review, Sol adjudication,
+  repair-cycle position, and release/deployment progress are not persisted
+  by this phase. That gap is stated here, explicitly, rather than implied
+  away: a later outer-run-resume capability, not this one.
+- No production default activation. `run-service.ts` is untouched — does
+  not reference `job_lifecycle` or `frontendBackendExecutionMode` at all
+  (checked directly).
+- No deployment behaviour added.
+- Deterministic harness control-plane logic throughout — Sol/Terra never
+  choose whether to resume a binding.
+
+**Tests: 48 new (870 total, up from 822 at the close of the 5j corrective
+review): 534 unit (+24 binding identity/consistency), 336 integration
+(+24 restart/resume).**
+
+- `run-binding-frontend-backend.test.ts` (24, unit, no Mongo):
+  `computeRunIntentHash` determinism/sensitivity/canonical-parse-not-raw-JSON;
+  `computeBindingId` determinism, per-field sensitivity, exact preimage
+  (`frontend-backend-build-` + `contentHash`, no clock/randomness);
+  `computeJobSpecHash` determinism and full-field sensitivity including
+  `jobId` itself; `bindingMarker`/`specificationCommitMessage` exact-line
+  shape; `parseStoredJobSpec` against a well-formed spec and two corrupt
+  shapes; `verifyBindingConsistency` accepting a genuinely matching pair
+  and rejecting each of jobSpecHash/jobId/projectId/role/businessProfile-ref/
+  sitePlan-ref/missing-input disagreement, plus exact-field (not identity)
+  `ArtifactRef` equality.
+- `frontend-backend-build-binding.integration.test.ts` (24): restart from
+  `retry_ready`/`validating`/`accepted` (each: no rediscovery, no
+  replanning, no duplicate Terra/validation/acceptance, same job/binding,
+  JobEngine's own attempt counter the only thing that advances); restart
+  after a real Git promotion but before binding finalisation (the
+  mandatory crash-recovery case — Phase 5i/5h replay is a pure
+  read-and-verify, finalisation retries and succeeds); a different intent
+  while a binding is active conflicts before any discovery side effect,
+  leaving the existing binding untouched; malformed/insufficient intake
+  still fails before resume with zero new side effects even with an active
+  binding; exact bound refs on resume against a competing newer version;
+  the factory is never called on resume; missing project/missing budget/
+  tampered jobSpecHash/missing bound artifact each fail closed without a
+  Terra call; resume preserves existing budget usage and the project
+  document's identity; a promoted binding frees the project for a
+  genuinely new generation while history is preserved; concurrent
+  identical prepare converges on one record, concurrent different prepare
+  conflicts without a partial overwrite; the specification commit recovers
+  across a simulated Git-succeeded/Mongo-failed crash with exactly one
+  marker commit; multiple commits sharing one exact marker fail closed
+  rather than picking the newest; a base-commit conflict refuses to commit
+  onto an unexpected lineage; a foreign dirty file still blocks
+  specification recovery on resume; `legacy_direct` creates zero
+  binding-related durable state and its own code branch contains no
+  binding-related call; `run-service.ts` remains unchanged.
+- `job-specs-frontend-backend.test.ts` (pinned-shape updates, no new
+  tests): `jobId` prefix and exact preimage updated to
+  `job_frontend_backend_`; a new assertion that the produced spec parses
+  through the real `JobSpec` contract.
+- `project-workspace.ts`'s `findCommitByMarker`→`findCommitsByMarker`
+  refactor: existing single-match callers and their tests (Phase 5h's own
+  promotion suite, `workspace.test.ts`) pass unmodified — confirmed, not
+  assumed.
+
+**Mutation testing — 13 mutations applied one at a time to the new
+production code, each backed up/applied/tested/restored individually, all
+killed:**
+
+1. Ignore the `runIntentHash` mismatch check (always treat an incoming
+   request as resumable) — killed: the different-intent-conflict test
+   fails.
+2. Resolve "latest" `businessProfile` on resume instead of the bound exact
+   ref — killed (indirectly, via the downstream dirty-tree guard: rehydrating
+   the wrong content collides with what the earlier spec commit already
+   captured for the pinned version).
+3. Call `createFrontendBackendJobSpec` again on resume instead of using the
+   stored spec — killed: the stored-spec-is-authority test's call-count
+   assertion fails.
+4. Call `producePlan` again on resume instead of substituting the bound
+   plan — killed: the retry_ready restart test's artifact-version-count
+   assertion fails.
+5. Ignore a `jobSpecHash` mismatch in `verifyBindingConsistency` — killed.
+6. Skip `JobSpec.safeParse` in `parseStoredJobSpec` entirely (trust raw
+   Mongo shape) — killed (2 unit test failures: a spec missing a required
+   field, and a spec that is not even an object, both stop being rejected).
+7. Randomise `bindingId` (append a timestamp) — killed by a dedicated
+   exact-preimage unit test, added after the first attempt at this
+   mutation went uncaught for the same millisecond-resolution reason
+   Phase 5j's own `jobId` randomisation mutation once did (see that
+   section) — the repeated-call-equality test alone is not reliable
+   against a fast synchronous call pair.
+8. Skip the marker search before committing (always attempt to write) —
+   killed (falls through to the base-commit-conflict guard instead of
+   silently duplicating the commit — confirmed defence in depth, not a
+   gap).
+9. Ignore the `specificationBaseCommit` conflict check — killed (produces
+   a different, incorrect error — `SpecificationCommitProducedNothing`
+   instead of the intended `BaseConflict` — confirming the guard is
+   load-bearing).
+10. Allow a foreign dirty path into the specification commit — killed.
+11. Skip the multiple-marker corruption check (`shas.length > 1`) — killed
+    (falls through to the base-conflict guard rather than silently
+    succeeding — a dedicated test constructs two commits sharing one exact
+    marker to exercise this).
+12. Remove the `status: 'prepared'` filter from `findActivePreparedBinding`
+    (resume a historical `promoted` binding as if still active) — killed:
+    the next-generation test's fresh discovery collides with the wrongly
+    "active" historical binding's own `runIntentHash`, surfacing as a
+    conflict instead of a clean new binding.
+13. Finalise the binding `promoted` *before* checking Phase 5i's own
+    outcome — killed (2 test failures: both the `retry_ready` and
+    `validating` restart tests find the binding incorrectly finalised).
+
+Not independently forced through a runtime mutation, with the reason each
+is still covered:
+
+- **Ignore `binding.jobId`/`businessProfile`/`sitePlan` disagreement in
+  `verifyBindingConsistency`** — code-identical in shape to mutation 5 (an
+  early-return check in the same function), each already has its own
+  dedicated passing unit test proving it fires today; not re-run
+  individually.
+- **Delete a binding on `retry_ready`/`validation_failed`, or roll back
+  Phase 5h's promotion when finalisation fails** — no such code exists to
+  mutate; both are structural absences (nothing in this module ever calls
+  a delete on `frontendBackendBuildBindings`, and nothing calls a Git
+  rollback primitive), consistent with Phase 5h's own promotion module
+  never having one either.
+- **Rerun Terra merely because a job is `ready`/`validating` a second
+  time, or two prepared bindings coexisting for one project** — enforced
+  by Phase 5i's own state machine and by the partial unique Mongo index
+  respectively; both already proven in their own review (Phase 5i's own
+  mutation-tested `state: 'ready'` filter; the concurrent-different-prepare
+  integration test here, which exercises the real index rather than
+  re-deriving its guarantee in application code).
+- **Create Phase 5i's job before the binding is durable** — the binding
+  creation call site sits textually before `coordinator.run(spec)` in
+  `orchestrator.ts`'s fresh-path branch; confirmed by inspection, not a
+  forced mutation.
+- **Fuzzy marker matching** — `findCommitsByMarker`'s exact-line match is
+  shared, unmodified machinery already covered by
+  `workspace.test.ts`'s own "ignores unrelated commits with similar-looking
+  text" case.
+- **Activate `job_lifecycle` in `run-service.ts`** — covered by the
+  dedicated structural test asserting the file contains neither
+  `job_lifecycle` nor `frontendBackendExecutionMode`.
+
+**Phase 5k applies only to `frontendBackendExecutionMode: 'job_lifecycle'`.**
+**`legacy_direct` remains byte-for-byte unchanged and the default.** **The
+active-binding check runs strictly before any discovery side effect, after
+the same pure intake validation `discoverProject` itself runs.** **The
+stored `JobSpec` is authority on resume; the factory runs only for a new
+binding.** **Phase 5k resumes an incomplete `frontend_backend` build
+lifecycle — it does not persist a general outer `runProject` phase
+cursor.** **No Luna. No new Sol routing. No deployment. No production
+default activation.**
+
 ### Deliberately next, not now
 
-- **Proposed, not implemented — pick one:** (A) durable run-level build
-  binding/resume — record which Phase 5i `jobId` a run is waiting on, so a
-  fresh `runProject` call can discover and resume it instead of only
-  reusing it by coincidence of identical pinned inputs; or (B) activate
-  `job_lifecycle` for one real production `runProject` caller in
-  `run-service.ts`, keeping `legacy_direct` available as an explicit
-  rollback. Not both at once — (A) is a durable-state/schema change to
-  runs, (B) is a call-site/config change to who opts in; combining them
-  would make either one hard to attribute if something regresses. Which is
-  appropriate depends on inspecting `run-service.ts`'s current caller(s)
-  first, not assumed here.
+- **Phase 5k closed option (A) from the note above** — the durable
+  run-level build binding/resume Phase 5j's own "deliberately next" section
+  proposed is now implemented (see Phase 5k). What remains open from that
+  choice is option (B): activate `job_lifecycle` for one real production
+  `runProject` caller in `run-service.ts`, keeping `legacy_direct` available
+  as an explicit rollback — not proposed further here; it depends on
+  inspecting `run-service.ts`'s current caller(s) first, and on a decision
+  this session was not asked to make.
+- **Also not implemented — Phase 5k's own stated limitation:** a general
+  outer-`runProject` resume cursor for *after* a build binding reaches
+  `promoted` (evaluation/review/repair/release progress is not persisted;
+  a process dying in that window restarts that part from scratch). Phase
+  5k deliberately scoped itself to the build lifecycle alone — see that
+  section's own "Scope, held exactly where the brief drew it."
 - **Later still** — mapping Luna repair work onto persisted jobs, what a
   replan does to jobs from the superseded plan (`superseded` does not exist
   yet), orphaned staging cleanup (deferred deliberately, not overlooked),

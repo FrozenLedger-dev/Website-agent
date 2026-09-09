@@ -8,6 +8,7 @@
  * needs a real `ArtifactRegistry`.
  */
 import { describe, expect, it } from 'vitest';
+import { JobSpec } from '@statxai/contracts';
 import { contentHash } from '@statxai/workspace';
 import { createFrontendBackendJobSpec } from '../src/job-specs/frontend-backend.js';
 import { FRONTEND_BACKEND_INPUT } from '../src/job-handlers/frontend-backend.js';
@@ -51,9 +52,14 @@ describe('createFrontendBackendJobSpec — shape', () => {
     expect(b.output).toEqual(['app/']);
   });
 
-  it('the jobId is namespaced with the documented "frontend-backend-" prefix', () => {
+  it('the jobId is namespaced with the documented "job_frontend_backend_" prefix, and satisfies the real JobId contract', () => {
     const spec = createFrontendBackendJobSpec(INPUT);
-    expect(spec.jobId.startsWith('frontend-backend-')).toBe(true);
+    expect(spec.jobId.startsWith('job_frontend_backend_')).toBe(true);
+    // `@statxai/contracts`' own `JobId` schema (`^job_[a-z0-9_]+$`) — never
+    // exercised at runtime by `JobEngine`/`JobRunner`, so a jobId shape this
+    // would have rejected went uncaught until Phase 5k's own stored-spec
+    // parsing became the first real caller to validate it.
+    expect(JobSpec.safeParse(spec).success).toBe(true);
   });
 });
 
@@ -65,10 +71,10 @@ describe('createFrontendBackendJobSpec — deterministic identity', () => {
     expect(a.jobId).toBe(b.jobId);
   });
 
-  it('jobId is exactly frontend-backend- + contentHash of the JobSpec identity (jobId excluded)', () => {
+  it('jobId is exactly job_frontend_backend_ + contentHash of the JobSpec identity (jobId excluded)', () => {
     const spec = createFrontendBackendJobSpec(INPUT);
     const { jobId, ...identity } = spec;
-    expect(jobId).toBe(`frontend-backend-${contentHash(identity)}`);
+    expect(jobId).toBe(`job_frontend_backend_${contentHash(identity)}`);
   });
 
   it('a changed projectId changes the jobId', () => {

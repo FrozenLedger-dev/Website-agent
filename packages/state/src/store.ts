@@ -10,6 +10,7 @@ import type {
   AuditEvent,
   BudgetDocument,
   DefectBudgetDocument,
+  FrontendBackendBuildBindingDocument,
   JobDocument,
   JobPromotionRecord,
   ProjectDocument,
@@ -90,6 +91,15 @@ export class StateStore {
   get promotions(): Collection<JobPromotionRecord> {
     return this.db.collection<JobPromotionRecord>('job_promotions');
   }
+  /**
+   * Durable active/historical `frontend_backend` job-mode build bindings
+   * (Phase 5k) — what lets a fresh `runProject` invocation resume an
+   * incomplete build after a restart instead of starting discovery/planning
+   * again. See `FrontendBackendBuildBindingDocument`'s own doc comment.
+   */
+  get frontendBackendBuildBindings(): Collection<FrontendBackendBuildBindingDocument> {
+    return this.db.collection<FrontendBackendBuildBindingDocument>('frontend_backend_build_bindings');
+  }
 
   /**
    * Run `fn` inside a multi-document transaction.
@@ -165,6 +175,16 @@ export class StateStore {
     // artifact lineage index is: a `committed` promotion no longer
     // participates, freeing the project for the next one.
     await this.promotions.createIndexes([
+      { key: { projectId: 1 }, unique: true, partialFilterExpression: { status: 'prepared' } },
+      { key: { projectId: 1, jobId: 1 } },
+    ]);
+
+    // At most one unfinished ("prepared") frontend/backend build binding per
+    // project (Phase 5k) — the same project-scoped active-slot shape as
+    // `promotions` above, for the same reason: a `promoted` binding no
+    // longer participates, freeing the project for its next build
+    // generation, while history is preserved rather than deleted.
+    await this.frontendBackendBuildBindings.createIndexes([
       { key: { projectId: 1 }, unique: true, partialFilterExpression: { status: 'prepared' } },
       { key: { projectId: 1, jobId: 1 } },
     ]);

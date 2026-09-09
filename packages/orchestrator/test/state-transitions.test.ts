@@ -137,9 +137,15 @@ describe('the run has one owner for its progress', () => {
   it('lets phases keep their own immutable locals', async () => {
     // The rule is one *mutable* owner per fact, not a ban on named values.
     // Destructured since Phase 5j threaded `sitePlanRef` alongside the plan
-    // itself — `initialPlan` is still one immutable local, just no longer
-    // the plain return value.
+    // itself — `initialPlan` is still one immutable local. Phase 5k adds a
+    // resume source ahead of the same destructuring (a ternary, so a
+    // resumed invocation substitutes the bound plan without ever calling
+    // `producePlan` or declaring a second, mutable `let initialPlan` to
+    // assign across an `if`/`else`) rather than the plain return value
+    // sitting there alone.
     const body = await runProject();
-    expect(body).toContain('const { plan: initialPlan, sitePlanRef: initialSitePlanRef } = await producePlan');
+    expect(body).toContain('const { plan: initialPlan, sitePlanRef: initialSitePlanRef } = activeBinding');
+    expect(body).toContain(': await producePlan({ deps, facts }, 0);');
+    expect(body).not.toMatch(/\blet initialPlan\b/);
   });
 });

@@ -13,14 +13,19 @@
  * takes effect once the harness has authorised it.
  */
 import {
+  BusinessProfile,
+  SitePlan,
   type AgentTier,
+  type JobSpec,
 } from '@statxai/contracts';
 import {
   ModelClient,
 } from '@statxai/agents';
 import { BudgetExhausted, spend, type StateStore } from '@statxai/state';
+import type { FrontendBackendBuildBindingDocument } from '@statxai/state';
 import {
   ArtifactRegistry,
+  ProjectWorkspace,
 } from '@statxai/workspace';
 import { JobEngine } from '@statxai/job-engine';
 import {
@@ -31,15 +36,27 @@ import {
 } from '@statxai/policy-engine';
 import { concluded, withoutDelivery, type RunResult } from './phases/conclude.js';
 import { buildFromPlan } from './phases/build.js';
-import { discoverProject } from './phases/discover.js';
+import { discoverProject, validateIntake, type DiscoverResult } from './phases/discover.js';
 import { adjudicateDefects } from './phases/adjudicate.js';
 import { evaluateSite } from './phases/evaluate.js';
-import { producePlan, revisePlan, sitePlanArtifactPaths } from './phases/planning.js';
+import { producePlan, revisePlan } from './phases/planning.js';
 import { executeRepairs } from './phases/repair.js';
 import { publishRelease } from './phases/publish.js';
 import { seekRelease } from './phases/release.js';
 import { createFrontendBackendLifecycleCoordinator } from './job-lifecycle/frontend-backend.js';
 import { createFrontendBackendJobSpec } from './job-specs/frontend-backend.js';
+import {
+  computeRunIntentHash,
+  ensureSpecificationCommitted,
+  finalizeBindingPromoted,
+  findActivePreparedBinding,
+  parseStoredJobSpec,
+  prepareFrontendBackendBuildBinding,
+  rehydrateSpecificationFiles,
+  verifyBindingConsistency,
+  FrontendBackendBuildBindingConflict,
+  FrontendBackendBuildBindingResumeStateMissing,
+} from './run-binding/frontend-backend.js';
 import {
   createRunProgress,
   snapshotProgress,
@@ -51,6 +68,11 @@ import {
 
 export type { RunResult } from './phases/conclude.js';
 export type { Progress } from './run-context.js';
+// Phase 5k moved this from an inline definition here into the module that
+// now owns the whole specification-commit sequence — re-exported so no
+// existing import site (`from '@statxai/orchestrator'` or this file
+// directly) has to change.
+export { RunProjectSpecificationWorkingTreeDirty } from './run-binding/frontend-backend.js';
 import {
   blocking,
 } from './defects.js';
@@ -65,27 +87,6 @@ import {
  * never by falling back to `buildFromPlan`.
  */
 export type FrontendBackendExecutionMode = 'legacy_direct' | 'job_lifecycle';
-
-/**
- * The canonical workspace carried an uncommitted change outside the exact
- * set discovery/planning are known to have materialised, right before the
- * job-mode branch's own harness commit — the same discipline Phase 5h's own
- * promotion guard (`PromotionWorkingTreeDirty`) applies to its commit,
- * applied here to this one. Never silently swept into a commit whose
- * message claims to be only the specification: a stray file left by
- * something else stays uncommitted, and this invocation stops before Phase
- * 5i ever runs.
- */
-export class RunProjectSpecificationWorkingTreeDirty extends Error {
-  constructor(projectId: string, paths: readonly string[]) {
-    super(
-      `runProject "${projectId}": the canonical working tree has uncommitted changes outside the ` +
-        `discovered/planned specification: ${paths.join(', ')}`,
-    );
-    this.name = 'RunProjectSpecificationWorkingTreeDirty';
-  }
-}
-
 
 export interface RunOptions {
   projectId: string;
@@ -184,20 +185,125 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     phaseStarted = now;
   };
 
-  // -- Phase 1: Discover ----------------------------------------------------
+  // -- Phase 1: Discover (or, in job_lifecycle mode, resume) ----------------
   //
-  // Deterministic, and everything it produces is returned rather than assigned:
-  // the phase cannot report a run, so the decision about what an unusable brief
-  // means to the caller stays here.
-  const discovery = await discoverProject({
-    projectId,
-    intake: options.intake,
-    store,
-    registry,
-    workspacesRoot,
-    autonomyMode,
-    say,
-  });
+  // Deterministic, and everything it produces is returned rather than
+  // assigned: the phase cannot report a run, so the decision about what an
+  // unusable brief means to the caller stays here.
+  //
+  // Phase 5k: `legacy_direct` calls `discoverProject` exactly as it always
+  // has — nothing below this comment changes for it. `job_lifecycle` runs
+  // the same pure intake validation `discoverProject` itself runs (Phase
+  // 4e's zero-side-effect guarantee for malformed/insufficient intake, kept
+  // by construction since both call the one shared `validateIntake`) and
+  // only *then* asks whether an active, unfinished build binding already
+  // exists for this project — strictly before any of discovery's own
+  // durable side effects (project reset, budget reset, profile
+  // put/accept/materialise). A binding for a *different* logical request
+  // fails closed immediately; a binding for the *same* request resumes by
+  // rehydrating durable state directly, never by calling `discoverProject`
+  // or `producePlan` at all.
+  let discovery: DiscoverResult;
+  let activeBinding: FrontendBackendBuildBindingDocument | null = null;
+  let resumedPlan: SitePlan | null = null;
+  let resumedSpec: JobSpec | null = null;
+
+  if (frontendBackendExecutionMode === 'job_lifecycle') {
+    const validated = validateIntake(options.intake);
+
+    if (!validated.ok) {
+      // `discoverProject` is never called for this outcome, so its own
+      // progress messages are reproduced here verbatim — an observer sees
+      // the exact same two events either way.
+      say({ phase: 'discover', detail: 'Validating intake against the canonical schema' });
+      say({ phase: 'discover', detail: validated.reason, level: 'fail' });
+      discovery = { ok: false, outcome: 'intake_insufficient' };
+    } else {
+      const runIntentHash = computeRunIntentHash({ projectId, profile: validated.profile });
+      const existingBinding = await findActivePreparedBinding(store, projectId);
+
+      if (existingBinding && existingBinding.runIntentHash !== runIntentHash) {
+        // A different logical request is already mid-build for this
+        // project. Fails closed here, before any discovery side effect —
+        // the existing binding is never resumed silently, destroyed, or
+        // raced past by starting a second one alongside it.
+        throw new FrontendBackendBuildBindingConflict(projectId, existingBinding.runIntentHash, runIntentHash);
+      }
+
+      if (existingBinding) {
+        say({ phase: 'discover', detail: 'Validating intake against the canonical schema' });
+        say({
+          phase: 'discover',
+          detail: `${validated.profile.businessName} — ${validated.profile.services.length} services`,
+          level: 'ok',
+        });
+        say({
+          phase: 'discover',
+          detail: `Resuming active frontend_backend build binding (job ${existingBinding.jobId})`,
+          level: 'ok',
+        });
+
+        // The stored spec is authoritative for resume — never reconstructed
+        // from the current factory, which a later deployment could have
+        // changed. Re-proven consistent with the binding before either is
+        // trusted.
+        const spec = parseStoredJobSpec(existingBinding);
+        verifyBindingConsistency(existingBinding, spec);
+
+        // Exact bound refs, never "latest" — `resolve` throws if either is
+        // missing, which is a platform/control-plane fault, not something
+        // repaired by rerunning discovery or substituting a newer version.
+        const profile = BusinessProfile.parse(await registry.resolve(projectId, existingBinding.businessProfile));
+        const plan = SitePlan.parse(await registry.resolve(projectId, existingBinding.sitePlan));
+
+        // Rehydrated, never recreated: a resume must not reset project
+        // state or the model budget merely because the process restarted.
+        const projectDoc = await store.projects.findOne({ _id: projectId });
+        if (!projectDoc) {
+          throw new FrontendBackendBuildBindingResumeStateMissing(projectId, existingBinding._id, 'project document');
+        }
+        const budgetDoc = await store.budgets.findOne({ _id: projectId });
+        if (!budgetDoc) {
+          throw new FrontendBackendBuildBindingResumeStateMissing(projectId, existingBinding._id, 'budget document');
+        }
+
+        const workspace = await ProjectWorkspace.open(projectId, workspacesRoot);
+
+        activeBinding = existingBinding;
+        resumedPlan = plan;
+        resumedSpec = spec;
+        discovery = {
+          ok: true,
+          profile,
+          businessProfileRef: existingBinding.businessProfile,
+          workspace,
+          budgetLimits: budgetDoc.limits,
+        };
+      } else {
+        // No active binding: the fresh path, identical to what
+        // `legacy_direct` always runs.
+        discovery = await discoverProject({
+          projectId,
+          intake: options.intake,
+          store,
+          registry,
+          workspacesRoot,
+          autonomyMode,
+          say,
+        });
+      }
+    }
+  } else {
+    discovery = await discoverProject({
+      projectId,
+      intake: options.intake,
+      store,
+      registry,
+      workspacesRoot,
+      autonomyMode,
+      say,
+    });
+  }
 
   if (!discovery.ok) {
     // Nothing was built, so there is nothing to report but the telemetry spent
@@ -228,8 +334,15 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   const deps: RunDeps = { store, registry, workspace, model, say, track };
   const facts: RunFacts = { projectId, profile, autonomyMode, budgetLimits };
 
-  // -- Phase 2: Plan --------------------------------------------------------
-  const { plan: initialPlan, sitePlanRef: initialSitePlanRef } = await producePlan({ deps, facts }, 0);
+  // -- Phase 2: Plan (or, resuming, the exact bound plan) --------------------
+  // One immutable local either way — resuming never re-invokes Sol or
+  // persists another plan version; it substitutes the exact plan this
+  // build binding was already prepared against, in `producePlan`'s own
+  // returned shape, so the destructuring below is identical regardless of
+  // which source it came from.
+  const { plan: initialPlan, sitePlanRef: initialSitePlanRef } = activeBinding
+    ? { plan: resumedPlan!, sitePlanRef: activeBinding.sitePlan }
+    : await producePlan({ deps, facts }, 0);
   progress.plan = initialPlan;
 
   // Defined here, not after the build boundary: Phase 5j's job-mode exit
@@ -273,11 +386,34 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       say,
       track,
     });
-    const spec = createFrontendBackendJobSpec({
-      projectId,
-      businessProfileRef,
-      sitePlanRef: initialSitePlanRef,
-    });
+
+    // Phase 5k: on resume, the stored spec is authority — the factory is
+    // never called again, and its output is never treated as though it
+    // were. On the fresh path, the factory is still the one source of the
+    // exact `JobSpec`, and a durable binding is prepared for it before
+    // Phase 5i ever runs.
+    let spec: JobSpec;
+    let binding: FrontendBackendBuildBindingDocument;
+    if (activeBinding) {
+      spec = resumedSpec!;
+      binding = activeBinding;
+    } else {
+      spec = createFrontendBackendJobSpec({
+        projectId,
+        businessProfileRef,
+        sitePlanRef: initialSitePlanRef,
+      });
+      binding = await prepareFrontendBackendBuildBinding(store, {
+        projectId,
+        runIntentHash: computeRunIntentHash({ projectId, profile }),
+        businessProfileRef,
+        sitePlanRef: initialSitePlanRef,
+        jobSpec: spec,
+        // Canonical HEAD *before* the specification commit below — `null`
+        // is a legitimate first-ever commit, not a placeholder.
+        specificationBaseCommit: await workspace.currentCommit(),
+      });
+    }
 
     // Mirrors `buildFromPlan`'s own first write: the outer project-state
     // transition belongs to `runProject`, the harness/run owner, not to the
@@ -287,38 +423,27 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       { $set: { state: 'building', updatedAt: new Date() } },
     );
 
-    // `discoverProject`/`persistPlan` already materialised the business
-    // profile and the specification into this same canonical workspace —
-    // see their own doc comments — and left them uncommitted. On the
-    // `legacy_direct` path, `buildFromPlan`'s own `commit('Terra: build')`
-    // always swept them into the same commit as the generated site;
-    // `job_lifecycle` never calls that function, so nothing else ever
-    // commits them, and Phase 5h's own promotion refuses to commit while
-    // the working tree carries anything outside the candidate's own files
-    // (see job-promotion/frontend-backend.ts's dirty-tree guard). This is
-    // not a new write — it is retiming the same pre-existing harness
-    // materialisation into its own commit instead of relying on a
-    // site-file commit that never happens on this path. No site file is
-    // touched here: `writeSiteFiles`/`publishBuildDirectly` are never
-    // called from this branch, only 5h's own promotion writes `app/`.
-    //
-    // Before committing: the working tree must carry nothing beyond the
-    // exact specification discovery/planning are known to have written —
-    // the same "nothing foreign rides along" discipline Phase 5h's own
-    // promotion guard applies to its own commit. A stray file left by
-    // anything else stops this invocation here, uncommitted, before Phase
-    // 5i ever runs.
-    const expectedSpecificationPaths = new Set([
-      'client/business-profile.json',
-      ...sitePlanArtifactPaths(initialPlan),
-    ]);
-    const dirty = await workspace.dirtyPaths();
-    const unexpected = dirty.filter((path) => !expectedSpecificationPaths.has(path));
-    if (unexpected.length > 0) {
-      throw new RunProjectSpecificationWorkingTreeDirty(projectId, unexpected);
+    if (activeBinding) {
+      // Discovery/planning never ran this invocation, so the bound
+      // specification never touched this process's canonical workspace —
+      // re-materialise it idempotently before the replay-safe commit below
+      // can find (or create) anything. A no-op if it is already there.
+      await rehydrateSpecificationFiles(workspace, profile, initialPlan);
     }
-    await workspace.commit('Harness: specification');
-    say({ phase: 'build', detail: `Executing frontend_backend via job_lifecycle (job ${spec.jobId})` });
+
+    // Replay-safe, marker-aware handoff — see `run-binding/frontend-backend.ts`
+    // for the full recovery sequence (Phase 5h's own promotion pattern,
+    // applied one step earlier in the pipeline). No site file is touched
+    // here either way: `writeSiteFiles`/`publishBuildDirectly` are never
+    // called from this branch, only 5h's own promotion writes `app/`.
+    await ensureSpecificationCommitted(store, workspace, binding, initialPlan);
+
+    say({
+      phase: 'build',
+      detail: activeBinding
+        ? `Resuming frontend_backend via job_lifecycle (job ${spec.jobId})`
+        : `Executing frontend_backend via job_lifecycle (job ${spec.jobId})`,
+    });
 
     // Exactly one call. Every outcome but `promoted` stops this invocation
     // through the existing non-delivery exit below — never a second call,
@@ -338,9 +463,20 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       // it, so this never collapses "retry_ready" and "validation_failed"
       // into an indistinguishable "blocked" — the bucket is the same, but
       // what actually happened is not lost. No `terminalDecision` is set:
-      // no policy adjudication occurred here.
+      // no policy adjudication occurred here. The binding is deliberately
+      // left `prepared` — a later invocation must be able to resume it.
       return { ...(await concluded(ctx(), 'blocked', undefined)), jobLifecycleOutcome: result.outcome };
     }
+
+    // Finalised only after Phase 5i itself reports `promoted` — never
+    // speculatively. If this write fails, the promotion itself is not
+    // undone and the binding stays `prepared`; a later invocation resumes
+    // it, replays Phase 5i (a pure read-and-verify at that point), and
+    // retries only this finalisation.
+    await finalizeBindingPromoted(store, binding._id, {
+      promotionId: result.promotionId,
+      promotionCommitSha: result.commitSha,
+    });
 
     say({ phase: 'build', detail: `frontend_backend promoted: commit ${result.commitSha}`, level: 'ok' });
   } else {
