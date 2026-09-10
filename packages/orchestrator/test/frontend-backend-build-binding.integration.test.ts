@@ -849,14 +849,28 @@ describe('legacy_direct never touches bindings', () => {
   });
 });
 
-describe('run-service.ts remains unchanged', () => {
-  it('does not reference job_lifecycle or frontendBackendExecutionMode', async () => {
+describe('run-service.ts: no caller is activated as of Phase 5k', () => {
+  /**
+   * True when this suite was written (Phase 5k): no caller had opted into
+   * `job_lifecycle` yet, so `run-service.ts` mentioned neither string at
+   * all. Phase 5l deliberately changes that — it activates `job_lifecycle`
+   * for the one real production entrypoint, wiring `frontendBackendExecutionMode`
+   * straight through `launchRun` — so the literal "never mentions either
+   * string" assertion this test made is now obsolete *by design*, not a
+   * regression. What this test actually guarded — that `launchRun` picks
+   * `legacy_direct` for any caller that does not explicitly ask for
+   * `job_lifecycle` — is still true and is pinned here directly instead;
+   * Phase 5l's own suite (`run-service.integration.test.ts`) covers the
+   * rest of the activation surface, including a dedicated structural test
+   * that exactly one production caller (`apps/console/app/api/runs
+   * /route.ts`) references either string at all.
+   */
+  it("launchRun's own default, for a caller that omits frontendBackendExecutionMode, is still exactly legacy_direct", async () => {
     const { readFile } = await import('node:fs/promises');
     const { fileURLToPath } = await import('node:url');
     const { dirname, join: pathJoin } = await import('node:path');
     const src = pathJoin(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'run-service.ts');
     const code = await readFile(src, 'utf8');
-    expect(code).not.toContain('job_lifecycle');
-    expect(code).not.toContain('frontendBackendExecutionMode');
+    expect(code).toContain("options.frontendBackendExecutionMode ?? 'legacy_direct'");
   });
 });

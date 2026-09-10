@@ -3721,12 +3721,10 @@ default activation.**
 
 - **Phase 5k closed option (A) from the note above** — the durable
   run-level build binding/resume Phase 5j's own "deliberately next" section
-  proposed is now implemented (see Phase 5k). What remains open from that
-  choice is option (B): activate `job_lifecycle` for one real production
-  `runProject` caller in `run-service.ts`, keeping `legacy_direct` available
-  as an explicit rollback — not proposed further here; it depends on
-  inspecting `run-service.ts`'s current caller(s) first, and on a decision
-  this session was not asked to make.
+  proposed is now implemented (see Phase 5k). Option (B) — activating
+  `job_lifecycle` for one real production `runProject` caller, keeping
+  `legacy_direct` available as an explicit rollback — is now implemented
+  too, as Phase 5l, below.
 - **Also not implemented — Phase 5k's own stated limitation:** a general
   outer-`runProject` resume cursor for *after* a build binding reaches
   `promoted` (evaluation/review/repair/release progress is not persisted;
@@ -3740,6 +3738,335 @@ default activation.**
   not in-process handlers).
 
 None of these are implemented.
+
+### Phase 5l — activate `job_lifecycle` for one real production entrypoint — **DONE**
+
+Phase 5k made `job_lifecycle` restart-safe; nothing had opted into it yet.
+This phase activates it for exactly one real production caller, keeps
+`legacy_direct` available as an explicit, operator-controlled rollback, and
+closes a real corruption path the activation itself made reachable for the
+first time.
+
+**The one production entrypoint: `apps/console/app/api/runs/route.ts`.**
+Inspected first, per the brief: `runProject` has exactly two non-test
+callers — `run-service.ts`'s `launchRun` (the shared implementation) and
+`orchestrator.ts` itself — and `launchRun` has exactly two callers,
+`apps/console/app/api/runs/route.ts` (the console's own `POST /api/runs`,
+a real HTTP entrypoint) and `scripts/run-agent.ts` (a headless CLI script;
+its own doc comment calls it "the same entry point the console uses" only
+so a CLI run shows up in the same run list — it is not itself the
+production surface). The console route is the one activated. `run-agent.ts`
+is deliberately untouched — the brief's own exclusion list names CLI tools
+explicitly, and a structural test pins that its source never mentions
+`frontendBackendExecutionMode` or `FRONTEND_BACKEND_EXECUTION_MODE`.
+
+**Configuration is harness-owned, resolved once at process start, never at
+request time.** `apps/console/lib/store.ts` gains two module-level
+constants, computed the same way `WORKSPACES_ROOT` already is there (an
+IIFE at import time, anchored to the repo root because Next's cwd is
+`apps/console`, not the repo root):
+
+- `FRONTEND_BACKEND_EXECUTION_MODE` — `FRONTEND_BACKEND_EXECUTION_MODE`
+  env var. Unset → `'job_lifecycle'` (the production default for this
+  entrypoint only). Set to `legacy_direct` → the operator rollback. Set to
+  anything else → throws at module load, failing the console's
+  startup/first import rather than surfacing mid-run.
+- `VALIDATION_WORKSPACES_ROOT` — `VALIDATION_WORKSPACES_ROOT` env var,
+  defaulting to `./validation-workspaces`. Always computed, never required:
+  `legacy_direct` never reads it, so an unset value never blocks rollback.
+
+The route's `POST` handler reads both and passes them straight into
+`launchRun` alongside `body.intake`/`body.autonomyMode` — the mode is never
+read from the request body, so intake content can never select a build
+authority. A structural test asserts the exact wiring
+(`frontendBackendExecutionMode: FRONTEND_BACKEND_EXECUTION_MODE`), not
+merely that the constant is imported somewhere in the file — the weaker
+check was tried first and failed to catch a mutation that dropped the
+option while leaving the import in place.
+
+**The resolution is split into two directly testable functions**, both in
+`run-service.ts` (`@statxai/orchestrator`), so the production default has
+one definition rather than an untestable inline expression in a Next.js
+app with no test harness of its own:
+
+- `parseFrontendBackendExecutionMode(raw: string)` — exact-match only
+  (`'legacy_direct'` / `'job_lifecycle'`, trimmed of surrounding
+  whitespace, case-sensitive), throws `InvalidFrontendBackendExecutionModeConfig`
+  on anything else. Deliberately **not** `routing.ts`'s `BUILD_STRATEGY`
+  pattern (lower-cased, unrecognised values silently ignored as "no
+  override") — that fits a developer override that is optional by nature; a
+  production execution mode is not, so a typo must fail loudly rather than
+  silently select a build authority nobody chose.
+- `resolveFrontendBackendExecutionMode(raw: string | undefined)` — the
+  production default itself: unset → `'job_lifecycle'`, defined →
+  `parseFrontendBackendExecutionMode(raw)`. Nothing in `run-service.ts`
+  calls it; only the console's own config module does. The default's
+  *location* is deliberate: not inside `runProject`, `build.ts`, Phase 5i,
+  or the job engine, per the brief — one layer up, in the activated
+  entrypoint's own configuration.
+
+**`runProject`'s own internal default is untouched — still `legacy_direct`.**
+Zero changes to `orchestrator.ts`. A direct `runProject(...)` call with no
+`frontendBackendExecutionMode` behaves exactly as before Phase 5l, proved by
+a dedicated regression test (and already guarded independently by Phase 5j's
+own "legacy mode remains the default" suite). `launchRun`'s own default
+mirrors it exactly (`options.frontendBackendExecutionMode ?? 'legacy_direct'`)
+— every caller that never mentions the option, including the untouched
+script, is unaffected by this phase.
+
+**No runtime fallback.** Once a `launchRun` call resolves to `job_lifecycle`,
+Phase 5j/5k's existing rule stands unmodified: `retry_ready`,
+`validation_failed`, and every other non-`promoted` outcome surface through
+the same `jobLifecycleOutcome`/`blocked` result Phase 5j already defined.
+Phase 5l adds no fallback logic anywhere — there is no code path in this
+phase's own additions that could fall back, verified by inspection rather
+than by a forced mutation (nothing to mutate).
+
+**A real corruption path, found and closed before activation — the
+brief's own mandatory pre-activation safety check.** Inspecting
+`job-promotion/frontend-backend.ts` directly: `legacy_direct`'s own
+publish (`workspace.commit('Terra: build')`, an unconditional `git add
+-A`) and Phase 5h's promotion both write to the same canonical Git tree
+with no awareness of each other. Phase 5h's own base-commit guard
+(`PromotionBaseConflict`) protects a *second* promotion attempt against a
+HEAD that moved since the *first* attempt recorded its `baseCommit` — but
+the *first* attempt's `baseCommit` is simply whatever HEAD is at the
+moment promotion is first attempted. So the reachable failure is: a
+project's `frontend_backend` job reaches `accepted`, a `legacy_direct` run
+against the *same* project commits and moves HEAD forward before Phase 5h
+is ever asked to promote, and promotion's first (and only) attempt then
+adopts the new HEAD as its own base and commits cleanly on top of it —
+silently interleaving two independent generations' files, with no error
+raised anywhere. Answer to the brief's question: **no, a `legacy_direct`
+invocation is not safe for a project with an active Phase 5k binding.**
+
+**The fix is a fail-closed rollback conflict, not automatic resumption or
+deletion — exactly as directed.** `launchRun` resolves its effective mode
+first; if it is `legacy_direct`, it calls Phase 5k's own
+`findActivePreparedBinding` (unmodified — Phase 5l does not touch the
+binding module beyond this one new caller of an already-exported function)
+*before* `RunRecorder.start`, before any project/budget/workspace
+mutation. A `prepared` binding throws `ActiveJobLifecycleRollbackConflict`,
+named with the project id and the exact binding id. This is a property of
+the *project*, not of which caller asked: the guard applies identically
+whether the effective mode arrived via explicit rollback configuration or
+via a caller (like the untouched script) that simply never mentions the
+option, since both would corrupt the same workspace the same way. The
+console route catches this one exception type and returns `409`; anything
+else propagates as a genuine platform failure. No binding is ever deleted,
+mutated, or silently resumed by this guard — abandonment/supersession is
+explicitly out of scope, exactly as directed.
+
+**A promoted binding does not block rollback — only a `prepared` one does.**
+`findActivePreparedBinding`'s own `status: 'prepared'` filter (Phase 5k,
+unmodified) is what makes this true; a dedicated test proves a project
+whose earlier `job_lifecycle` generation already promoted accepts a later
+`legacy_direct` run cleanly, with the historical `promoted` record left
+exactly as it was — still present, still exactly one, never mutated.
+
+**Observability reuses the existing run-event stream — no new pipeline.**
+`launchRun` logs `frontend_backend_execution_mode=<mode>` through the same
+`recorder.event(phase, detail, level)` every other progress line already
+goes through, once, right after the rollback-conflict check and before the
+run itself starts. Never a `JobSpec` body, a secret, artifact content, or a
+credential — the value is always one of exactly two literal strings.
+
+**Reviewer-caught gap, closed before commit: the two workspace roots could
+still collide.** `WORKSPACES_ROOT` and `VALIDATION_WORKSPACES_ROOT` having
+independent env vars and independent defaults does not, by itself, stop an
+operator from configuring one to equal the other — and if they did, Phase
+5g-1's disposable per-validation directories would be created and torn
+down *inside* the canonical Git tree `ProjectWorkspace` commits from,
+exactly the "two authorities writing the same tree" defect
+`ActiveJobLifecycleRollbackConflict` exists to prevent for `legacy_direct`
+vs. an active binding — reachable here by a config typo instead of a race.
+`assertDistinctWorkspaceRoots(workspacesRoot, validationWorkspacesRoot)`
+(`run-service.ts`) canonicalises both — `path.resolve`, lexical
+normalisation of `.`/`..`/relative-vs-absolute/redundant segments, not
+`fs.realpath`: both roots are typically created lazily by
+`ProjectWorkspace.open`'s own `mkdir(..., { recursive: true })`, so a
+symlink-resolving check would have to tolerate a directory that does not
+exist yet, defeating "fail closed before any filesystem write" — and
+throws `WorkspaceRootsCollide`, naming the one colliding canonical
+directory, if they match. `apps/console/lib/store.ts` calls it once at
+module load, immediately after both roots and the resolved execution mode
+are computed, gated on `FRONTEND_BACKEND_EXECUTION_MODE === 'job_lifecycle'`
+— failing the console's startup/first import before any run, exactly where
+the mode-parse failure already does. The gate matters: `legacy_direct`
+never opens a validation workspace, so an unused, colliding
+`VALIDATION_WORKSPACES_ROOT` must never become a rollback blocker (§19) —
+checking unconditionally would have made a legacy-only deployment's
+startup depend on job-mode-only configuration being sane, which is exactly
+the coupling §19 forbids. Mutation-verified: disabling the check's own
+condition (`if (false && ...)`, restored immediately after) fails both of
+`assertDistinctWorkspaceRoots`'s dedicated unit tests. `apps/console`
+carries no test harness of its own, so the module-load wiring in
+`store.ts` (the `if (FRONTEND_BACKEND_EXECUTION_MODE === 'job_lifecycle')`
+gate and the call itself) is verified by direct inspection rather than a
+forced runtime mutation — the same limitation already noted above for
+`VALIDATION_WORKSPACES_ROOT`'s own construction.
+
+**Tests: 34 new (904 total, up from 870): 19 unit
+(`run-service.test.ts`), 15 integration (`run-service.integration.test.ts`)**,
+plus one existing Phase 5k structural test corrected to match this phase's
+deliberate change (below).
+
+- `run-service.test.ts` (19, unit, no Mongo):
+  `parseFrontendBackendExecutionMode` accepting both literal values,
+  tolerating incidental whitespace, and failing closed on eight distinct
+  invalid inputs including case variants (`JOB_LIFECYCLE`) and near-misses
+  (`job-lifecycle`) — no case-normalisation convention is claimed for this
+  switch; `resolveFrontendBackendExecutionMode`'s unset/explicit/invalid
+  behaviour directly; `assertDistinctWorkspaceRoots` failing closed on two
+  differently-written configs that resolve to the same canonical directory
+  (relative-vs-absolute, and a redundant `.` segment), naming the exact
+  colliding directory in its error, and never throwing for two genuinely
+  distinct roots.
+- `run-service.integration.test.ts` (15): `runProject` and `launchRun` both
+  still default to `legacy_direct` when the option is omitted; the
+  production caller's explicit `job_lifecycle` drives the real job-mode
+  path end to end and the exact `validationWorkspacesRoot` value reaches
+  `runProject` (asserted via `vi.fn(actual.runProject)` wrapping the real
+  implementation, not a stub — every scenario here runs genuine
+  discovery/planning/Phase 5i-5k machinery); the selected mode is logged
+  through the real run-event stream; explicit `legacy_direct` runs the real
+  direct builder with zero binding/job side effects and does not require
+  `validationWorkspacesRoot` at all; a forced `retry_ready` never invokes
+  the direct builder; **a second `launchRun` call for the same project — a
+  fresh call, proving the real restart-safe path rather than a test-only
+  adapter — resumes the exact Phase 5k binding**, with zero new
+  `business-profile`/`site-plan` artifact versions, zero additional
+  `planSite` calls, and exactly one specification commit across both
+  calls; a promoted binding frees the project for a later `legacy_direct`
+  run while the historical record survives untouched; **the mandatory
+  active-binding-conflict scenario**: a project with a `prepared` binding
+  refuses a `legacy_direct` `launchRun` before the legacy builder runs,
+  leaving the binding, the job document, and canonical Git history
+  byte-for-byte unchanged, and creating no run record for the rejected
+  attempt; two structurally different intakes both resolve to whatever mode
+  was configured, never to something intake-dependent; no source file under
+  `@statxai/agents` mentions either execution-mode literal (the model can
+  never see or choose one); the console route wires the mode from its own
+  config into the exact `launchRun` call, never from the request body; the
+  script never mentions the mode at all; no other console API route
+  references it either.
+- `frontend-backend-build-binding.integration.test.ts`'s own Phase 5k
+  suite "run-service.ts remains unchanged" is renamed and its assertion
+  corrected: its literal "the file mentions neither string at all" check
+  is now obsolete *by design* — Phase 5l's whole point is that
+  `run-service.ts` does mention them. What it actually protected —
+  `launchRun`'s own default staying `legacy_direct` for an unconfigured
+  caller — is pinned directly instead, with a note explaining why the
+  change is deliberate rather than a regression a future reader should
+  investigate.
+
+**Mutation testing — 9 mutations applied one at a time to Phase 5l's own
+new production code, each backed up/applied/tested/restored individually,
+all killed:**
+
+1. Production default flipped back to `legacy_direct`
+   (`resolveFrontendBackendExecutionMode`'s unset branch) — killed.
+2. `runProject`'s own internal default changed to `job_lifecycle`
+   (`orchestrator.ts`, reverted immediately after) — killed twice over: by
+   this phase's own regression test and, independently, by Phase 5j's
+   pre-existing "legacy mode remains the default" suite.
+3. The rollback-conflict guard disabled (`if (false)` in place of the mode
+   check) — killed: the mandatory active-binding-conflict test failed with
+   "promise resolved instead of rejecting" once the legacy builder was
+   allowed to run unchecked.
+4. Invalid config silently mapped to `legacy_direct` instead of thrown —
+   killed (10 unit-test failures).
+5. Invalid config silently mapped to `job_lifecycle` instead of thrown —
+   killed (10 unit-test failures).
+6. The console route's `launchRun` call stopped passing
+   `frontendBackendExecutionMode` (leaving the now-unused import in place)
+   — **not** killed by the first version of the structural test, which
+   only checked that the constant's name appeared somewhere in the file;
+   strengthened to check the exact wiring pattern
+   (`frontendBackendExecutionMode:\s*FRONTEND_BACKEND_EXECUTION_MODE`),
+   which then killed it. Kept as the permanent test.
+7. `scripts/run-agent.ts` given its own explicit
+   `frontendBackendExecutionMode: 'job_lifecycle'` (a second caller
+   activating job mode) — killed by the dedicated one-caller structural
+   test.
+8. `findActivePreparedBinding`'s `status: 'prepared'` filter dropped
+   (temporarily, to verify the rollback-conflict guard's own dependency on
+   it — not a permanent change; Phase 5k's binding module is otherwise
+   untouched by this phase) — killed: the promoted-history-does-not-block
+   test failed with the exact `ActiveJobLifecycleRollbackConflict` a
+   correctly-scoped filter must never raise against a merely-historical
+   record.
+9. `assertDistinctWorkspaceRoots`'s own comparison disabled
+   (`if (false && ...)`) — killed: both of its dedicated unit tests failed.
+
+Not independently forced through a runtime mutation, with the reason each
+is still covered:
+
+- **Delete or mutate an active binding on rollback** — no such call exists
+  anywhere in `run-service.ts` to mutate (confirmed by inspection:
+  `frontendBackendBuildBindings` is never named there at all; the only
+  binding-module call is the unmodified, read-only
+  `findActivePreparedBinding`).
+- **Runtime fallback after `retry_ready`/`validation_failed`** — Phase 5l
+  adds no fallback code path anywhere for a mutation to target; the
+  no-fallback property is Phase 5j/5k's own, already mutation-tested in
+  their own reviews, and re-exercised here through the real `launchRun`
+  boundary rather than re-proven from scratch.
+- **Intake or a model call selecting the mode** — structurally impossible
+  by construction: `frontendBackendExecutionMode` in `run-service.ts`
+  derives only from `options.frontendBackendExecutionMode` (never
+  `options.intake`), and the file imports nothing from `@statxai/agents` at
+  all — confirmed directly, and independently by the dedicated test that
+  scans every source file under `packages/agents/src` for either literal.
+- **`run-service.ts` activating Luna or changing deployment behaviour** —
+  confirmed by inspection: neither "luna" nor "deploy" appears anywhere in
+  the file.
+- **Validation root pointing at the canonical workspace** — two distinct
+  env vars with two distinct defaults do not, on their own, rule this out
+  by operator misconfiguration; closed by `assertDistinctWorkspaceRoots`
+  (mutation 9, above), which fails closed on collision rather than
+  assuming the two are always different. `apps/console` carries no test
+  harness to force a mutation of `store.ts`'s own module-load wiring (the
+  gate and the call site) through, so *that* half is asserted by
+  inspection rather than a forced runtime failure — the check itself is
+  mutation-verified directly. The genuinely runtime-testable half — that
+  `launchRun` forwards whatever `validationWorkspacesRoot` value it is
+  given, unchanged, into `runProject` — is covered directly (mutation not
+  required: the pass-through is a straight-line data flow with no branch
+  to mutate independently of mutation 6 above).
+
+**Scope, held exactly where the brief drew it:**
+
+- Exactly one production caller activated. `scripts/run-agent.ts` is
+  unmodified. No other `apps/console` API route references the execution
+  mode.
+- `orchestrator.ts`, `packages/job-engine`, Phase 5i's coordinator, and
+  Phase 5k's binding module (`run-binding/frontend-backend.ts`) are all
+  byte-for-byte unchanged — confirmed by `git diff` showing zero lines
+  touched in any of them.
+- No Luna, no repair-cycle changes. No deployment/release-authorization
+  changes. No multi-role cutover — only `frontend_backend` uses the Phase
+  5 lifecycle, unchanged from Phase 5j/5k.
+- No background worker, poller, or scheduler added — the production
+  request still explicitly drives the bounded lifecycle, exactly as
+  before.
+- No binding abandonment/supersession/cancellation capability added — an
+  active binding blocking rollback is left exactly as found until it
+  promotes (or a later, separate capability retires it).
+- Post-promotion `runProject` phases (evaluation, review, repair, release)
+  remain unresumable across a restart — Phase 5k's own stated limitation,
+  untouched by this phase.
+
+**Explicit statements, as the brief requires:**
+
+Phase 5l activates `job_lifecycle` for exactly one real production
+entrypoint. `runProject` itself still defaults to `legacy_direct`.
+`legacy_direct` remains available as an operator-selected rollback mode.
+Rollback selection happens before `runProject` execution; Phase 5l does not
+add dynamic runtime fallback. Phase 5l does not delete or supersede active
+Phase 5k bindings. Phase 5l does not add Luna repair. Phase 5l does not
+change deployment behaviour. Phase 5l does not activate any other worker
+role.
 
 ## Phases 6–17
 
