@@ -217,7 +217,7 @@ export interface JobPromotionRecord {
   updatedAt: Date;
 }
 
-export type FrontendBackendBuildBindingStatus = 'prepared' | 'promoted';
+export type FrontendBackendBuildBindingStatus = 'prepared' | 'promoted' | 'abandoned';
 
 /**
  * The durable record that lets a fresh `runProject` invocation (Phase 5k)
@@ -240,11 +240,15 @@ export type FrontendBackendBuildBindingStatus = 'prepared' | 'promoted';
  *
  * `status` moves `prepared -> promoted` exactly once, the moment Phase 5i
  * returns `promoted` — mirroring `JobPromotionRecord`'s own
- * `prepared -> committed` shape. A `promoted` binding is retained as
- * historical control-plane evidence, never deleted, and no longer occupies
- * the project's one-active-binding slot (see the partial unique index on
- * `{ projectId }` in `StateStore.ensureIndexes`), so a later, genuinely new
- * build generation for the same project is free to prepare a new one.
+ * `prepared -> committed` shape — or `prepared -> abandoned` exactly once,
+ * the moment an operator explicitly revokes an incomplete build (Phase 5m,
+ * `run-binding/frontend-backend.ts`'s `abandonFrontendBackendBuild`). Both
+ * `promoted` and `abandoned` are retained as historical control-plane
+ * evidence, never deleted, and neither occupies the project's
+ * one-active-binding slot (see the partial unique index on `{ projectId }`
+ * in `StateStore.ensureIndexes`, filtered to `status: 'prepared'`), so a
+ * later, genuinely new build generation — or, after `abandoned`, a
+ * `legacy_direct` rollback — is free to proceed for the same project.
  */
 export interface FrontendBackendBuildBindingDocument {
   _id: string;
@@ -265,6 +269,16 @@ export interface FrontendBackendBuildBindingDocument {
   /** Set only once `status` becomes `promoted`, from Phase 5i/5h's own returned values. */
   promotionId: string | null;
   promotionCommitSha: string | null;
+  /**
+   * Operator evidence, set only once `status` becomes `abandoned` (Phase
+   * 5m) — all three together, never individually. Optional, not
+   * `| null`-defaulted: a binding written before Phase 5m existed simply
+   * has none of the three fields present at all, which is a normal, valid
+   * `prepared`/`promoted` document rather than one needing a migration.
+   */
+  abandonedAt?: Date;
+  abandonedBy?: string;
+  abandonmentReason?: string;
   createdAt: Date;
   updatedAt: Date;
 }

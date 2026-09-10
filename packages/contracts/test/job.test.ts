@@ -20,9 +20,28 @@ describe('job state machine', () => {
   });
 
   it('treats accepted as terminal', () => {
-    for (const to of ['ready', 'running', 'failed', 'blocked'] as const) {
+    for (const to of ['ready', 'running', 'failed', 'blocked', 'superseded'] as const) {
       expect(canTransition('accepted', to)).toBe(false);
     }
+  });
+
+  it('permits superseding every pre-acceptance state, and forbids superseding accepted (Phase 5m)', () => {
+    for (const from of ['draft', 'ready', 'running', 'validating', 'failed', 'repair_requested', 'blocked'] as const) {
+      expect(canTransition(from, 'superseded')).toBe(true);
+    }
+    expect(canTransition('accepted', 'superseded')).toBe(false);
+  });
+
+  it('treats superseded as terminal — no state may be reached from it', () => {
+    for (const to of ['draft', 'ready', 'running', 'validating', 'accepted', 'failed', 'repair_requested', 'blocked'] as const) {
+      expect(canTransition('superseded', to)).toBe(false);
+    }
+  });
+
+  it('TERMINAL_JOB_STATES means successful completion only — superseded is not in it', async () => {
+    const { TERMINAL_JOB_STATES } = await import('../src/index.js');
+    expect(TERMINAL_JOB_STATES).toEqual(['accepted']);
+    expect(TERMINAL_JOB_STATES).not.toContain('superseded');
   });
 
   it('forbids skipping validation', () => {

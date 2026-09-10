@@ -4068,6 +4068,385 @@ Phase 5k bindings. Phase 5l does not add Luna repair. Phase 5l does not
 change deployment behaviour. Phase 5l does not activate any other worker
 role.
 
+## Phase 5m — explicit active build abandonment + pre-acceptance job supersession — **DONE**
+
+Phase 5l's own guard left a real operational gap: a project with a
+genuinely stuck `prepared` Phase 5k binding had no explicit escape
+hatch — the binding correctly blocked both `legacy_direct` rollback and a
+fresh `job_lifecycle` generation until it promoted, with no way for an
+operator to end that wait. Phase 5m adds exactly one explicit,
+harness-owned action: abandon one exact binding, and — atomically —
+permanently revoke its job's pre-acceptance execution authority.
+
+**Scope, drawn exactly where the brief drew it: pre-acceptance only.**
+Inspecting `job-promotion/frontend-backend.ts` directly: an `accepted` job
+may already be entering Phase 5h's canonical promotion path, and a
+Mongo-only "supersede accepted" write cannot prove promotion has not
+already crossed from Mongo authority into filesystem/Git mutation.
+Revoking an accepted-but-unpromoted job needs a dedicated promotion fence
+this phase does not add. So: `prepared` binding + `accepted` job → fails
+closed (`FrontendBackendBuildAbandonmentAcceptedConflict`), never
+resolved here. See Phase 5n, proposed below.
+
+### The binding: a third historical status
+
+`FrontendBackendBuildBindingStatus` gains `'abandoned'`, alongside
+`'prepared'`/`'promoted'`. Three new optional fields —
+`abandonedAt`/`abandonedBy`/`abandonmentReason` — are set together, only
+once, only on that transition. Optional rather than
+`| null`-defaulted deliberately: a binding written before Phase 5m existed
+simply lacks all three, which is a normal `prepared`/`promoted` document,
+not one needing a migration. `StateStore.ensureIndexes`'s partial unique
+index (`{ projectId: 1 }`, filtered to `status: 'prepared'`) is
+**untouched** — `'abandoned'` falls outside that filter by construction,
+exactly like `'promoted'` already does, so the active slot is released and
+a later `legacy_direct` rollback or fresh `job_lifecycle` generation
+proceeds normally. `findActivePreparedBinding` (Phase 5k, also untouched)
+is what makes this true everywhere it's read — Phase 5l's rollback guard
+and Phase 5k's own resume lookup both automatically stop treating an
+abandoned binding as active, with zero changes to either.
+
+### `JobState` gains `superseded`
+
+Reachable from every pre-acceptance state — `draft`, `ready`, `running`,
+`validating`, `failed`, `repair_requested`, `blocked` — and from nowhere
+else; **not** from `accepted`. `TRANSITIONS.superseded = []`: fully
+terminal, no outgoing edge, ever. The architecture-review note this
+`TRANSITIONS` table used to carry ("there is no `superseded` state... left
+as the document specifies rather than invented here") is retired along
+with the state it described the absence of.
+
+**`TERMINAL_JOB_STATES` stays exactly `['accepted']` — inspected before
+touching it, per the brief.** Grepped first: nothing in the codebase reads
+it today. Its meaning is not "every state with no outgoing edge" (both
+`accepted` and `superseded` are that, structurally) — it is specifically
+*successful* completion, the one state `JobEngine.dependenciesSatisfied`
+checks a dependency against. Adding `superseded` to it would make a
+permanently-revoked upstream job's dependents look unblocked the moment it
+became terminal-looking, which is exactly backwards. Left alone, with a
+doc comment now stating the distinction explicitly so a future consumer
+does not have to re-derive it.
+
+**Superseded is terminal by omission, not by a new special case.** `claim`
+only ever matches `state: 'ready'`; `dependenciesSatisfied` only ever
+counts `state: 'accepted'`; `block`/`release`/`requestRepair`/`accept`
+(unguarded)/`transitionOwnedRunning` (`submitForValidation`/`fail`) all
+guard on explicit `from` arrays that simply never include `'superseded'`.
+None of these needed to change — a state nothing's `from` list names is
+already unreachable from everywhere else, for free.
+
+### `JobEngine.supersede(jobId, actor, { reason, bindingId?, now?, session? })`
+
+The one new transition. Guarded exactly like every other one here: a
+`findOneAndUpdate` filtered on `state: { $in: [...seven pre-acceptance
+states] }`. An `accepted` job is not special-cased — it is simply absent
+from that list, so the guard matches nothing and the call fails closed
+with the same `JobStateConflict` every other wrong-state attempt in this
+file produces (defense in depth: `abandonFrontendBackendBuild`'s own
+explicit accepted-check normally catches this first, but this guard would
+catch it independently if that check were ever removed — mutation-verified
+directly).
+
+- **`reason` is required**, non-empty after trimming
+  (`InvalidSupersessionReason` otherwise) — the audit trail this produces
+  is the only durable record of why a specific execution was permanently
+  revoked.
+- **A `running` job's lease is cleared unconditionally** (`{ lease: null }`
+  in the guarded `$set`), regardless of who currently holds it. Harness
+  authority overriding a worker's claim, not the worker relinquishing its
+  own.
+- **`session`**, when supplied, participates in the caller's own
+  transaction — no second one opened. This is what lets
+  `abandonFrontendBackendBuild` move the binding and the job atomically.
+- **Audit**: the private `transition()` helper gained two additive,
+  backward-compatible parameters — `now` and `auditDetail` — so
+  `supersede`'s `reason`/`bindingId` land in the same `job_transition`
+  audit entry every other transition already writes, without a second
+  write or a bespoke audit path.
+
+**Why a stale worker cannot advance the job afterward — reused machinery,
+not new code.** `heartbeat`/`submitForValidation`/`fail` all guard on
+`state: 'running'` via `transitionOwnedRunning`; once superseded, none of
+them match. `JobRunner` (`packages/job-engine/src/runner.ts`) already
+reports `{ kind: 'authority_lost', reason: 'heartbeat_lost' |
+'transition_conflict' }` for exactly this shape of loss — Phase 5c/5f's
+own existing mechanism, verified here (a dedicated race test: a runner's
+handler blocks until its abort signal fires; an operator abandons the
+job mid-execution; the runner reports `authority_lost` and the job never
+reaches `validating`) rather than assumed. **Zero changes to
+`packages/job-engine/src/runner.ts`.**
+
+### `abandonFrontendBackendBuild({ projectId, bindingId, actor, reason }, { store, engine })`
+
+`packages/orchestrator/src/run-binding/frontend-backend.ts` — the module
+that already owns Phase 5k's binding lifecycle owns this too, rather than
+splitting binding authority across two files.
+
+**Exact identity, not "the project's current active binding".** Loads by
+`_id: bindingId`, then verifies `binding.projectId === projectId`. A
+fabricated or stale `bindingId` fails with
+`FrontendBackendBuildBindingNotFound`/`FrontendBackendBuildBindingProjectMismatch`
+and **never falls back** to whatever is active for that project now — the
+brief's own stale-request scenario (an operator inspects binding A, A
+completes or is abandoned, B becomes active, a delayed request for A
+arrives) must never touch B. Verified directly: the first version of the
+"fabricated bindingId" test passed by coincidence (the fixture project had
+no other binding at all); strengthened to give the project a genuine
+active binding first, which is what actually caught a deliberately
+introduced not-found-falls-back-to-active-binding mutation.
+
+**One Mongo transaction, start to finish** (`store.withTransaction` — the
+driver retries the whole callback on a transient conflict, so every read
+inside is safe to re-take on retry):
+
+1. Load the binding by exact id; verify project; **`'abandoned'`/`'promoted'`
+   status returns the matching historical outcome, read-only** — no second
+   transition, no mutation of a binding this call did not just abandon
+   (idempotent replay, mutation-verified: disabling this short-circuit
+   makes a repeat request throw instead of replaying cleanly).
+2. Only `'prepared'` continues. `parseStoredJobSpec` +
+   `verifyBindingConsistency` first — reused from Phase 5k, unchanged —
+   never abandon corrupt binding state blindly.
+3. If `binding.jobId` names an existing `JobDocument`: verify it actually
+   describes this binding (`projectId`, `role`, and the live job's `.spec`
+   still content-hashing identically to the binding's own stored one —
+   `FrontendBackendBuildAbandonmentJobMismatch` otherwise). Then, in
+   order: promotion-evidence check (`store.promotions.findOne({ jobId
+   })`, independent of job state — `FrontendBackendBuildAbandonmentPromotionEvidenceConflict`
+   on any hit, mutation-verified), accepted check
+   (`FrontendBackendBuildAbandonmentAcceptedConflict`, mutation-verified),
+   then `engine.supersede(job._id, actor, { reason, bindingId, session })`.
+   **No `JobDocument` at all** (Phase 5k's own crash point — a binding
+   prepared before Phase 5i ever enqueued) is valid and expected: nothing
+   is superseded, and no fake job is invented to be superseded.
+4. Guarded `prepared -> abandoned`, same session, recording
+   `abandonedAt`/`abandonedBy`/`abandonmentReason`.
+
+**The acceptance-vs-abandonment race resolves to exactly the two outcomes
+the brief requires, with no extra locking.** Both `acceptValidatedFrontendBackendCandidate`
+(5g-2, unmodified) and this function read the job fresh inside their own
+transaction and guard their write on the state they just read; MongoDB's
+own transaction conflict/retry semantics do the rest:
+
+- This transaction commits first → job `superseded`, binding `abandoned`;
+  5g-2's attempt (racing or retried) reads `state !== 'validating'` and
+  throws `AcceptanceBindingStale` — its own, pre-existing guard, untouched.
+- 5g-2 commits first → job `accepted`; this transaction, retried by the
+  driver, reads that fresh and throws
+  `FrontendBackendBuildAbandonmentAcceptedConflict` — binding stays
+  `prepared`, for a human (or Phase 5n) to resolve.
+- The mixed case — binding `abandoned`, job `accepted` — is not reachable
+  by construction. Verified directly: a real `Promise.allSettled` race
+  between the two against a genuine `validating` job (real 5g-1 evidence,
+  real registry, real gates), asserting the invariant holds regardless of
+  which side actually won.
+
+**What this never does, enforced by what its own dependencies are, not
+merely by convention.** `AbandonFrontendBackendBuildDeps` is `{ store,
+engine }` — no `registry`, no `workspace`, no `model` (a dedicated
+structural test greps the interface's own source for any of the three).
+So by construction it cannot: delete an artifact, touch the canonical
+Git workspace, call `git reset`/commit/revert, or call a model. It never
+modifies a `JobPromotionRecord` either — only reads one, to check for its
+existence. And it never starts a replacement: no call to `runProject`,
+`discoverProject`, `producePlan`, Terra, or Luna anywhere in the module
+(grepped directly) — abandonment stops after revocation; what happens
+next is a separate, later, explicit request.
+
+### The production operator surface — and a gap the brief required reporting, not working around
+
+**Investigated first, per the brief's own explicit instruction (§24):
+`apps/console` has no authentication of any kind.** No `middleware.ts`
+exists; no auth dependency (`next-auth`, `clerk`, session/cookie handling)
+appears anywhere in the repo; every existing API route
+(`GET`/`POST /api/runs`, `GET /api/runs/[runId]`, `GET /api/preview/...`)
+performs zero identity checks. Anyone who can reach the console's port can
+already call every existing route.
+
+**Per §24 and §48: an unauthenticated HTTP abandonment endpoint was not
+added.** Adding one "merely to complete Phase 5m" would let any
+unauthenticated caller revoke a production build — a materially worse
+outcome than the gap it would close. Instead:
+
+- `scripts/abandon-build.ts` (`pnpm build:abandon <projectId> <bindingId>
+  <reason...>`) is the operator surface — the same trust boundary every
+  other script in `scripts/` already relies on (`db-check.ts`,
+  `gate-check.ts`, `run-agent.ts`): whoever can run a script on this host
+  already has the access an operator action requires. `actor` is derived
+  from `os.userInfo().username`, **never a `--actor` flag** — the same
+  discipline §23 asks of a real authenticated route, applied here to the
+  one identity source a CLI script actually has. A structural test pins
+  both: the script uses `userInfo()`, and never matches `--actor`.
+- No HTTP route in `apps/console` references `abandonFrontendBackendBuild`
+  at all — a dedicated structural test asserts this by scanning every
+  route file. §89's "add the strongest available structural test" is this:
+  the strongest available proof that an unauthenticated actor cannot reach
+  this capability is that no network-reachable path to it exists.
+
+**This is a gap worth closing, explicitly flagged rather than quietly
+left implicit:** the console has no operator authentication for *any* of
+its existing routes, not just this new one. Phase 5m does not attempt to
+add one — that is a distinct, larger capability (who counts as an
+operator, how they authenticate, what else should be gated behind it) than
+"abandon one build."
+
+### Phase 5i and 5j: a legitimately abandoned job is not a platform error
+
+`FrontendBackendLifecycleResult`'s outcome union gains `'superseded'`,
+alongside the other simple state-outcomes it already had
+(`in_progress`/`retry_ready`/.../`draft`). The coordinator's `advance()`
+switch gains one matching `case`, returning immediately — no model call,
+no validation, no acceptance, no promotion (mutation-verified: making this
+case fall through to `runner.runOnce()` instead produces an infinite
+loop/timeout, since nothing ever changes the job's state back to `ready`).
+
+**`orchestrator.ts` needed zero changes.** `jobLifecycleOutcome` is typed
+as `FrontendBackendLifecycleResult['outcome']` — a structural derivation,
+not a hand-maintained union — so `'superseded'` propagates automatically.
+The existing `if (result.outcome !== 'promoted')` branch already treats
+every non-`promoted` outcome identically: `RunResult.outcome` becomes
+`'blocked'`, `jobLifecycleOutcome` carries the exact value, no fallback, no
+downstream evaluation. A stale in-flight invocation that resolved the
+active binding and its spec *before* a concurrent operator abandonment —
+the same race window a process restart or a slow request could land in —
+observes this exact path, verified directly by replaying that sequence
+manually with the coordinator (resolve binding → abandon concurrently →
+call `coordinator.run(spec)` with the pre-abandonment spec) rather than
+trying to force a non-deterministic race through the full `runProject`
+entrypoint.
+
+A fresh `job_lifecycle` invocation never resumes an abandoned binding —
+`findActivePreparedBinding`'s `status: 'prepared'` filter (Phase 5k,
+untouched) already excludes it, so the fresh path runs exactly as it did
+before Phase 5m: new discovery, new planning, a new deterministic
+`JobSpec`/`jobId`. Verified end to end: a generation stuck in
+`retry_ready`, abandoned, then a second `job_lifecycle` invocation for the
+same project produces a **new** binding with a **different** `jobId`,
+reaches `released`, and the first generation's job is still, and remains,
+`superseded`.
+
+### Tests
+
+**Unit: 6 new** (`packages/contracts/test/job.test.ts` — `superseded`
+transition table coverage, `TERMINAL_JOB_STATES` exclusion). **Integration:
+46 new** — 15 in `packages/job-engine/test/engine.test.ts`'s new
+`describe('supersede (Phase 5m)', ...)` (every allowed source state, the
+accepted rejection, lease clearing, reason validation, audit detail,
+external-session participation, terminal-non-runnability across every
+other `JobEngine` method, dependency non-satisfaction, lease-reaper
+non-interference), 31 in the new
+`packages/orchestrator/test/frontend-backend-build-abandonment.integration.test.ts`
+— split into a low-level part (`abandonFrontendBackendBuild` against
+bindings/jobs built with Phase 5k's own primitives, no model calls: every
+pre-acceptance state, no-job-yet, accepted rejection, promotion-evidence
+rejection, exact-identity guards including the fabricated-id case above,
+idempotent replay, promoted immunity, active-slot release with history
+preserved, reason validation, no-auto-abandonment, and five structural
+scope-boundary tests) and a full-pipeline part reusing real 5g-1/5g-2/5h/5i
+machinery (stale 5g-1 evidence, the acceptance race, the runner-authority
+race, the Phase 5i outcome, the stale-invocation race, a full new
+generation after abandonment, and legacy rollback both before and after
+abandonment). **Total: 952 (up from 904).**
+
+### Mutation testing
+
+**13 mutations applied directly to Phase 5m's own new production code**
+(`run-binding/frontend-backend.ts`, `job-engine/engine.ts`,
+`job-lifecycle/frontend-backend.ts`), each backed up under distinct
+filenames, applied, tested, and restored individually — restoration
+verified byte-for-byte against the backup after every single one, not only
+at the end:
+
+1. Binding deleted instead of marked `abandoned` — killed (two tests: the
+   no-job-yet case and active-slot-release/history).
+2. `findActivePreparedBinding` loosened to also match `'abandoned'` —
+   killed (wrong binding returned to the active-slot-release test).
+3. Accepted-job check disabled — killed, and revealed a second,
+   independent guard: `JobEngine.supersede`'s own state filter rejects
+   `accepted` regardless, so the call still fails, just via a different
+   error type the test correctly distinguishes.
+4. Promotion-evidence check disabled — killed.
+5. Exact-`bindingId` lookup given a same-project active-binding fallback
+   on miss — **not killed by the original test suite**, because the
+   existing "unknown bindingId" fixture had no other binding to fall back
+   to. Strengthened with a dedicated fixture (a fabricated id against a
+   project that *does* have a real active binding) that catches it, and
+   confirmed the original assertion (binding + job left completely
+   untouched) still holds once restored.
+6. `projectId` mismatch check disabled — killed.
+7. Idempotent-replay short-circuit disabled — killed (the second call
+   throws instead of returning `already_abandoned`).
+8. Phase 5i's `superseded` case changed to attempt execution instead of
+   stopping — killed (infinite loop / test timeout, since nothing returns
+   the job to `ready`).
+9. `JobEngine.supersede`'s lease-clearing removed — killed.
+
+Not independently forced through a runtime mutation, with the reason each
+is still covered:
+
+- **Job/binding writes outside the shared transaction.** Both writes
+  already go through the one `session` this function opens (or is handed);
+  there is no code path that could write either outside it without
+  removing the `session` parameter from the calls entirely, which is
+  mutation 5's own territory (already covered) plus a straightforward
+  read of the function — there is exactly one `withTransaction` call and
+  every write inside it takes `{ session }`.
+- **`superseded` satisfying a dependency, `release`/`claim`/etc. accepting
+  it.** No code exists in any of those methods that mentions
+  `'superseded'` at all to mutate — their `from`/eligibility lists simply
+  never name it, confirmed by reading each one directly (`packages/contracts/test/job.test.ts`
+  and `engine.test.ts`'s own "permanently non-runnable" test independently
+  pin the resulting behaviour).
+- **Auto-abandonment on `retry_ready`/`failed`/etc.** No caller of
+  `abandonFrontendBackendBuild` or `engine.supersede` exists anywhere
+  except the CLI script and (in tests) direct calls — grepped directly,
+  and pinned by a dedicated structural test.
+- **Abandonment deleting staged artifacts or performing a Git
+  mutation.** `AbandonFrontendBackendBuildDeps` has no `registry`/
+  `workspace` field to call either through — structurally impossible, not
+  merely untested (dedicated structural tests assert both the dependency
+  shape and the absence of the relevant calls in source).
+- **A production API route supersedes an arbitrary role.** No such route
+  exists — the only production surface is the CLI script, scoped to
+  exactly `frontend_backend` by construction (it calls
+  `abandonFrontendBackendBuild`, which itself only ever touches
+  `frontend_backend_build_bindings` and the one job a binding names).
+
+### Scope, held exactly where the brief drew it
+
+- Accepted-but-unpromoted jobs are never abandoned in this phase — see
+  Phase 5n, proposed below.
+- No Git mutation, ever — no reset, revert, or history rewrite.
+- No artifact or staging-output deletion.
+- No automatic abandonment — explicit operator action only, every time.
+- No replacement build started by the abandonment action itself.
+- No Luna, no Sol decision authority over abandon-vs-resume.
+- No deployment/release behaviour changed.
+- No other worker role reachable through this capability.
+- `FRONTEND_BACKEND_EXECUTION_MODE`, `runProject`'s internal default, and
+  the Phase 5l workspace-root collision guard are all untouched.
+
+**Explicit statements, as the brief requires:**
+
+Phase 5m abandons only a specific exact active binding selected by
+bindingId. Phase 5m atomically abandons the prepared binding and
+supersedes its pre-acceptance job when that job exists. Phase 5m does not
+delete jobs, bindings, staged artifacts, or Git history. Phase 5m
+permanently prevents a superseded job from becoming runnable again. Phase
+5m does not automatically start a replacement build. Phase 5m does not
+abandon accepted jobs. Phase 5m does not add Luna repair. Phase 5m does
+not change deployment behavior.
+
+### Deliberately next, not now
+
+**Phase 5n — accepted-build promotion fence + safe abandonment.** The gap
+Phase 5m's own scope boundary names explicitly: make accepted-but-unpromoted
+abandonment safe by introducing a durable promotion authority/fence, so
+Phase 5h cannot begin canonical mutation after an abandonment wins, and
+abandonment cannot win after Phase 5h already owns the fence — without
+inventing a Mongo/filesystem/Git distributed-transaction fiction. Not
+proposed further here; not implemented in this phase.
+
 ## Phases 6–17
 
 Not started.

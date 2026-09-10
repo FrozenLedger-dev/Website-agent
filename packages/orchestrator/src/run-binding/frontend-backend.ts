@@ -28,8 +28,9 @@
  * this phase does not implement — see `docs/upgrade-status.md`).
  */
 import { JobSpec, type ArtifactRef, type BusinessProfile, type SitePlan } from '@statxai/contracts';
-import type { FrontendBackendBuildBindingDocument, StateStore } from '@statxai/state';
+import type { FrontendBackendBuildBindingDocument, JobDocument, StateStore } from '@statxai/state';
 import { contentHash, type ProjectWorkspace } from '@statxai/workspace';
+import type { JobEngine } from '@statxai/job-engine';
 import { FRONTEND_BACKEND_INPUT } from '../job-handlers/frontend-backend.js';
 import { BUSINESS_PROFILE_ARTIFACT_PATH, materialiseBusinessProfileFile } from '../phases/discover.js';
 import { materialiseSitePlanFiles, sitePlanArtifactPaths } from '../phases/planning.js';
@@ -496,4 +497,300 @@ export async function finalizeBindingPromoted(
       },
     },
   );
+}
+
+// ---------------------------------------------------------------------------
+// Explicit abandonment (Phase 5m)
+// ---------------------------------------------------------------------------
+
+/**
+ * No `prepared` binding exists under this exact `bindingId` at all — never
+ * yet created, or a typo. Never substituted for "the project's current
+ * active binding": a stale operator request must fail on the exact id it
+ * named, not silently fall back to whatever is active now.
+ */
+export class FrontendBackendBuildBindingNotFound extends Error {
+  constructor(bindingId: string) {
+    super(`frontend_backend build binding "${bindingId}" does not exist`);
+    this.name = 'FrontendBackendBuildBindingNotFound';
+  }
+}
+
+/**
+ * The exact binding named by `bindingId` exists, but for a different
+ * project than the caller supplied. Fails closed rather than abandoning a
+ * binding under a project id the caller did not actually intend — the
+ * exact-identity guard `abandonFrontendBackendBuild`'s own brief requires.
+ */
+export class FrontendBackendBuildBindingProjectMismatch extends Error {
+  constructor(requestedProjectId: string, bindingId: string, actualProjectId: string) {
+    super(
+      `frontend_backend build binding "${bindingId}" belongs to project "${actualProjectId}", not the requested ` +
+        `"${requestedProjectId}"; refusing to abandon it`,
+    );
+    this.name = 'FrontendBackendBuildBindingProjectMismatch';
+  }
+}
+
+/** `reason` was empty, whitespace-only, or exceeded {@link MAX_ABANDONMENT_REASON_LENGTH}. */
+export class FrontendBackendBuildAbandonmentReasonInvalid extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FrontendBackendBuildAbandonmentReasonInvalid';
+  }
+}
+
+/**
+ * The binding's own `jobId` names a `JobDocument` that does not actually
+ * describe the same request — a different project, a different role, or a
+ * `JobSpec` that no longer content-hashes the same as the binding's own
+ * stored one. Genuine control-plane corruption (this should never happen
+ * given how the binding and the job are both created), never silently
+ * proceeded past.
+ */
+export class FrontendBackendBuildAbandonmentJobMismatch extends Error {
+  constructor(bindingId: string, jobId: string, detail: string) {
+    super(`frontend_backend build binding "${bindingId}": job "${jobId}" does not match this binding — ${detail}`);
+    this.name = 'FrontendBackendBuildAbandonmentJobMismatch';
+  }
+}
+
+/**
+ * The exact bound job is already `accepted`. Phase 5m's own scope boundary
+ * (see `docs/upgrade-status.md`'s Phase 5m section): an accepted job may
+ * already be entering Phase 5h's canonical promotion path, and a Mongo-only
+ * "supersede accepted" write cannot safely prove that promotion has not
+ * already crossed from Mongo authority into filesystem/Git mutation.
+ * Revoking an accepted-but-unpromoted build needs a dedicated promotion
+ * fence this phase does not add — see Phase 5n. The binding stays
+ * `prepared`; the job stays `accepted`; nothing here is mutated.
+ */
+export class FrontendBackendBuildAbandonmentAcceptedConflict extends Error {
+  constructor(projectId: string, bindingId: string, jobId: string) {
+    super(
+      `project "${projectId}" binding "${bindingId}": job "${jobId}" is already accepted; refusing to abandon — ` +
+        `accepted-but-unpromoted revocation is out of scope for this capability (see Phase 5n)`,
+    );
+    this.name = 'FrontendBackendBuildAbandonmentAcceptedConflict';
+  }
+}
+
+/**
+ * A `JobPromotionRecord` already exists for the exact bound job, even
+ * though abandonment was requested. This should normally correlate with the
+ * job already being `accepted` (caught by
+ * {@link FrontendBackendBuildAbandonmentAcceptedConflict} first) — reaching
+ * this instead means durable state disagrees with itself, which is
+ * control-plane inconsistency to report, never permission to clean up.
+ * Phase 5m never reads this as license to modify or delete promotion
+ * evidence.
+ */
+export class FrontendBackendBuildAbandonmentPromotionEvidenceConflict extends Error {
+  constructor(projectId: string, bindingId: string, jobId: string) {
+    super(
+      `project "${projectId}" binding "${bindingId}": job "${jobId}" already has promotion evidence; refusing to ` +
+        `abandon — contradictory durable state, not repaired here`,
+    );
+    this.name = 'FrontendBackendBuildAbandonmentPromotionEvidenceConflict';
+  }
+}
+
+/** Generous enough for a real operator explanation, bounded so this is never an unlimited free-text field. No existing shared limit exists elsewhere in this codebase for a human-authored reason string, so this is Phase 5m's own. */
+export const MAX_ABANDONMENT_REASON_LENGTH = 2000;
+
+/**
+ * Non-empty after trimming, and within {@link MAX_ABANDONMENT_REASON_LENGTH}
+ * — the one validation `abandonFrontendBackendBuild` applies to `reason`
+ * before anything durable is touched. The trimmed value, not the raw one, is
+ * what gets persisted: incidental leading/trailing whitespace is not part of
+ * the operator's actual explanation.
+ */
+export function validateAbandonmentReason(reason: string): string {
+  const trimmed = reason.trim();
+  if (trimmed === '') {
+    throw new FrontendBackendBuildAbandonmentReasonInvalid('abandonment reason must not be empty or whitespace-only');
+  }
+  if (trimmed.length > MAX_ABANDONMENT_REASON_LENGTH) {
+    throw new FrontendBackendBuildAbandonmentReasonInvalid(
+      `abandonment reason exceeds ${MAX_ABANDONMENT_REASON_LENGTH} characters (got ${trimmed.length})`,
+    );
+  }
+  return trimmed;
+}
+
+export interface AbandonFrontendBackendBuildInput {
+  readonly projectId: string;
+  /** The exact binding to abandon — never inferred from "the project's current active binding". */
+  readonly bindingId: string;
+  /**
+   * Harness/operator identity. Never a raw HTTP request body field — a real
+   * caller derives this from its own authenticated context before calling
+   * here. This function does not, and cannot, verify who `actor` really is;
+   * it only records what it is told.
+   */
+  readonly actor: string;
+  readonly reason: string;
+}
+
+export interface AbandonFrontendBackendBuildDeps {
+  readonly store: StateStore;
+  readonly engine: JobEngine;
+}
+
+export type FrontendBackendBuildAbandonmentResult =
+  | {
+      readonly outcome: 'abandoned';
+      readonly binding: FrontendBackendBuildBindingDocument;
+      /** `null` when Phase 5k's own crash point applied: a binding existed but Phase 5i had never enqueued its job yet. */
+      readonly supersededJobId: string | null;
+    }
+  | {
+      /** Idempotent replay: this exact binding was already abandoned, by this call or an earlier one. No second transition, no second audit entry. */
+      readonly outcome: 'already_abandoned';
+      readonly binding: FrontendBackendBuildBindingDocument;
+    }
+  | {
+      /** The binding already reached `promoted` — historical, successful, and never turned into `abandoned` after the fact. */
+      readonly outcome: 'already_promoted';
+      readonly binding: FrontendBackendBuildBindingDocument;
+    };
+
+/**
+ * Explicitly, durably abandon exactly one active `frontend_backend` build
+ * binding, and — atomically, in the same Mongo transaction — permanently
+ * supersede its pre-acceptance job if one was ever enqueued (Phase 5m).
+ *
+ * No automatic trigger exists anywhere for this: not a timeout, not a lease
+ * expiry, not `retry_ready`/`validation_failed`/`failed`/`repair_requested`.
+ * A caller decides, explicitly, every time.
+ *
+ * Sequence, all inside one transaction (the Mongo driver retries the whole
+ * callback on a transient conflict, so every read below is re-taken fresh on
+ * a retry rather than trusted stale):
+ *
+ *   1. Load the binding by its exact `_id` — never "the project's current
+ *      active one". Not found, or found under a different `projectId`, both
+ *      fail closed before anything else is read.
+ *   2. `status === 'abandoned'` or `'promoted'`: return the matching
+ *      historical outcome. Read-only — no second transition, no mutation of
+ *      a binding this call did not just abandon.
+ *   3. `status === 'prepared'`: {@link verifyBindingConsistency} first — a
+ *      corrupt binding is never abandoned blindly. Then, if `binding.jobId`
+ *      names an existing `JobDocument`: verify it actually describes this
+ *      binding's own request (project, role, exact `JobSpec`); fail closed
+ *      on {@link FrontendBackendBuildAbandonmentAcceptedConflict} if it is
+ *      already `accepted`, or on
+ *      {@link FrontendBackendBuildAbandonmentPromotionEvidenceConflict} if a
+ *      `JobPromotionRecord` already exists for it regardless of state; then
+ *      `engine.supersede(...)`, in this same session. If no `JobDocument`
+ *      exists yet (Phase 5k's own crash point — a binding prepared before
+ *      Phase 5i ever enqueued), nothing is superseded and none is invented.
+ *   4. Guarded `prepared -> abandoned`, recording `abandonedAt`/
+ *      `abandonedBy`/`abandonmentReason`, in the same transaction as step 3's
+ *      job transition — never one without the other, and never partially:
+ *      if either write fails, the whole transaction aborts and the previous
+ *      state (binding `prepared`, job whatever it was) is preserved exactly.
+ *
+ * The acceptance-vs-abandonment race (5g-2's own guarded transaction racing
+ * this one) is not solved with extra locking — both sides read the job
+ * fresh inside their own transaction and guard their write on the state
+ * they just read, so MongoDB's own transaction conflict/retry semantics
+ * give exactly one of two outcomes: this transaction commits first (job
+ * `superseded`, binding `abandoned`, 5g-2's later attempt reads `state !==
+ * 'validating'` and throws `AcceptanceBindingStale`), or 5g-2 commits first
+ * (job `accepted`; this transaction, retried by the driver, reads that
+ * fresh and throws `FrontendBackendBuildAbandonmentAcceptedConflict` — the
+ * binding is left exactly `prepared`, for a human to resolve through
+ * promotion or a later promotion-fencing capability). The mixed case —
+ * binding `abandoned` with the job `accepted` — is not reachable by
+ * construction, not merely tested for.
+ *
+ * What this deliberately never does: delete the binding, the job, any
+ * artifact, or any Git history; touch the canonical workspace; call
+ * `git reset`/`revert`/commit anything; modify or retire a
+ * `JobPromotionRecord`; start a replacement build, discovery, planning, a
+ * Terra call, or a Luna call. Abandonment stops after revocation — what
+ * happens next is a separate, later, explicit request.
+ */
+export async function abandonFrontendBackendBuild(
+  input: AbandonFrontendBackendBuildInput,
+  deps: AbandonFrontendBackendBuildDeps,
+): Promise<FrontendBackendBuildAbandonmentResult> {
+  const reason = validateAbandonmentReason(input.reason);
+
+  return deps.store.withTransaction(async (session) => {
+    const binding = await deps.store.frontendBackendBuildBindings.findOne({ _id: input.bindingId }, { session });
+    if (!binding) throw new FrontendBackendBuildBindingNotFound(input.bindingId);
+    if (binding.projectId !== input.projectId) {
+      throw new FrontendBackendBuildBindingProjectMismatch(input.projectId, input.bindingId, binding.projectId);
+    }
+
+    if (binding.status === 'abandoned') return { outcome: 'already_abandoned' as const, binding };
+    if (binding.status === 'promoted') return { outcome: 'already_promoted' as const, binding };
+
+    // Only 'prepared' remains. Never abandon corrupt binding state blindly.
+    const spec = parseStoredJobSpec(binding);
+    verifyBindingConsistency(binding, spec);
+
+    const job: JobDocument | null = await deps.store.jobs.findOne({ _id: binding.jobId }, { session });
+
+    let supersededJobId: string | null = null;
+    if (job) {
+      if (job.projectId !== binding.projectId || job.role !== ROLE) {
+        throw new FrontendBackendBuildAbandonmentJobMismatch(binding._id, job._id, 'projectId or role does not match the binding');
+      }
+      if (contentHash(job.spec) !== contentHash(spec)) {
+        throw new FrontendBackendBuildAbandonmentJobMismatch(binding._id, job._id, 'JobSpec no longer matches the binding\'s stored one');
+      }
+
+      // Independent of `job.state`: contradictory durable state is a
+      // control-plane fault, not something abandonment repairs.
+      const promotionEvidence = await deps.store.promotions.findOne({ jobId: job._id }, { session });
+      if (promotionEvidence) {
+        throw new FrontendBackendBuildAbandonmentPromotionEvidenceConflict(binding.projectId, binding._id, job._id);
+      }
+      if (job.state === 'accepted') {
+        throw new FrontendBackendBuildAbandonmentAcceptedConflict(binding.projectId, binding._id, job._id);
+      }
+
+      const superseded = await deps.engine.supersede(job._id, input.actor, {
+        reason,
+        bindingId: binding._id,
+        session,
+      });
+      supersededJobId = superseded._id;
+    }
+
+    const now = new Date();
+    const updated = await deps.store.frontendBackendBuildBindings.findOneAndUpdate(
+      { _id: binding._id, status: 'prepared' },
+      {
+        $set: {
+          status: 'abandoned',
+          abandonedAt: now,
+          abandonedBy: input.actor,
+          abandonmentReason: reason,
+          updatedAt: now,
+        },
+      },
+      { session, returnDocument: 'after' },
+    );
+
+    if (!updated) {
+      // Defense in depth: under this module's own transaction semantics
+      // (snapshot isolation, whole-callback retry on conflict) this branch
+      // should be unreachable in practice — reclassified from what is
+      // actually there rather than trusted to never happen.
+      const fresh = await deps.store.frontendBackendBuildBindings.findOne({ _id: binding._id }, { session });
+      if (!fresh) throw new FrontendBackendBuildBindingNotFound(binding._id);
+      if (fresh.status === 'abandoned') return { outcome: 'already_abandoned' as const, binding: fresh };
+      if (fresh.status === 'promoted') return { outcome: 'already_promoted' as const, binding: fresh };
+      throw new FrontendBackendBuildBindingCorrupt(
+        binding._id,
+        'binding is still "prepared" but its own guarded abandonment update did not match',
+      );
+    }
+
+    return { outcome: 'abandoned' as const, binding: updated, supersededJobId };
+  });
 }

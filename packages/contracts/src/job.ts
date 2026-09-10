@@ -25,6 +25,7 @@ export const JobState = z.enum([
   'failed',
   'repair_requested',
   'blocked',
+  'superseded',
 ]);
 export type JobState = z.infer<typeof JobState>;
 
@@ -37,22 +38,48 @@ export type JobState = z.infer<typeof JobState>;
  * lease reclamation. Without it a worker crash strands the job in `running`
  * forever, since nothing else can claim it.
  *
- * Note for the architecture review: there is no `superseded` state. When Sol
- * re-plans, in-flight jobs from the previous plan have no defined disposition —
- * `blocked` is the closest fit but does not mean the same thing. Left as the
- * document specifies rather than invented here.
+ * `superseded` (Phase 5m) closes the gap the architecture review once noted
+ * here: an operator explicitly abandoning a durably-bound build now has a
+ * defined disposition for that build's pre-acceptance job, distinct from
+ * `blocked` — `blocked` means a dependency/policy problem that may still be
+ * resolved forward; `superseded` means this exact execution has been
+ * permanently revoked and will never run, validate, or accept again.
+ * Reachable from every pre-acceptance state (`draft`, `ready`, `running`,
+ * `validating`, `failed`, `repair_requested`, `blocked`) and from nowhere
+ * else — deliberately *not* from `accepted`: an accepted job may already be
+ * entering Phase 5h's canonical promotion path, and revoking it needs a
+ * dedicated promotion-fencing capability this phase does not add (see
+ * `docs/upgrade-status.md`'s Phase 5m section). `superseded` itself has no
+ * outgoing edges — once reached, permanently terminal, never reclaimed,
+ * released, retried, or re-accepted.
  */
 const TRANSITIONS: Readonly<Record<JobState, readonly JobState[]>> = Object.freeze({
-  draft: ['ready', 'blocked'],
-  ready: ['running', 'blocked'],
-  running: ['validating', 'failed', 'ready'],
-  validating: ['accepted', 'failed', 'repair_requested'],
-  failed: ['ready', 'repair_requested', 'blocked'],
-  repair_requested: ['ready', 'accepted', 'blocked'],
-  blocked: ['ready', 'failed'],
+  draft: ['ready', 'blocked', 'superseded'],
+  ready: ['running', 'blocked', 'superseded'],
+  running: ['validating', 'failed', 'ready', 'superseded'],
+  validating: ['accepted', 'failed', 'repair_requested', 'superseded'],
+  failed: ['ready', 'repair_requested', 'blocked', 'superseded'],
+  repair_requested: ['ready', 'accepted', 'blocked', 'superseded'],
+  blocked: ['ready', 'failed', 'superseded'],
   accepted: [],
+  superseded: [],
 });
 
+/**
+ * Not "every state with no outgoing transition" — `accepted` and
+ * `superseded` are both that, structurally, but this array means
+ * specifically *successful* completion: the one state a job dependency
+ * (`JobRecord.dependsOn`, `JobEngine.dependenciesSatisfied`) is satisfied
+ * by. Deliberately still exactly `['accepted']` after Phase 5m added
+ * `superseded` — inspected before editing, per that phase's own brief:
+ * this array has no consumer in the codebase today (grepped, confirmed),
+ * but its meaning is the one a future dependency-satisfaction consumer
+ * would read it for, and `superseded` must never satisfy a dependency the
+ * way `accepted` does (a permanently-revoked upstream job must leave its
+ * dependents permanently unschedulable, not accidentally unblocked). If a
+ * future need arises for "every state execution can never leave," that is
+ * a different array with a different name, not a redefinition of this one.
+ */
 export const TERMINAL_JOB_STATES: readonly JobState[] = Object.freeze(['accepted']);
 
 export function canTransition(from: JobState, to: JobState): boolean {

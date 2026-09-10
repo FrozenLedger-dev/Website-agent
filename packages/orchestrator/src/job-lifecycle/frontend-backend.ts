@@ -130,7 +130,16 @@ export type FrontendBackendLifecycleResult =
         | 'failed'
         | 'repair_requested'
         | 'blocked'
-        | 'draft';
+        | 'draft'
+        /**
+         * The job is `superseded` (Phase 5m) — an operator explicitly
+         * abandoned the Phase 5k build binding this job belongs to, before
+         * this invocation ever reached it. Reported exactly like every
+         * other non-`promoted` stop: no model call, no validation, no
+         * acceptance, no promotion, no platform error. A legitimately
+         * abandoned job is not a fault this lifecycle throws on.
+         */
+        | 'superseded';
       readonly jobId: string;
       readonly state: JobState;
       readonly enqueued: boolean;
@@ -276,6 +285,13 @@ export function createFrontendBackendLifecycleCoordinator(
       case 'repair_requested':
         // No repair-tier handler is wired in this phase. Stop.
         return { outcome: 'repair_requested', jobId: job._id, state: job.state, enqueued, workerExecuted };
+
+      case 'superseded':
+        // Permanently revoked by an explicit operator abandonment (Phase
+        // 5m) — never by this lifecycle itself. Stop, exactly like every
+        // other terminal-for-this-invocation state above: no retry, no
+        // fallback, no attempt to resume what abandonment already ended.
+        return { outcome: 'superseded', jobId: job._id, state: job.state, enqueued, workerExecuted };
 
       case 'running':
         // Someone already holds this job's lease — steal nothing, run

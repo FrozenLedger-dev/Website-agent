@@ -168,6 +168,21 @@ export class InvalidClaimRoles extends Error {
   }
 }
 
+/**
+ * `supersede()` was called with an empty (or whitespace-only) reason.
+ *
+ * Superseding a job is a permanent, harness-owned revocation with no
+ * automatic trigger (Phase 5m) — the audit trail is the only record of why
+ * a specific execution was abandoned, and an empty reason would leave that
+ * question unanswerable to anyone reading the trail later.
+ */
+export class InvalidSupersessionReason extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidSupersessionReason';
+  }
+}
+
 export interface EnqueueParams {
   spec: JobSpec;
   origin: JobOrigin;
@@ -539,6 +554,75 @@ export class JobEngine {
   }
 
   /**
+   * Permanently revoke a job's pre-acceptance execution authority (Phase
+   * 5m). Harness-owned, explicit-only — nothing in this file ever calls it:
+   * there is no automatic supersession for a timeout, a lease expiry, a
+   * `retry_ready`, or a `validation_failed`. A caller (Phase 5m's own
+   * `abandonFrontendBackendBuild`) decides when to invoke this; `JobEngine`
+   * itself holds no opinion about when a job should be abandoned.
+   *
+   * Legal from every pre-acceptance state — `draft`, `ready`, `running`,
+   * `validating`, `failed`, `repair_requested`, `blocked` — and from
+   * nowhere else: `accepted` is deliberately excluded from the guarded
+   * filter below, so an attempt against an already-accepted job matches
+   * nothing and fails closed with {@link JobStateConflict} naming the
+   * legal source states, exactly like every other guarded transition here
+   * that a caller aims at the wrong state. No special-cased "is it
+   * accepted?" check exists in this method for that reason — the guard
+   * *is* the check.
+   *
+   * A `running` job's lease is cleared unconditionally, regardless of who
+   * currently holds it or whether it has expired — this is harness
+   * authority overriding a worker's claim, not a worker relinquishing its
+   * own. Once this transaction commits, the stale worker's own lease-bound
+   * calls (`heartbeat`, `submitForValidation`, `fail`) all guard on
+   * `state: 'running'`, which no longer matches, so none of them can
+   * advance the job again — see `hasActiveLease`/`transitionOwnedRunning`.
+   * A worker may still produce immutable staged bytes after losing
+   * authority; those stay orphaned, unaccepted and noncanonical, which is
+   * acceptable and never cleaned up here (Phase 5m's own scope boundary).
+   *
+   * `superseded` is terminal (`TRANSITIONS.superseded === []`) and is
+   * deliberately excluded from `TERMINAL_JOB_STATES`: that array means
+   * *successful* completion, and a dependency on a superseded job must
+   * never become satisfied merely because it can no longer progress — see
+   * `TERMINAL_JOB_STATES`'s own doc comment.
+   *
+   * `reason` is required and may not be empty/whitespace-only — the audit
+   * trail this produces is the only durable record of why a specific
+   * execution was permanently revoked. `bindingId`, when given, is carried
+   * into the audit detail alongside it purely as evidence linking this
+   * supersession to the Phase 5k build binding that caused it — this
+   * method has no idea what a "build binding" is and reads nothing from
+   * one.
+   *
+   * `options.session`, when supplied, is used directly and no transaction
+   * is opened here — the caller already owns one, typically because it
+   * must also transition a `FrontendBackendBuildBindingDocument`
+   * `prepared -> abandoned` atomically with this. Omitted, this opens its
+   * own transaction, exactly like every other guarded method in this file.
+   */
+  async supersede(
+    jobId: string,
+    actor: string,
+    options: { reason: string; bindingId?: string; now?: Date; session?: ClientSession },
+  ): Promise<JobDocument> {
+    if (options.reason.trim() === '') {
+      throw new InvalidSupersessionReason('JobEngine.supersede: reason must not be empty');
+    }
+    return this.transition(
+      jobId,
+      ['draft', 'ready', 'running', 'validating', 'failed', 'repair_requested', 'blocked'],
+      'superseded',
+      actor,
+      { lease: null },
+      options.session,
+      options.now,
+      { reason: options.reason, ...(options.bindingId !== undefined ? { bindingId: options.bindingId } : {}) },
+    );
+  }
+
+  /**
    * Return jobs whose lease has expired to the `ready` pool.
    *
    * Without this a crashed worker strands its job in `running` forever: nothing
@@ -674,10 +758,18 @@ export class JobEngine {
   }
 
   /**
-   * `session`, when supplied (Phase 5g-2), is used directly and no
-   * transaction is opened here — the caller already owns one. Every
-   * pre-5g-2 caller omits it and gets exactly the original behaviour: its
-   * own transaction, opened and committed by this call alone.
+   * `session`, when supplied (Phase 5g-2, Phase 5m), is used directly and no
+   * transaction is opened here — the caller already owns one. Every caller
+   * that omits it gets exactly the original behaviour: its own transaction,
+   * opened and committed by this call alone.
+   *
+   * `now`/`auditDetail` (Phase 5m) are both optional and additive: every
+   * pre-5m caller omits them and gets exactly the original behaviour — the
+   * current clock, and an audit detail of exactly `{ to, attempt }`.
+   * `auditDetail`, when given, is merged in alongside those two rather than
+   * replacing them, so a caller (`supersede`) can attach evidence — a
+   * reason, a binding id — without this method needing to know what that
+   * evidence means.
    */
   private async transition(
     jobId: string,
@@ -686,14 +778,16 @@ export class JobEngine {
     actor: string,
     extra: Record<string, unknown>,
     session?: ClientSession,
+    now?: Date,
+    auditDetail?: Record<string, unknown>,
   ): Promise<JobDocument> {
     for (const state of from) assertTransition(state, to);
 
     const run = async (session: ClientSession): Promise<JobDocument> => {
-      const now = new Date();
+      const at = now ?? new Date();
       const updated = await this.store.jobs.findOneAndUpdate(
         { _id: jobId, state: { $in: [...from] } },
-        { $set: { state: to, updatedAt: now, ...extra } },
+        { $set: { state: to, updatedAt: at, ...extra } },
         { session, returnDocument: 'after' },
       );
 
@@ -708,8 +802,8 @@ export class JobEngine {
         jobId,
         kind: 'job_transition',
         actor,
-        detail: { to, attempt: updated.attempt },
-        at: now,
+        detail: { to, attempt: updated.attempt, ...auditDetail },
+        at,
       });
       return updated;
     };

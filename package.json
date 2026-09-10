@@ -16,6 +16,7 @@
     "agent:run": "node --env-file=.env.local --import tsx scripts/run-agent.ts",
     "preview": "node --env-file=.env.local --import tsx scripts/preview.ts",
     "gate:check": "node --env-file=.env.local --import tsx scripts/gate-check.ts",
+    "build:abandon": "node --env-file=.env.local --import tsx scripts/abandon-build.ts",
     "scaffold:check": "node --import tsx scripts/scaffold-check.ts",
     "console": "cd apps/console && node --env-file=../../.env.local ./node_modules/next/dist/bin/next dev --port 3100",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p apps/console/tsconfig.json",

@@ -4,6 +4,7 @@ import { StateStore } from '@statxai/state';
 import {
   InvalidAcceptanceBinding,
   InvalidClaimRoles,
+  InvalidSupersessionReason,
   JobAcceptanceBindingConflict,
   JobAttemptConflict,
   JobEngine,
@@ -973,5 +974,165 @@ describe('lease authority over a running job', () => {
       const submitted = await engine.submitForValidation('job_a', 'worker-1', job.attempt, { now: T0 });
       expect(submitted.executionOutputs ?? null).toBeNull();
     });
+  });
+});
+
+describe('supersede (Phase 5m)', () => {
+  const REASON = 'operator abandoned this generation';
+
+  const assertSuperseded = async (jobId = 'job_a') => {
+    const superseded = await engine.supersede(jobId, 'operator:alice', { reason: REASON, bindingId: 'binding_x' });
+    expect(superseded.state).toBe('superseded');
+    const stored = await store.jobs.findOne({ _id: jobId });
+    expect(stored?.state).toBe('superseded');
+  };
+
+  it('supersedes a draft job', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' }, draft: true });
+    await assertSuperseded();
+  });
+
+  it('supersedes a ready job', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+    await assertSuperseded();
+  });
+
+  it('supersedes a failed job (exhausted retries)', async () => {
+    // maxAttempts: 1 so fail() leaves the job in 'failed' rather than
+    // immediately retrying it back to 'ready' — fail()'s own documented
+    // behaviour only stops there once attempt >= maxAttempts.
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' }, maxAttempts: 1 });
+    const claimed = await engine.claim('worker-1', TERRA);
+    const failed = await engine.fail(claimed!._id, 'boom', 'worker-1', claimed!.attempt);
+    expect(failed.state).toBe('failed');
+    await assertSuperseded();
+  });
+
+  it('supersedes a repair_requested job', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+    const claimed = await engine.claim('worker-1', TERRA);
+    await engine.submitForValidation('job_a', 'worker-1', claimed!.attempt);
+    await engine.requestRepair('job_a', 'harness');
+    await assertSuperseded();
+  });
+
+  it('supersedes a blocked job', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+    await engine.block('job_a', 'harness', 'dependency problem');
+    await assertSuperseded();
+  });
+
+  it('supersedes a running job and clears its lease', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+    const claimed = await engine.claim('worker-1', TERRA);
+    expect(claimed?.lease?.holder).toBe('worker-1');
+
+    const superseded = await engine.supersede('job_a', 'operator:alice', { reason: REASON });
+    expect(superseded.state).toBe('superseded');
+    expect(superseded.lease).toBeNull();
+
+    // The stale worker no longer has authority: heartbeat fails immediately.
+    expect(await engine.heartbeat('job_a', 'worker-1', claimed!.attempt)).toBe(false);
+  });
+
+  it('supersedes a validating job — a stale acceptance attempt can no longer succeed', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+    const claimed = await engine.claim('worker-1', TERRA);
+    await engine.submitForValidation('job_a', 'worker-1', claimed!.attempt);
+
+    const superseded = await engine.supersede('job_a', 'operator:alice', { reason: REASON });
+    expect(superseded.state).toBe('superseded');
+
+    await expect(engine.accept('job_a', 'harness:validator')).rejects.toBeInstanceOf(JobStateConflict);
+  });
+
+  it('rejects superseding an accepted job — JobStateConflict, nothing mutated', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+    const claimed = await engine.claim('worker-1', TERRA);
+    await engine.submitForValidation('job_a', 'worker-1', claimed!.attempt);
+    await engine.accept('job_a', 'harness:validator');
+
+    await expect(engine.supersede('job_a', 'operator:alice', { reason: REASON })).rejects.toBeInstanceOf(JobStateConflict);
+
+    const stored = await store.jobs.findOne({ _id: 'job_a' });
+    expect(stored?.state).toBe('accepted');
+  });
+
+  it('rejects superseding an already-superseded job — no resurrection path', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+    await engine.supersede('job_a', 'operator:alice', { reason: REASON });
+
+    await expect(engine.supersede('job_a', 'operator:alice', { reason: 'again' })).rejects.toBeInstanceOf(JobStateConflict);
+  });
+
+  it('rejects an empty or whitespace-only reason, before anything is written', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+
+    await expect(engine.supersede('job_a', 'operator:alice', { reason: '' })).rejects.toBeInstanceOf(InvalidSupersessionReason);
+    await expect(engine.supersede('job_a', 'operator:alice', { reason: '   ' })).rejects.toBeInstanceOf(InvalidSupersessionReason);
+
+    const stored = await store.jobs.findOne({ _id: 'job_a' });
+    expect(stored?.state).toBe('ready');
+  });
+
+  it('records the reason and bindingId in the audit trail, alongside the transition', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+    await engine.supersede('job_a', 'operator:alice', { reason: REASON, bindingId: 'binding_x' });
+
+    const event = await store.auditLog.findOne({ jobId: 'job_a', kind: 'job_transition', 'detail.to': 'superseded' });
+    expect(event?.actor).toBe('operator:alice');
+    expect(event?.detail.reason).toBe(REASON);
+    expect(event?.detail.bindingId).toBe('binding_x');
+  });
+
+  it('participates in an externally supplied session — an aborted caller transaction leaves the job untouched', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+
+    await expect(
+      store.withTransaction(async (session) => {
+        await engine.supersede('job_a', 'operator:alice', { reason: REASON, session });
+        throw new Error('caller aborts after superseding, inside its own transaction');
+      }),
+    ).rejects.toThrow('caller aborts');
+
+    const stored = await store.jobs.findOne({ _id: 'job_a' });
+    expect(stored?.state).toBe('ready');
+  });
+
+  it('a superseded job is permanently non-runnable: claim/release/block/requestRepair/accept/submitForValidation all reject it', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+    await engine.supersede('job_a', 'operator:alice', { reason: REASON });
+
+    expect(await engine.claim('worker-1', TERRA, { jobId: 'job_a' })).toBeNull();
+    await expect(engine.release('job_a', 'harness')).rejects.toBeInstanceOf(JobStateConflict);
+    await expect(engine.block('job_a', 'harness', 'x')).rejects.toBeInstanceOf(JobStateConflict);
+    await expect(engine.requestRepair('job_a', 'harness')).rejects.toBeInstanceOf(JobStateConflict);
+    await expect(engine.accept('job_a', 'harness:validator')).rejects.toBeInstanceOf(JobStateConflict);
+    // Not running any more, so the fallback classifies this as a state
+    // conflict rather than a lease one — see `transitionOwnedRunning`.
+    await expect(engine.submitForValidation('job_a', 'worker-1', 1)).rejects.toBeInstanceOf(JobStateConflict);
+  });
+
+  it('reclaimExpiredLeases never touches a superseded job', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+    await engine.claim('worker-1', TERRA, { leaseMs: 1 });
+    await engine.supersede('job_a', 'operator:alice', { reason: REASON });
+
+    expect(await engine.reclaimExpiredLeases(new Date(Date.now() + 10_000))).toBe(0);
+    const stored = await store.jobs.findOne({ _id: 'job_a' });
+    expect(stored?.state).toBe('superseded');
+  });
+
+  it('a dependent job is never unblocked by a superseded dependency', async () => {
+    await engine.enqueue({ spec: spec('job_base', ['src/base.tsx']), origin: { kind: 'plan' } });
+    await engine.enqueue({
+      spec: spec('job_dependent', ['src/dependent.tsx']),
+      origin: { kind: 'plan' },
+      dependsOn: ['job_base'],
+    });
+
+    await engine.supersede('job_base', 'operator:alice', { reason: REASON });
+
+    expect(await engine.claim('worker-1', TERRA, { jobId: 'job_dependent' })).toBeNull();
   });
 });
