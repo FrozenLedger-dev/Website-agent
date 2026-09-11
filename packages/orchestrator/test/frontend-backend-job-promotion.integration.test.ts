@@ -17,8 +17,8 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { Collection } from 'mongodb';
 import { StateStore } from '@statxai/state';
-import { ArtifactRegistry, ProjectWorkspace } from '@statxai/workspace';
-import { JobEngine, jobOutputNamespace } from '@statxai/job-engine';
+import { ArtifactRegistry, ProjectWorkspace, contentHash } from '@statxai/workspace';
+import { JobEngine, PromotionFenceConflict, jobOutputNamespace } from '@statxai/job-engine';
 import type { ArtifactRef, JobSpec } from '@statxai/contracts';
 import type { BuildCandidate } from '../src/phases/build.js';
 import { frontendBackendCandidateName } from '../src/job-handlers/frontend-backend.js';
@@ -123,7 +123,47 @@ async function stageAcceptedJob(
   return { job, candidateRef };
 }
 
-const promotionDeps = () => ({ store, registry, workspacesRoot });
+const promotionDeps = () => ({ store, registry, engine, workspacesRoot });
+
+/**
+ * Simulate a crash exactly at the `promotions` collection's own
+ * `findOneAndUpdate` finalize write — never Phase 5n's `jobs`-collection
+ * `findOneAndUpdate` inside `acquirePromotionFence`, which now runs
+ * earlier in the same sequence. A blind, collection-agnostic
+ * `mockImplementationOnce` on `Collection.prototype.findOneAndUpdate`
+ * would otherwise be consumed by the fence's own write instead of the
+ * finalize call these tests actually mean to interrupt.
+ */
+function mockPromotionsFinalizeCrash(message: string) {
+  const original = Collection.prototype.findOneAndUpdate;
+  let thrown = false;
+  return vi.spyOn(Collection.prototype, 'findOneAndUpdate').mockImplementation(function (this: Collection, ...args: Parameters<typeof original>) {
+    if (!thrown && this.collectionName === 'job_promotions') {
+      thrown = true;
+      throw new Error(message);
+    }
+    return Reflect.apply(original, this, args);
+  } as typeof original);
+}
+
+/**
+ * Simulate a crash exactly at the `job_promotions` collection's own
+ * `insertOne` — i.e. exactly the gap Phase 5n opens between a fence being
+ * durably acquired and the brand-new `prepared` receipt that follows it.
+ * Never Phase 5n's own `jobs`-collection `findOneAndUpdate` (the fence
+ * write itself), which must be allowed to succeed for real.
+ */
+function mockPromotionsInsertCrash(message: string) {
+  const original = Collection.prototype.insertOne;
+  let thrown = false;
+  return vi.spyOn(Collection.prototype, 'insertOne').mockImplementation(function (this: Collection, ...args: Parameters<typeof original>) {
+    if (!thrown && this.collectionName === 'job_promotions') {
+      thrown = true;
+      throw new Error(message);
+    }
+    return Reflect.apply(original, this, args);
+  } as typeof original);
+}
 
 async function canonicalWorkspace(projectId: string): Promise<ProjectWorkspace> {
   return ProjectWorkspace.open(projectId, workspacesRoot);
@@ -477,10 +517,10 @@ describe('crash after Git commit before Mongo finalize', () => {
     // Mongo finalize call is made to fail, simulating a process crash in
     // exactly the gap between the two. `store.promotions` returns a fresh
     // `Collection` instance per access (the driver never caches it), so the
-    // spy must sit on the shared prototype, not on any one instance.
-    const spy = vi.spyOn(Collection.prototype, 'findOneAndUpdate').mockImplementationOnce(async () => {
-      throw new Error('simulated crash: Mongo finalize fails right after the Git commit succeeded');
-    });
+    // spy must sit on the shared prototype, not on any one instance —
+    // filtered to that exact collection (see `mockPromotionsFinalizeCrash`)
+    // so it does not instead catch Phase 5n's own `jobs`-collection write.
+    const spy = mockPromotionsFinalizeCrash('simulated crash: Mongo finalize fails right after the Git commit succeeded');
 
     await expect(promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps())).rejects.toThrow(
       'simulated crash',
@@ -588,9 +628,7 @@ describe('promotion commit may become an ancestor', () => {
     const jobId = 'job_promote_ancestor';
     await stageAcceptedJob(projectId, jobId, { contents: 'ancestor content' });
 
-    const spy = vi.spyOn(Collection.prototype, 'findOneAndUpdate').mockImplementationOnce(async () => {
-      throw new Error('simulated crash after commit C, before Mongo finalize');
-    });
+    const spy = mockPromotionsFinalizeCrash('simulated crash after commit C, before Mongo finalize');
     await expect(promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps())).rejects.toThrow(
       'simulated crash after commit C',
     );
@@ -846,21 +884,35 @@ describe('exact Git marker lookup', () => {
 });
 
 describe('job/candidate acceptance unchanged', () => {
-  it('leaves job.state, attempt, executionOutputs, and candidate.acceptedAt exactly as they were', async () => {
+  it('leaves job.state, attempt, and executionOutputs exactly as they were — the only job write is Phase 5n\'s own promotionFence', async () => {
     const projectId = 'proj_promote_acceptance_unchanged';
     const jobId = 'job_promote_acceptance_unchanged';
     const { job, candidateRef } = await stageAcceptedJob(projectId, jobId);
     const before = await store.jobs.findOne({ _id: jobId });
     const artifactBefore = await store.artifacts.findOne({ projectId, name: candidateRef.name });
 
-    await promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps());
+    const result = await promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps());
 
     const after = await store.jobs.findOne({ _id: jobId });
-    // Full deep equality, not just the fields promotion is known to read —
-    // a stray write anywhere on the job document (e.g. a bespoke
-    // "promoted" marker) must fail this test even if it doesn't touch
-    // `state`, `attempt`, or `executionOutputs`.
-    expect(after).toEqual(before);
+    // Full deep equality except the two fields Phase 5n's own fence
+    // acquisition is expected to touch — `promotionFence` (unset before,
+    // set to exactly this promotion's own identity after) and its
+    // `updatedAt` bump. Any *other* stray write anywhere on the job
+    // document (e.g. a bespoke "promoted" marker) must still fail this
+    // test.
+    expect(after).toEqual({
+      ...before,
+      promotionFence: {
+        promotionId: result.promotionId,
+        attempt: job.attempt,
+        candidate: candidateRef,
+        baseCommit: null,
+        acquiredAt: after?.promotionFence?.acquiredAt,
+      },
+      updatedAt: after?.updatedAt,
+    });
+    expect(before?.promotionFence ?? null).toBeNull();
+    expect(after?.promotionFence?.acquiredAt).toBeInstanceOf(Date);
     expect(after?.state).toBe('accepted');
     expect(after?.attempt).toBe(job.attempt);
     expect(after?.executionOutputs).toEqual(before?.executionOutputs);
@@ -882,5 +934,221 @@ describe('no repair, deployment, or model side effect', () => {
     expect(events.map((e) => e.detail['to'])).not.toContain('repair_requested');
     const promotionCount = await store.promotions.countDocuments({ jobId });
     expect(promotionCount).toBe(1);
+  });
+});
+
+describe('Phase 5n — the promotion fence', () => {
+  it('MANDATORY: is acquired before any canonical mutation — a crash immediately after leaves canonical files untouched and no receipt', async () => {
+    const projectId = 'proj_5n_fence_before_mutation';
+    const jobId = 'job_5n_fence_before_mutation';
+    await stageAcceptedJob(projectId, jobId);
+
+    const spy = mockPromotionsInsertCrash('simulated crash: fence acquired, receipt insert never happens');
+    await expect(promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps())).rejects.toThrow(
+      'simulated crash: fence acquired',
+    );
+    spy.mockRestore();
+
+    const fenced = await store.jobs.findOne({ _id: jobId });
+    expect(fenced?.promotionFence).not.toBeNull();
+    expect(fenced?.state).toBe('accepted');
+
+    // No receipt was ever created, and no canonical commit exists.
+    expect(await store.promotions.countDocuments({ jobId })).toBe(0);
+    const ws = await canonicalWorkspace(projectId);
+    expect(await ws.currentCommit()).toBeNull();
+  });
+
+  it('MANDATORY: crash after fence, before receipt — retry reuses the exact same fence, creates exactly one receipt, and promotes once', async () => {
+    const projectId = 'proj_5n_crash_after_fence';
+    const jobId = 'job_5n_crash_after_fence';
+    const { job, candidateRef } = await stageAcceptedJob(projectId, jobId);
+
+    const spy = mockPromotionsInsertCrash('simulated crash after fence, before receipt insert');
+    await expect(promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps())).rejects.toThrow(
+      'simulated crash after fence',
+    );
+    spy.mockRestore();
+
+    const fenceAfterCrash = (await store.jobs.findOne({ _id: jobId }))?.promotionFence;
+    expect(fenceAfterCrash).not.toBeNull();
+    expect(fenceAfterCrash?.baseCommit).toBeNull();
+    expect(fenceAfterCrash?.attempt).toBe(job.attempt);
+    expect(await store.promotions.countDocuments({ jobId })).toBe(0);
+
+    // Retry: a genuine, unmocked production call — new process objects,
+    // nothing shared with the call above beyond durable state.
+    const result = await promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps());
+    expect(result.candidate).toEqual(candidateRef);
+
+    const fenceAfterRetry = (await store.jobs.findOne({ _id: jobId }))?.promotionFence;
+    expect(fenceAfterRetry?.promotionId).toBe(fenceAfterCrash?.promotionId);
+    expect(fenceAfterRetry?.acquiredAt.getTime()).toBe(fenceAfterCrash?.acquiredAt.getTime());
+    expect(await store.promotions.countDocuments({ jobId })).toBe(1);
+    const record = await store.promotions.findOne({ jobId });
+    expect(record?.status).toBe('committed');
+    expect(record?.baseCommit).toBeNull();
+
+    const ws = await canonicalWorkspace(projectId);
+    expect(await countCommitsWithMarker(ws.root, promotionMarker(result.promotionId))).toBe(1);
+  });
+
+  it('MANDATORY: canonical HEAD cannot be silently re-adopted if it moved between fence acquisition and receipt creation', async () => {
+    const projectId = 'proj_5n_head_moved_after_fence';
+    const jobId = 'job_5n_head_moved_after_fence';
+    await stageAcceptedJob(projectId, jobId);
+
+    const spy = mockPromotionsInsertCrash('simulated crash after fence, before receipt insert');
+    await expect(promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps())).rejects.toThrow('simulated crash');
+    spy.mockRestore();
+
+    // State A: fence durably acquired against `baseCommit: null` (this
+    // project's first-ever commit base), receipt absent, marker absent.
+    const fenceBefore = (await store.jobs.findOne({ _id: jobId }))?.promotionFence;
+    expect(fenceBefore?.baseCommit).toBeNull();
+    expect(await store.promotions.countDocuments({ jobId })).toBe(0);
+
+    // An unrelated canonical write lands on this project's lineage before
+    // the retry — HEAD is no longer what the fence itself recorded.
+    const ws = await canonicalWorkspace(projectId);
+    await ws.writeSiteFiles([{ path: 'unrelated.txt', contents: 'someone else\'s canonical write' }]);
+    const unrelatedCommit = await ws.commit('an unrelated canonical write');
+    expect(unrelatedCommit).not.toBeNull();
+    expect(await ws.currentCommit()).toBe(unrelatedCommit);
+
+    // Retry. The existing fence is authority: its own `baseCommit` (null)
+    // is reused verbatim, never re-proposed from the moved HEAD — so the
+    // fence replays idempotently, the receipt is recovered/created against
+    // the fence's own base, and the moved HEAD is caught where it should
+    // be, by the canonical base-commit check immediately before any
+    // materialisation.
+    const retryError = await promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps()).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(retryError).toBeInstanceOf(PromotionBaseConflict);
+    // Explicitly *not* a fence conflict: that would mean the retry had
+    // reconstructed the expected fence from current HEAD and then tripped
+    // over its own reconstruction, rather than treating the stored fence
+    // as authority.
+    expect(retryError).not.toBeInstanceOf(PromotionFenceConflict);
+
+    // The fence is byte-for-byte what it was: not rewritten, not rebased
+    // onto the new HEAD, not re-acquired.
+    const fenceAfter = (await store.jobs.findOne({ _id: jobId }))?.promotionFence;
+    expect(fenceAfter).toEqual(fenceBefore);
+
+    // No receipt anywhere records the moved HEAD as this promotion's base.
+    const receipts = await store.promotions.find({ jobId }).toArray();
+    for (const receipt of receipts) {
+      expect(receipt.baseCommit).toBe(fenceBefore!.baseCommit);
+      expect(receipt.baseCommit).not.toBe(unrelatedCommit);
+      expect(receipt.status).toBe('prepared');
+      expect(receipt.commitSha).toBeNull();
+    }
+
+    // No reset, no rebase, no promotion commit — HEAD is exactly the
+    // unrelated commit, untouched by the refused retry.
+    expect(await ws.currentCommit()).toBe(unrelatedCommit);
+    expect(await countCommitsWithMarker(ws.root, promotionMarker(fenceBefore!.promotionId))).toBe(0);
+  });
+
+  it('legacy compatibility: a pre-5n prepared receipt with no fence recovers correctly — the fence backfills to the receipt\'s own identity, no replacement receipt', async () => {
+    const projectId = 'proj_5n_legacy_prepared';
+    const jobId = 'job_5n_legacy_prepared';
+    const { candidateRef } = await stageAcceptedJob(projectId, jobId);
+
+    // Hand-construct the pre-5n durable shape directly: a real `prepared`
+    // receipt, deterministically identified exactly as production code
+    // would, but with no fence ever acquired on the job (the job was
+    // promoted, or a promotion was at least prepared, before Phase 5n
+    // existed).
+    const job = await store.jobs.findOne({ _id: jobId });
+    expect(job?.promotionFence ?? null).toBeNull();
+    // The exact same deterministic identity `computePromotionId` (private
+    // to `job-promotion/frontend-backend.ts`) derives — reusing production's
+    // own `contentHash` rather than a second hashing scheme, so this
+    // fixture's `_id` is byte-for-byte what a genuine pre-5n prepared
+    // receipt would have used.
+    const legacyPromotionId = contentHash({
+      projectId,
+      jobId,
+      attempt: job!.attempt,
+      outputName: candidateRef.name,
+      outputVersion: candidateRef.version,
+      outputContentHash: candidateRef.contentHash ?? null,
+    });
+    await store.promotions.insertOne({
+      _id: legacyPromotionId,
+      projectId,
+      jobId,
+      attempt: job!.attempt,
+      output: candidateRef,
+      baseCommit: null,
+      status: 'prepared',
+      commitSha: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const result = await promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps());
+    expect(result.promotionId).toBe(legacyPromotionId);
+    expect(await store.promotions.countDocuments({ jobId })).toBe(1);
+
+    const fenced = await store.jobs.findOne({ _id: jobId });
+    expect(fenced?.promotionFence?.promotionId).toBe(legacyPromotionId);
+    expect(fenced?.promotionFence?.baseCommit).toBeNull();
+
+    const record = await store.promotions.findOne({ jobId });
+    expect(record?.status).toBe('committed');
+  });
+
+  it('legacy compatibility: a committed receipt with its Git marker already present, no fence, stays idempotent', async () => {
+    const projectId = 'proj_5n_legacy_committed';
+    const jobId = 'job_5n_legacy_committed';
+    await stageAcceptedJob(projectId, jobId);
+
+    // First promotion happens for real, through the genuine production
+    // path — this is what "committed, marker present" durable state
+    // actually looks like once produced.
+    const first = await promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps());
+    const ws = await canonicalWorkspace(projectId);
+    expect(await countCommitsWithMarker(ws.root, promotionMarker(first.promotionId))).toBe(1);
+
+    // Simulate "no fence" pre-5n durable state by clearing the one this
+    // process's own first call just wrote — the receipt/marker pairing
+    // alone is what a truly legacy committed promotion would have.
+    await store.jobs.updateOne({ _id: jobId }, { $set: { promotionFence: null } });
+
+    const replay = await promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps());
+    expect(replay.commitSha).toBe(first.commitSha);
+    expect(await countCommitsWithMarker(ws.root, promotionMarker(first.promotionId))).toBe(1);
+    expect(await store.promotions.countDocuments({ jobId })).toBe(1);
+
+    // The replay backfills a fence matching the receipt's own identity —
+    // never a second receipt, never a second commit.
+    const fenced = await store.jobs.findOne({ _id: jobId });
+    expect(fenced?.promotionFence?.promotionId).toBe(first.promotionId);
+  });
+
+  it('the fence never expires and is never cleared by a later platform failure', async () => {
+    const projectId = 'proj_5n_fence_survives_failure';
+    const jobId = 'job_5n_fence_survives_failure';
+    await stageAcceptedJob(projectId, jobId);
+
+    const spy = mockPromotionsInsertCrash('simulated platform failure after fence acquisition');
+    await expect(promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps())).rejects.toThrow('simulated platform failure');
+    spy.mockRestore();
+
+    const fenceAfterFailure = (await store.jobs.findOne({ _id: jobId }))?.promotionFence;
+    expect(fenceAfterFailure).not.toBeNull();
+    const acquiredAt = fenceAfterFailure!.acquiredAt.getTime();
+
+    // Time passing, and further calls, change nothing about the fence's
+    // own identity — there is no expiry, no heartbeat, no auto-release.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const stillThere = (await store.jobs.findOne({ _id: jobId }))?.promotionFence;
+    expect(stillThere?.acquiredAt.getTime()).toBe(acquiredAt);
+    expect(stillThere?.promotionId).toBe(fenceAfterFailure!.promotionId);
   });
 });

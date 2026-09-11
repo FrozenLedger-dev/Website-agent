@@ -25,7 +25,12 @@
 import { userInfo } from 'node:os';
 import { StateStore } from '@statxai/state';
 import { JobEngine } from '@statxai/job-engine';
-import { abandonFrontendBackendBuild } from '@statxai/orchestrator';
+import {
+  abandonFrontendBackendBuild,
+  FrontendBackendBuildPromotionOwned,
+  FrontendBackendBuildAbandonmentDownstreamDependency,
+  FrontendBackendBuildAbandonmentPromotionEvidenceConflict,
+} from '@statxai/orchestrator';
 
 const [projectId, bindingId, ...reasonParts] = process.argv.slice(2);
 const reason = reasonParts.join(' ');
@@ -40,7 +45,24 @@ const actor = `operator:${userInfo().username}`;
 const store = await StateStore.connect();
 try {
   const engine = new JobEngine(store);
-  const result = await abandonFrontendBackendBuild({ projectId, bindingId, actor, reason }, { store, engine });
+  let result;
+  try {
+    result = await abandonFrontendBackendBuild({ projectId, bindingId, actor, reason }, { store, engine });
+  } catch (error) {
+    if (error instanceof FrontendBackendBuildPromotionOwned) {
+      console.error(`\n  Cannot abandon: promotion already owns this build (${error.message}).\n  Wait for it to finish, or escalate — Phase 5n does not revoke promotion authority.\n`);
+      process.exit(1);
+    }
+    if (error instanceof FrontendBackendBuildAbandonmentDownstreamDependency) {
+      console.error(`\n  Cannot abandon: another job already depends on this one's acceptance (${error.message}).\n  This capability does not revoke a dependency graph.\n`);
+      process.exit(1);
+    }
+    if (error instanceof FrontendBackendBuildAbandonmentPromotionEvidenceConflict) {
+      console.error(`\n  Cannot abandon: this build already has promotion evidence on record (${error.message}).\n`);
+      process.exit(1);
+    }
+    throw error;
+  }
 
   console.log(`\n  project   ${projectId}`);
   console.log(`  binding   ${result.binding._id}`);

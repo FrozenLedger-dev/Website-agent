@@ -4444,8 +4444,140 @@ Phase 5m's own scope boundary names explicitly: make accepted-but-unpromoted
 abandonment safe by introducing a durable promotion authority/fence, so
 Phase 5h cannot begin canonical mutation after an abandonment wins, and
 abandonment cannot win after Phase 5h already owns the fence — without
-inventing a Mongo/filesystem/Git distributed-transaction fiction. Not
-proposed further here; not implemented in this phase.
+inventing a Mongo/filesystem/Git distributed-transaction fiction. This is
+what the section below implements.
+
+## Phase 5n — durable accepted-build promotion fence + safe accepted-state abandonment — **DONE**
+
+Closes the gap Phase 5m left open: an `accepted` job could never be
+abandoned, because nothing durable could tell whether Phase 5h had already
+begun canonical publication. Kept intentionally compact — see
+`packages/job-engine/src/engine.ts`, `packages/contracts/src/job.ts`,
+`packages/orchestrator/src/job-promotion/frontend-backend.ts`, and
+`packages/orchestrator/src/run-binding/frontend-backend.ts` for the full
+reasoning in each module's own doc comments.
+
+**The fence.** `JobDocument.promotionFence?: JobPromotionFence | null`
+(`@statxai/contracts`) — `{ promotionId, attempt, candidate, baseCommit,
+acquiredAt }`, stored on the same `JobDocument` promotion and abandonment
+already compete over, rather than a second collection/lock. `undefined`
+and `null` both mean "no fence" (a legacy pre-5n document simply lacks the
+key; the Mongo guard `{ promotionFence: null }` matches both by Mongo's
+own semantics). **Durable, not a lease** — no `expiresAt`, no heartbeat, no
+`releasePromotionFence`; once acquired it is permanent evidence, because
+canonical filesystem/Git mutation may already have happened by the time
+anything reads it again. `accepted -> superseded` is now a legal table
+entry (`contracts/src/job.ts`), but only the one narrow, fence-checked
+`JobEngine` method below actually offers it — the generic `supersede()`'s
+own guarded filter still never names `accepted`, unchanged since Phase 5m.
+
+**`JobEngine.acquirePromotionFence(jobId, { promotionId, attempt, candidate,
+baseCommit, actor, now?, session? })`** — legal only from `state:
+'accepted'`. First call: durably writes the fence, guarded atomically on
+`{ state: 'accepted', attempt, promotionFence: null }`, after re-verifying
+`attempt`/`candidate` against the job's own current durable state
+(`PromotionFenceBindingConflict` otherwise). Exact-same-fence replay is a
+read-only no-op (same `acquiredAt`, no duplicate audit) — safe to call on
+every promotion attempt, including a pure replay of an already-`committed`
+historical promotion, which is what makes this double as "re-prove fence
+ownership before touching the canonical tree again." A genuinely different
+fence already present: `PromotionFenceConflict`, never overwritten.
+**`JobEngine.supersedeAcceptedBeforePromotion(jobId, actor, { reason,
+bindingId?, now?, session? })`** — the one place `accepted -> superseded`
+actually happens: guarded on `{ state: 'accepted', promotionFence: null }`;
+a fence already present fails with `PromotionFenceOwned`. Both share
+`supersede()`'s existing audit/session/reason conventions exactly — no
+second audit pipeline.
+
+**Phase 5h's new sequence** (`promoteAcceptedFrontendBackendCandidate`):
+prove the accepted job/candidate (unchanged) → read-only preflight for an
+existing receipt (its `baseCommit`, if any, is authoritative — never
+re-read from HEAD, so a legacy receipt and its backfilled fence can never
+disagree) → **acquire the fence** → only then create a new `prepared`
+receipt if none existed → unchanged marker lookup/materialise/commit/
+finalise. The fence acquisition is what serialises promotion against
+accepted-state abandonment: a stale invocation whose job abandonment
+already superseded fails right there, with a `JobStateConflict`, before a
+receipt is ever created or a single file touched. `FrontendBackendPromotionDeps`
+gained one field, `engine: JobEngine`.
+
+**Accepted-state abandonment** (`abandonFrontendBackendBuild`, `run-binding/
+frontend-backend.ts`) — Phase 5m's blanket "accepted always fails" is
+narrowed: an accepted job may now be abandoned when, in order, (1) no
+existing `JobPromotionRecord` exists at all (Phase 5m's own check,
+preserved — this is what still protects a legacy job promoted before a
+fence was ever backfilled onto it), (2) no `promotionFence`
+(`FrontendBackendBuildPromotionOwned` otherwise — the dedicated error the
+brief asked for), (3) no downstream job already depends on it
+(`FrontendBackendBuildAbandonmentDownstreamDependency` — Phase 5n does not
+recursively revoke a dependency graph). Only then:
+`supersedeAcceptedBeforePromotion`, in the same transaction as the
+binding's own `prepared -> abandoned`. `FrontendBackendBuildAbandonmentAcceptedConflict`
+(Phase 5m's blanket rejection) is retired — nothing throws it any more.
+The accepted candidate's `acceptedAt` is never touched either way; only the
+job that held it becomes `superseded`, so it can never again reach
+promotion through that job.
+
+**The race, resolved by MongoDB's own transaction conflict/retry — no
+extra locking.** Both sides read the job fresh inside their own
+transaction and guard their write on what they just read: whichever
+transaction commits first durably wins, and the loser's retried read sees
+the winner's result and fails closed (abandonment sees the fence and
+throws `FrontendBackendBuildPromotionOwned`; promotion sees `state !==
+'accepted'` and throws `JobStateConflict`). Verified three ways: each
+ordering pinned deterministically, plus one real `Promise.allSettled` race
+against genuine concurrent Mongo transactions — the forbidden combination
+(abandoned binding + any successful new promotion) is checked directly,
+not inferred from timing.
+
+**Legacy compatibility, verified not assumed.** A pre-5n `prepared` receipt
+with no fence: Phase 5h backfills a fence matching the receipt's own
+identity exactly and continues — no replacement receipt. A `committed`
+receipt with its marker already in history, no fence: stays idempotent,
+backfills the same way, no duplicate commit. Both are still blocked from
+accepted-state abandonment by the unmodified promotion-evidence check
+regardless of whether a fence was ever backfilled onto them.
+
+**Scope held exactly where the brief drew it:** no HTTP abandonment
+endpoint (the console still has no authentication — unchanged gap, not
+addressed here); `scripts/abandon-build.ts` gained three caught-error
+messages for the new domain errors, nothing else; no Luna; no deployment
+change; no change to Phase 5g-1/5g-2, Phase 5k binding identity, Phase 5l
+configuration/defaults, or `runProject`'s own default.
+
+**Tests: net +26 (954 → 980), across the same 53 files — no test file was
+added or removed.** +1 unit (`packages/contracts/test/job.test.ts`: the
+`accepted -> superseded` transition is now structurally legal, so the two
+tests asserting the opposite were replaced by three) and +25 integration:
+`JobEngine`'s `acquirePromotionFence`/`supersedeAcceptedBeforePromotion`
+(+13 — note `packages/job-engine/test/engine.test.ts` runs in the
+*integration* suite, not the unit one, per `vitest.integration.config.ts`'s
+own named-includes list), the Phase 5h fence sequence including both
+mandatory crash scenarios and both legacy-receipt shapes (+6), and
+accepted-state abandonment's four outcomes plus the three mandatory race
+scenarios — abandonment-first, promotion-first, and the real concurrent
+race (+6, net of the single blanket "accepted always fails" test Phase 5n
+replaced). Full regression suite (5h/5i/5k/5l/5m) green throughout,
+including two pre-existing Phase 5h tests whose `Collection.prototype`
+crash-simulation mocks had to be narrowed to their exact intended
+collection once Phase 5n added an earlier `findOneAndUpdate` call
+(`jobs`, inside `acquirePromotionFence`) that a collection-agnostic
+`mockImplementationOnce` would otherwise have caught instead.
+
+Mutation-tested: fence-before-mutation ordering, the four fail-closed
+guards (state, attempt/candidate binding, foreign fence, accepted-only
+supersession), idempotent replay, and the accepted-abandonment gate
+sequence (evidence check, fence check, dependency check) — see the
+completion report for the exact list and kill results.
+
+**Explicitly:** Phase 5n serializes accepted-build abandonment and
+canonical promotion through one durable promotion fence, stored on the
+job. Phase 5h cannot begin canonical publication unless the authoritative
+accepted job owns the exact expected fence. The fence never expires and is
+never cleared automatically. The canonical base commit lives inside the
+fence so a restart can never silently adopt a different HEAD. Accepted
+candidate history remains intact after abandonment. No replacement build,
+no HTTP endpoint, no Luna, no deployment change.
 
 ## Phases 6–17
 

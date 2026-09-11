@@ -19,17 +19,26 @@ describe('job state machine', () => {
     expect(canTransition('validating', 'accepted')).toBe(true);
   });
 
-  it('treats accepted as terminal', () => {
-    for (const to of ['ready', 'running', 'failed', 'blocked', 'superseded'] as const) {
+  it('treats accepted as terminal except for the one Phase 5n supersession edge', () => {
+    for (const to of ['ready', 'running', 'failed', 'blocked'] as const) {
       expect(canTransition('accepted', to)).toBe(false);
     }
   });
 
-  it('permits superseding every pre-acceptance state, and forbids superseding accepted (Phase 5m)', () => {
+  it('permits superseding every pre-acceptance state (Phase 5m)', () => {
     for (const from of ['draft', 'ready', 'running', 'validating', 'failed', 'repair_requested', 'blocked'] as const) {
       expect(canTransition(from, 'superseded')).toBe(true);
     }
-    expect(canTransition('accepted', 'superseded')).toBe(false);
+  });
+
+  it('permits superseding accepted structurally (Phase 5n) — the actual guard lives in JobEngine, not this table', () => {
+    // This table only says the edge is *legal*. `JobEngine.supersede()`'s
+    // own guarded filter still never names `accepted` as a source state
+    // (unchanged since Phase 5m), and the narrow primitive that does offer
+    // this edge (`supersedeAcceptedBeforePromotion`) additionally requires
+    // no promotion fence to be present — neither of which this pure
+    // state-machine table can express or enforce.
+    expect(canTransition('accepted', 'superseded')).toBe(true);
   });
 
   it('treats superseded as terminal — no state may be reached from it', () => {

@@ -373,6 +373,7 @@ export function createFrontendBackendLifecycleCoordinator(
         const promotion = await promoteAcceptedFrontendBackendCandidate(job._id, {
           store: deps.store,
           registry: deps.registry,
+          engine: deps.engine,
           workspacesRoot: deps.workspacesRoot,
         });
         return {

@@ -11,6 +11,9 @@ import {
   JobLeaseConflict,
   JobNotFound,
   JobStateConflict,
+  PromotionFenceBindingConflict,
+  PromotionFenceConflict,
+  PromotionFenceOwned,
 } from '../src/index.js';
 
 const PROJECT = 'proj_engine_test';
@@ -1134,5 +1137,188 @@ describe('supersede (Phase 5m)', () => {
     await engine.supersede('job_base', 'operator:alice', { reason: REASON });
 
     expect(await engine.claim('worker-1', TERRA, { jobId: 'job_dependent' })).toBeNull();
+  });
+});
+
+describe('acquirePromotionFence (Phase 5n)', () => {
+  const CANDIDATE = { name: 'job-output/job_a/1/candidate', version: 1 };
+  const PROMOTER = 'harness:promoter';
+
+  async function acceptedJob(jobId = 'job_a') {
+    await engine.enqueue({ spec: spec(jobId, [`src/${jobId}.tsx`]), origin: { kind: 'plan' } });
+    const claimed = await engine.claim('worker-1', TERRA, { jobId });
+    await engine.submitForValidation(jobId, 'worker-1', claimed!.attempt, { outputs: [CANDIDATE] });
+    return engine.accept(jobId, 'harness:validator');
+  }
+
+  it('acquires the first fence: state stays accepted, every field exact, acquiredAt persisted', async () => {
+    const job = await acceptedJob();
+    const fenced = await engine.acquirePromotionFence('job_a', {
+      promotionId: 'promo_1',
+      attempt: job.attempt,
+      candidate: CANDIDATE,
+      baseCommit: 'deadbeef',
+      actor: PROMOTER,
+    });
+
+    expect(fenced.state).toBe('accepted');
+    expect(fenced.promotionFence).toEqual({
+      promotionId: 'promo_1',
+      attempt: job.attempt,
+      candidate: CANDIDATE,
+      baseCommit: 'deadbeef',
+      acquiredAt: fenced.promotionFence?.acquiredAt,
+    });
+    expect(fenced.promotionFence?.acquiredAt).toBeInstanceOf(Date);
+
+    const stored = await store.jobs.findOne({ _id: 'job_a' });
+    expect(stored?.promotionFence?.promotionId).toBe('promo_1');
+  });
+
+  it('supports a null baseCommit for a project\'s first-ever commit', async () => {
+    const job = await acceptedJob();
+    const fenced = await engine.acquirePromotionFence('job_a', {
+      promotionId: 'promo_1',
+      attempt: job.attempt,
+      candidate: CANDIDATE,
+      baseCommit: null,
+      actor: PROMOTER,
+    });
+    expect(fenced.promotionFence?.baseCommit).toBeNull();
+  });
+
+  it('state guard: only accepted may acquire — validating and superseded both reject', async () => {
+    await engine.enqueue({ spec: spec('job_validating', ['src/v.tsx']), origin: { kind: 'plan' } });
+    const claimed = await engine.claim('worker-1', TERRA, { jobId: 'job_validating' });
+    await engine.submitForValidation('job_validating', 'worker-1', claimed!.attempt, { outputs: [CANDIDATE] });
+    await expect(
+      engine.acquirePromotionFence('job_validating', { promotionId: 'p', attempt: 1, candidate: CANDIDATE, baseCommit: null, actor: PROMOTER }),
+    ).rejects.toBeInstanceOf(JobStateConflict);
+
+    await engine.enqueue({ spec: spec('job_superseded', ['src/s.tsx']), origin: { kind: 'plan' } });
+    await engine.supersede('job_superseded', 'operator:alice', { reason: 'x' });
+    await expect(
+      engine.acquirePromotionFence('job_superseded', { promotionId: 'p', attempt: 0, candidate: CANDIDATE, baseCommit: null, actor: PROMOTER }),
+    ).rejects.toBeInstanceOf(JobStateConflict);
+  });
+
+  it('rejects a wrong attempt or a stale candidate — no fence written', async () => {
+    const job = await acceptedJob();
+
+    await expect(
+      engine.acquirePromotionFence('job_a', { promotionId: 'promo_1', attempt: job.attempt + 1, candidate: CANDIDATE, baseCommit: null, actor: PROMOTER }),
+    ).rejects.toBeInstanceOf(PromotionFenceBindingConflict);
+    await expect(
+      engine.acquirePromotionFence('job_a', {
+        promotionId: 'promo_1',
+        attempt: job.attempt,
+        candidate: { name: 'job-output/job_a/1/different-candidate', version: 1 },
+        baseCommit: null,
+        actor: PROMOTER,
+      }),
+    ).rejects.toBeInstanceOf(PromotionFenceBindingConflict);
+
+    const stored = await store.jobs.findOne({ _id: 'job_a' });
+    expect(stored?.promotionFence ?? null).toBeNull();
+  });
+
+  it('the exact same fence replays idempotently — acquiredAt unchanged, one fence, no duplicate audit', async () => {
+    const job = await acceptedJob();
+    const first = await engine.acquirePromotionFence('job_a', { promotionId: 'promo_1', attempt: job.attempt, candidate: CANDIDATE, baseCommit: 'abc', actor: PROMOTER });
+    const second = await engine.acquirePromotionFence('job_a', { promotionId: 'promo_1', attempt: job.attempt, candidate: CANDIDATE, baseCommit: 'abc', actor: PROMOTER });
+
+    expect(second.promotionFence?.acquiredAt.getTime()).toBe(first.promotionFence?.acquiredAt.getTime());
+    const audits = await store.auditLog.countDocuments({ jobId: 'job_a', 'detail.event': 'promotion_fence_acquired' });
+    expect(audits).toBe(1);
+  });
+
+  it('a foreign fence (different promotionId) is refused — the existing fence is unchanged', async () => {
+    const job = await acceptedJob();
+    await engine.acquirePromotionFence('job_a', { promotionId: 'promo_1', attempt: job.attempt, candidate: CANDIDATE, baseCommit: 'abc', actor: PROMOTER });
+
+    await expect(
+      engine.acquirePromotionFence('job_a', { promotionId: 'promo_2', attempt: job.attempt, candidate: CANDIDATE, baseCommit: 'abc', actor: PROMOTER }),
+    ).rejects.toBeInstanceOf(PromotionFenceConflict);
+
+    const stored = await store.jobs.findOne({ _id: 'job_a' });
+    expect(stored?.promotionFence?.promotionId).toBe('promo_1');
+  });
+
+  it('records exactly one audit entry naming the promotionId/attempt/baseCommit', async () => {
+    const job = await acceptedJob();
+    await engine.acquirePromotionFence('job_a', { promotionId: 'promo_1', attempt: job.attempt, candidate: CANDIDATE, baseCommit: 'abc', actor: PROMOTER });
+
+    const event = await store.auditLog.findOne({ jobId: 'job_a', 'detail.event': 'promotion_fence_acquired' });
+    expect(event?.actor).toBe(PROMOTER);
+    expect(event?.detail.promotionId).toBe('promo_1');
+    expect(event?.detail.baseCommit).toBe('abc');
+  });
+});
+
+describe('supersedeAcceptedBeforePromotion (Phase 5n)', () => {
+  const CANDIDATE = { name: 'job-output/job_a/1/candidate', version: 1 };
+
+  async function acceptedJob(jobId = 'job_a') {
+    await engine.enqueue({ spec: spec(jobId, [`src/${jobId}.tsx`]), origin: { kind: 'plan' } });
+    const claimed = await engine.claim('worker-1', TERRA, { jobId });
+    await engine.submitForValidation(jobId, 'worker-1', claimed!.attempt, { outputs: [CANDIDATE] });
+    return engine.accept(jobId, 'harness:validator');
+  }
+
+  it('supersedes an accepted job with no fence', async () => {
+    await acceptedJob();
+    const superseded = await engine.supersedeAcceptedBeforePromotion('job_a', 'operator:alice', { reason: 'x', bindingId: 'binding_x' });
+    expect(superseded.state).toBe('superseded');
+    expect((await store.jobs.findOne({ _id: 'job_a' }))?.state).toBe('superseded');
+  });
+
+  it('rejects a non-accepted job with JobStateConflict', async () => {
+    await engine.enqueue({ spec: spec('job_a', ['src/a.tsx']), origin: { kind: 'plan' } });
+    await expect(
+      engine.supersedeAcceptedBeforePromotion('job_a', 'operator:alice', { reason: 'x' }),
+    ).rejects.toBeInstanceOf(JobStateConflict);
+  });
+
+  it('rejects an accepted job that already owns a fence — PromotionFenceOwned, job stays accepted', async () => {
+    const job = await acceptedJob();
+    await engine.acquirePromotionFence('job_a', { promotionId: 'promo_1', attempt: job.attempt, candidate: CANDIDATE, baseCommit: null, actor: 'harness:promoter' });
+
+    await expect(
+      engine.supersedeAcceptedBeforePromotion('job_a', 'operator:alice', { reason: 'x' }),
+    ).rejects.toBeInstanceOf(PromotionFenceOwned);
+
+    const stored = await store.jobs.findOne({ _id: 'job_a' });
+    expect(stored?.state).toBe('accepted');
+    expect(stored?.promotionFence?.promotionId).toBe('promo_1');
+  });
+
+  it('rejects an empty reason before anything is written', async () => {
+    await acceptedJob();
+    await expect(
+      engine.supersedeAcceptedBeforePromotion('job_a', 'operator:alice', { reason: '  ' }),
+    ).rejects.toBeInstanceOf(InvalidSupersessionReason);
+    expect((await store.jobs.findOne({ _id: 'job_a' }))?.state).toBe('accepted');
+  });
+
+  it('participates in an externally supplied session — an aborted caller transaction leaves the job untouched', async () => {
+    await acceptedJob();
+    await expect(
+      store.withTransaction(async (session) => {
+        await engine.supersedeAcceptedBeforePromotion('job_a', 'operator:alice', { reason: 'x', session });
+        throw new Error('caller aborts after superseding, inside its own transaction');
+      }),
+    ).rejects.toThrow('caller aborts');
+    expect((await store.jobs.findOne({ _id: 'job_a' }))?.state).toBe('accepted');
+  });
+
+  it('never resurrects a superseded-via-this-path job: cannot claim, release, re-accept, or reacquire a fence', async () => {
+    const job = await acceptedJob();
+    await engine.supersedeAcceptedBeforePromotion('job_a', 'operator:alice', { reason: 'x' });
+
+    expect(await engine.claim('worker-1', TERRA, { jobId: 'job_a' })).toBeNull();
+    await expect(engine.release('job_a', 'harness')).rejects.toBeInstanceOf(JobStateConflict);
+    await expect(
+      engine.acquirePromotionFence('job_a', { promotionId: 'promo_1', attempt: job.attempt, candidate: CANDIDATE, baseCommit: null, actor: 'harness:promoter' }),
+    ).rejects.toBeInstanceOf(JobStateConflict);
   });
 });

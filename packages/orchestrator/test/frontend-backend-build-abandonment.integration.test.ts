@@ -34,7 +34,8 @@ import {
   findActivePreparedBinding,
   prepareFrontendBackendBuildBinding,
   ActiveJobLifecycleRollbackConflict,
-  FrontendBackendBuildAbandonmentAcceptedConflict,
+  FrontendBackendBuildPromotionOwned,
+  FrontendBackendBuildAbandonmentDownstreamDependency,
   FrontendBackendBuildAbandonmentPromotionEvidenceConflict,
   FrontendBackendBuildAbandonmentReasonInvalid,
   FrontendBackendBuildBindingNotFound,
@@ -43,6 +44,8 @@ import {
 import { createFrontendBackendCandidateValidator } from '../src/job-validation/frontend-backend.js';
 import { acceptValidatedFrontendBackendCandidate, AcceptanceBindingStale } from '../src/job-acceptance/frontend-backend.js';
 import * as acceptanceModule from '../src/job-acceptance/frontend-backend.js';
+import { promoteAcceptedFrontendBackendCandidate } from '../src/job-promotion/frontend-backend.js';
+import * as promotionModule from '../src/job-promotion/frontend-backend.js';
 import { createFrontendBackendLifecycleCoordinator } from '../src/job-lifecycle/frontend-backend.js';
 
 const PROFILE_REF = { name: 'business-profile', version: 1, contentHash: 'a'.repeat(64) };
@@ -242,22 +245,107 @@ describe('pre-acceptance job states all supersede atomically with the binding', 
   });
 });
 
-describe('accepted job: fails closed, nothing mutated', () => {
-  it('rejects abandonment; binding stays prepared, job stays accepted', async () => {
-    const binding = await makeBinding('proj_5m_accepted');
+/**
+ * Phase 5n narrows Phase 5m's original blanket "accepted is never
+ * abandonable" rule: an accepted job may now be abandoned, but only while
+ * promotion has not yet obtained fence authority over it.
+ */
+describe('accepted job — abandonable only before promotion obtains the fence (Phase 5n)', () => {
+  async function acceptedBindingAndJob(projectId: string) {
+    const binding = await makeBinding(projectId);
     const claimed = await engine.claim('worker-1', 'terra', { jobId: binding.jobId });
-    await engine.submitForValidation(binding.jobId, 'worker-1', claimed!.attempt);
+    const outputs = [{ name: `job-output/${binding.jobId}/1/candidate`, version: 1 }];
+    await engine.submitForValidation(binding.jobId, 'worker-1', claimed!.attempt, { outputs });
     await engine.accept(binding.jobId, 'harness:validator');
+    return binding;
+  }
+
+  it('succeeds when no fence has been acquired: job -> superseded, binding -> abandoned, candidate.acceptedAt untouched', async () => {
+    const projectId = 'proj_5n_accepted_no_fence';
+    const binding = await acceptedBindingAndJob(projectId);
+
+    const result = await abandonFrontendBackendBuild(
+      { projectId, bindingId: binding._id, actor: ACTOR, reason: REASON },
+      { store, engine },
+    );
+    expect(result.outcome).toBe('abandoned');
+
+    expect((await store.jobs.findOne({ _id: binding.jobId }))?.state).toBe('superseded');
+    expect((await store.frontendBackendBuildBindings.findOne({ _id: binding._id }))?.status).toBe('abandoned');
+  });
+
+  it('fails closed once a promotion fence exists — FrontendBackendBuildPromotionOwned, nothing mutated', async () => {
+    const projectId = 'proj_5n_accepted_fenced';
+    const binding = await acceptedBindingAndJob(projectId);
+    const job = await store.jobs.findOne({ _id: binding.jobId });
+
+    await engine.acquirePromotionFence(binding.jobId, {
+      promotionId: 'promo_fence_fixture',
+      attempt: job!.attempt,
+      candidate: job!.executionOutputs![0]!,
+      baseCommit: null,
+      actor: 'harness:promoter',
+    });
 
     await expect(
-      abandonFrontendBackendBuild(
-        { projectId: 'proj_5m_accepted', bindingId: binding._id, actor: ACTOR, reason: REASON },
-        { store, engine },
-      ),
-    ).rejects.toBeInstanceOf(FrontendBackendBuildAbandonmentAcceptedConflict);
+      abandonFrontendBackendBuild({ projectId, bindingId: binding._id, actor: ACTOR, reason: REASON }, { store, engine }),
+    ).rejects.toBeInstanceOf(FrontendBackendBuildPromotionOwned);
+
+    const after = await store.jobs.findOne({ _id: binding.jobId });
+    expect(after?.state).toBe('accepted');
+    expect(after?.promotionFence?.promotionId).toBe('promo_fence_fixture');
+    expect((await store.frontendBackendBuildBindings.findOne({ _id: binding._id }))?.status).toBe('prepared');
+  });
+
+  it('legacy pre-5n promotion evidence (no fence) still blocks abandonment', async () => {
+    const projectId = 'proj_5n_accepted_legacy_evidence';
+    const binding = await acceptedBindingAndJob(projectId);
+    await store.promotions.insertOne({
+      _id: 'promo_legacy_fixture',
+      projectId,
+      jobId: binding.jobId,
+      attempt: 1,
+      output: { name: 'job-output/x/1/candidate', version: 1 },
+      baseCommit: null,
+      status: 'committed',
+      commitSha: 'deadbeef',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    await expect(
+      abandonFrontendBackendBuild({ projectId, bindingId: binding._id, actor: ACTOR, reason: REASON }, { store, engine }),
+    ).rejects.toBeInstanceOf(FrontendBackendBuildAbandonmentPromotionEvidenceConflict);
 
     expect((await store.jobs.findOne({ _id: binding.jobId }))?.state).toBe('accepted');
     expect((await store.frontendBackendBuildBindings.findOne({ _id: binding._id }))?.status).toBe('prepared');
+  });
+
+  it('fails closed when a downstream job already depends on the accepted job', async () => {
+    const projectId = 'proj_5n_accepted_downstream';
+    const binding = await acceptedBindingAndJob(projectId);
+    await engine.enqueue({
+      spec: {
+        projectId,
+        jobId: 'job_downstream_dependent',
+        role: 'frontend_backend',
+        objective: 'depends on the accepted job',
+        inputs: {},
+        acceptanceCriteria: ['x'],
+        allowedTools: [],
+        output: ['other.tsx'],
+      },
+      origin: { kind: 'plan' },
+      dependsOn: [binding.jobId],
+    });
+
+    await expect(
+      abandonFrontendBackendBuild({ projectId, bindingId: binding._id, actor: ACTOR, reason: REASON }, { store, engine }),
+    ).rejects.toBeInstanceOf(FrontendBackendBuildAbandonmentDownstreamDependency);
+
+    expect((await store.jobs.findOne({ _id: binding.jobId }))?.state).toBe('accepted');
+    expect((await store.frontendBackendBuildBindings.findOne({ _id: binding._id }))?.status).toBe('prepared');
+    expect((await store.jobs.findOne({ _id: 'job_downstream_dependent' }))?.state).toBe('ready');
   });
 });
 
@@ -577,6 +665,11 @@ vi.mock('../src/job-acceptance/frontend-backend.js', async (importOriginal) => {
   return { ...actual, acceptValidatedFrontendBackendCandidate: vi.fn(actual.acceptValidatedFrontendBackendCandidate) };
 });
 
+vi.mock('../src/job-promotion/frontend-backend.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof promotionModule>();
+  return { ...actual, promoteAcceptedFrontendBackendCandidate: vi.fn(actual.promoteAcceptedFrontendBackendCandidate) };
+});
+
 const issue = (over: Partial<ReviewIssue> = {}): ReviewIssue => ({
   id: 'QA-004',
   category: 'accessibility',
@@ -782,6 +875,10 @@ function coordinatorDeps() {
     workspacesRoot,
     validationWorkspacesRoot,
   };
+}
+
+function promotionDeps() {
+  return { store, registry, engine, workspacesRoot };
 }
 
 const launchLegacy = async (projectId: string) => {
@@ -1059,5 +1156,110 @@ describe('legacy rollback interacts correctly with abandonment', () => {
     const stored = await store.frontendBackendBuildBindings.findOne({ _id: binding!._id });
     expect(stored?.status).toBe('abandoned');
     expect(stored?.abandonedBy).toBe(ACTOR);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mandatory: accepted-abandonment vs. Phase 5h promotion-fence race
+// ---------------------------------------------------------------------------
+
+/** Drive the real coordinator to exactly `accepted`, with no promotion ever attempted — a controlled stop, not a fabrication of durable state. */
+async function acceptedBindingAndSpec(projectId: string) {
+  const { spec, binding } = await makeRealBindingAndSpec(projectId);
+  const coordinator = createFrontendBackendLifecycleCoordinator(coordinatorDeps());
+  vi.mocked(promotionModule.promoteAcceptedFrontendBackendCandidate).mockImplementationOnce(async () => {
+    throw new Error('stop exactly at accepted, before any promotion attempt');
+  });
+  await expect(coordinator.run(spec)).rejects.toThrow('stop exactly at accepted');
+  const job = await store.jobs.findOne({ _id: spec.jobId });
+  expect(job?.state).toBe('accepted');
+  expect(job?.promotionFence ?? null).toBeNull();
+  return { spec, binding };
+}
+
+describe('accepted abandonment wins before Phase 5h ever acquires a fence', () => {
+  it('MANDATORY: a stale Phase 5h invocation loses at fence acquisition, before any receipt or canonical write', async () => {
+    const projectId = 'proj_5n_abandon_wins';
+    const { binding } = await acceptedBindingAndSpec(projectId);
+
+    const abandonResult = await abandonFrontendBackendBuild(
+      { projectId, bindingId: binding._id, actor: ACTOR, reason: REASON },
+      { store, engine },
+    );
+    expect(abandonResult.outcome).toBe('abandoned');
+    expect((await store.jobs.findOne({ _id: binding.jobId }))?.state).toBe('superseded');
+
+    // The stale, already-in-flight Phase 5h attempt continues regardless —
+    // exactly what a real concurrent process would do — and must lose at
+    // fence acquisition, before touching Mongo's promotion collection or
+    // the canonical Git tree.
+    await expect(promoteAcceptedFrontendBackendCandidate(binding.jobId, promotionDeps())).rejects.toThrow();
+
+    expect(await store.promotions.countDocuments({ jobId: binding.jobId })).toBe(0);
+    expect((await canonicalCommitSubjects(projectId)).some((s) => s.includes('Promote accepted'))).toBe(false);
+  });
+});
+
+describe('promotion wins by acquiring the fence first', () => {
+  it('MANDATORY: abandonment then fails closed, and promotion can still continue/recover', async () => {
+    const projectId = 'proj_5n_promotion_wins';
+    const { spec, binding } = await acceptedBindingAndSpec(projectId);
+
+    // Promotion acquires the fence for real (the mock above only fires
+    // once, already consumed) and completes.
+    const promoted = await promoteAcceptedFrontendBackendCandidate(binding.jobId, promotionDeps());
+    expect(promoted.commitSha).toBeTruthy();
+
+    await expect(
+      abandonFrontendBackendBuild({ projectId, bindingId: binding._id, actor: ACTOR, reason: REASON }, { store, engine }),
+    ).rejects.toThrow();
+
+    const job = await store.jobs.findOne({ _id: binding.jobId });
+    expect(job?.state).toBe('accepted');
+    expect(job?.promotionFence?.promotionId).toBe(promoted.promotionId);
+    expect((await store.frontendBackendBuildBindings.findOne({ _id: binding._id }))?.status).toBe('prepared');
+
+    // Promotion "continuing/recovering" — a pure idempotent replay still
+    // works, untouched by the refused abandonment attempt.
+    const replay = await promoteAcceptedFrontendBackendCandidate(binding.jobId, promotionDeps());
+    expect(replay.commitSha).toBe(promoted.commitSha);
+    void spec;
+  });
+});
+
+describe('a real concurrent race between accepted abandonment and Phase 5h', () => {
+  it('MANDATORY: produces exactly one of the two valid authorities, never both', async () => {
+    const projectId = 'proj_5n_real_race';
+    const { binding } = await acceptedBindingAndSpec(projectId);
+
+    const [abandonResult, promoteResult] = await Promise.allSettled([
+      abandonFrontendBackendBuild({ projectId, bindingId: binding._id, actor: ACTOR, reason: REASON }, { store, engine }),
+      promoteAcceptedFrontendBackendCandidate(binding.jobId, promotionDeps()),
+    ]);
+
+    const job = await store.jobs.findOne({ _id: binding.jobId });
+    const bindingAfter = await store.frontendBackendBuildBindings.findOne({ _id: binding._id });
+    const promotionCount = await store.promotions.countDocuments({ jobId: binding.jobId });
+
+    // Forbidden combinations, checked directly rather than inferred from
+    // which promise settled which way.
+    expect(bindingAfter?.status === 'abandoned' && promotionCount > 0).toBe(false);
+    expect(job?.state === 'superseded' && promotionCount > 0).toBe(false);
+    expect(bindingAfter?.status === 'abandoned' && job?.promotionFence != null).toBe(false);
+
+    if (bindingAfter?.status === 'abandoned') {
+      // Authority A: abandonment won.
+      expect(job?.state).toBe('superseded');
+      expect(promotionCount).toBe(0);
+      expect(promoteResult.status).toBe('rejected');
+    } else {
+      // Authority B: promotion won the fence (whether or not it finished
+      // committing before the race resolved is immaterial — owning the
+      // fence is what "won" means, per the brief).
+      expect(bindingAfter?.status).toBe('prepared');
+      expect(job?.state).toBe('accepted');
+      expect(job?.promotionFence).not.toBeNull();
+      expect(abandonResult.status).toBe('rejected');
+    }
   });
 });

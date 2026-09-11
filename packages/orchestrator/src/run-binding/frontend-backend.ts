@@ -557,33 +557,46 @@ export class FrontendBackendBuildAbandonmentJobMismatch extends Error {
 
 /**
  * The exact bound job is already `accepted`. Phase 5m's own scope boundary
- * (see `docs/upgrade-status.md`'s Phase 5m section): an accepted job may
- * already be entering Phase 5h's canonical promotion path, and a Mongo-only
- * "supersede accepted" write cannot safely prove that promotion has not
- * already crossed from Mongo authority into filesystem/Git mutation.
- * Revoking an accepted-but-unpromoted build needs a dedicated promotion
- * fence this phase does not add — see Phase 5n. The binding stays
- * `prepared`; the job stays `accepted`; nothing here is mutated.
+ * (see `docs/upgrade-status.md`'s Phase 5m section). Phase 5n narrows this:
+ * an accepted job *may* now be abandoned, but only while promotion has not
+ * yet obtained the durable fence that proves it owns canonical publication
+ * authority — see {@link FrontendBackendBuildPromotionOwned} below for the
+ * case where it already has.
  */
-export class FrontendBackendBuildAbandonmentAcceptedConflict extends Error {
-  constructor(projectId: string, bindingId: string, jobId: string) {
+
+/**
+ * The exact bound job is `accepted` and already owns a durable promotion
+ * fence (Phase 5n, `JobPromotionFence` — `@statxai/contracts`) — promotion
+ * has already obtained authority over it, so abandonment loses and must
+ * not touch either the job or the binding. This is not "Git hasn't
+ * happened yet, so it's safe" — the fence itself, not any canonical
+ * filesystem/Git evidence, is what promotion authority means; it may exist
+ * before a single file has been written. The binding stays `prepared`; the
+ * job stays `accepted`; the fence is never cleared or modified.
+ */
+export class FrontendBackendBuildPromotionOwned extends Error {
+  constructor(projectId: string, bindingId: string, jobId: string, promotionId: string) {
     super(
-      `project "${projectId}" binding "${bindingId}": job "${jobId}" is already accepted; refusing to abandon — ` +
-        `accepted-but-unpromoted revocation is out of scope for this capability (see Phase 5n)`,
+      `project "${projectId}" binding "${bindingId}": job "${jobId}" is accepted and already owns promotion fence ` +
+        `"${promotionId}"; refusing to abandon — promotion already holds authority over it`,
     );
-    this.name = 'FrontendBackendBuildAbandonmentAcceptedConflict';
+    this.name = 'FrontendBackendBuildPromotionOwned';
   }
 }
 
 /**
- * A `JobPromotionRecord` already exists for the exact bound job, even
- * though abandonment was requested. This should normally correlate with the
- * job already being `accepted` (caught by
- * {@link FrontendBackendBuildAbandonmentAcceptedConflict} first) — reaching
- * this instead means durable state disagrees with itself, which is
- * control-plane inconsistency to report, never permission to clean up.
- * Phase 5m never reads this as license to modify or delete promotion
- * evidence.
+ * A `JobPromotionRecord` already exists for the exact bound job, regardless
+ * of its current state or whether it owns a `promotionFence`. This is
+ * Phase 5m's own original check, preserved unchanged for backward
+ * compatibility with durable state written before Phase 5n's fence
+ * existed: a legacy `prepared`/`committed` receipt is already promotion
+ * evidence in its own right, and must continue to block abandonment even
+ * though no fence was ever backfilled onto the job that produced it. For
+ * fence-bearing jobs this fires only as defense in depth — normally
+ * {@link FrontendBackendBuildPromotionOwned} (checked first, for `accepted`
+ * jobs) already caught it. Reaching this for a job that is *not* accepted,
+ * or has no fence, means durable state disagrees with itself: control-plane
+ * inconsistency to report, never permission to clean up.
  */
 export class FrontendBackendBuildAbandonmentPromotionEvidenceConflict extends Error {
   constructor(projectId: string, bindingId: string, jobId: string) {
@@ -592,6 +605,24 @@ export class FrontendBackendBuildAbandonmentPromotionEvidenceConflict extends Er
         `abandon — contradictory durable state, not repaired here`,
     );
     this.name = 'FrontendBackendBuildAbandonmentPromotionEvidenceConflict';
+  }
+}
+
+/**
+ * The exact bound `accepted` job already has another `JobDocument`
+ * depending on it (`dependsOn`) — `JobEngine.dependenciesSatisfied` may
+ * already be treating this job's acceptance as having authorised that
+ * dependent to run. Phase 5n does not attempt to recursively revoke a
+ * dependency graph; it fails closed instead, leaving the accepted job,
+ * its dependent, and the binding exactly as they were.
+ */
+export class FrontendBackendBuildAbandonmentDownstreamDependency extends Error {
+  constructor(projectId: string, bindingId: string, jobId: string, dependentJobId: string) {
+    super(
+      `project "${projectId}" binding "${bindingId}": job "${jobId}" has a downstream dependent ("${dependentJobId}"); ` +
+        `refusing to abandon — Phase 5n does not revoke a dependency graph`,
+    );
+    this.name = 'FrontendBackendBuildAbandonmentDownstreamDependency';
   }
 }
 
@@ -658,7 +689,8 @@ export type FrontendBackendBuildAbandonmentResult =
 /**
  * Explicitly, durably abandon exactly one active `frontend_backend` build
  * binding, and — atomically, in the same Mongo transaction — permanently
- * supersede its pre-acceptance job if one was ever enqueued (Phase 5m).
+ * supersede its job if one was ever enqueued (Phase 5m; extended to
+ * `accepted` jobs by Phase 5n).
  *
  * No automatic trigger exists anywhere for this: not a timeout, not a lease
  * expiry, not `retry_ready`/`validation_failed`/`failed`/`repair_requested`.
@@ -678,39 +710,54 @@ export type FrontendBackendBuildAbandonmentResult =
  *      corrupt binding is never abandoned blindly. Then, if `binding.jobId`
  *      names an existing `JobDocument`: verify it actually describes this
  *      binding's own request (project, role, exact `JobSpec`); fail closed
- *      on {@link FrontendBackendBuildAbandonmentAcceptedConflict} if it is
- *      already `accepted`, or on
- *      {@link FrontendBackendBuildAbandonmentPromotionEvidenceConflict} if a
- *      `JobPromotionRecord` already exists for it regardless of state; then
- *      `engine.supersede(...)`, in this same session. If no `JobDocument`
- *      exists yet (Phase 5k's own crash point — a binding prepared before
- *      Phase 5i ever enqueued), nothing is superseded and none is invented.
+ *      on {@link FrontendBackendBuildAbandonmentPromotionEvidenceConflict}
+ *      if a `JobPromotionRecord` already exists for it, regardless of
+ *      state (Phase 5m's own check, preserved for legacy pre-fence
+ *      receipts). Then, for an `accepted` job specifically (Phase 5n): fail
+ *      closed on {@link FrontendBackendBuildPromotionOwned} if it already
+ *      owns a `promotionFence`, or on
+ *      {@link FrontendBackendBuildAbandonmentDownstreamDependency} if
+ *      another job already depends on it; otherwise
+ *      `engine.supersedeAcceptedBeforePromotion(...)`. For every other
+ *      pre-acceptance state, the unchanged `engine.supersede(...)`. If no
+ *      `JobDocument` exists yet (Phase 5k's own crash point — a binding
+ *      prepared before Phase 5i ever enqueued), nothing is superseded and
+ *      none is invented.
  *   4. Guarded `prepared -> abandoned`, recording `abandonedAt`/
  *      `abandonedBy`/`abandonmentReason`, in the same transaction as step 3's
  *      job transition — never one without the other, and never partially:
  *      if either write fails, the whole transaction aborts and the previous
  *      state (binding `prepared`, job whatever it was) is preserved exactly.
  *
- * The acceptance-vs-abandonment race (5g-2's own guarded transaction racing
- * this one) is not solved with extra locking — both sides read the job
- * fresh inside their own transaction and guard their write on the state
- * they just read, so MongoDB's own transaction conflict/retry semantics
- * give exactly one of two outcomes: this transaction commits first (job
- * `superseded`, binding `abandoned`, 5g-2's later attempt reads `state !==
- * 'validating'` and throws `AcceptanceBindingStale`), or 5g-2 commits first
- * (job `accepted`; this transaction, retried by the driver, reads that
- * fresh and throws `FrontendBackendBuildAbandonmentAcceptedConflict` — the
- * binding is left exactly `prepared`, for a human to resolve through
- * promotion or a later promotion-fencing capability). The mixed case —
- * binding `abandoned` with the job `accepted` — is not reachable by
- * construction, not merely tested for.
+ * The accepted-abandonment-vs-promotion race (Phase 5h's own
+ * `acquirePromotionFence` call racing this one) is not solved with extra
+ * locking — both sides read the job fresh inside their own transaction and
+ * guard their write on the state/fence they just read, so MongoDB's own
+ * transaction conflict/retry semantics give exactly one of two outcomes:
+ * this transaction commits first (job `superseded`, binding `abandoned`;
+ * Phase 5h's later, retried `acquirePromotionFence` call reads `state !==
+ * 'accepted'` and throws `JobStateConflict`, before any canonical
+ * mutation), or Phase 5h commits first (fence acquired; this transaction,
+ * retried by the driver, reads the fence and throws
+ * {@link FrontendBackendBuildPromotionOwned} — the binding is left exactly
+ * `prepared`, for a human, or a later promotion-fencing capability's own
+ * completion, to resolve). The mixed case — binding `abandoned` with the
+ * job `accepted` and a fence — is not reachable by construction, not
+ * merely tested for. The pre-Phase-5n race against `validating` (5g-2's own
+ * acceptance transaction) still resolves the same way it always did:
+ * `AcceptanceBindingStale` on the losing side, via `engine.supersede`'s
+ * unchanged pre-acceptance guard.
  *
  * What this deliberately never does: delete the binding, the job, any
  * artifact, or any Git history; touch the canonical workspace; call
- * `git reset`/`revert`/commit anything; modify or retire a
- * `JobPromotionRecord`; start a replacement build, discovery, planning, a
- * Terra call, or a Luna call. Abandonment stops after revocation — what
- * happens next is a separate, later, explicit request.
+ * `git reset`/`revert`/commit anything; modify, clear, or retire a
+ * `JobPromotionRecord` or a `promotionFence`; start a replacement build,
+ * discovery, planning, a Terra call, or a Luna call. Abandonment stops
+ * after revocation — what happens next is a separate, later, explicit
+ * request. An accepted candidate's `acceptedAt` is untouched either way —
+ * it remains durable, historical, accepted evidence; only the job that
+ * held it is superseded, so it can never again reach promotion through
+ * that job.
  */
 export async function abandonFrontendBackendBuild(
   input: AbandonFrontendBackendBuildInput,
@@ -743,22 +790,42 @@ export async function abandonFrontendBackendBuild(
         throw new FrontendBackendBuildAbandonmentJobMismatch(binding._id, job._id, 'JobSpec no longer matches the binding\'s stored one');
       }
 
-      // Independent of `job.state`: contradictory durable state is a
-      // control-plane fault, not something abandonment repairs.
+      // Phase 5m's own check, preserved unchanged: independent of
+      // `job.state` or `promotionFence`, existing promotion evidence is
+      // contradictory durable state that abandonment never repairs. This
+      // is what still protects a legacy job promoted before Phase 5n's
+      // fence existed, and never received a backfilled one.
       const promotionEvidence = await deps.store.promotions.findOne({ jobId: job._id }, { session });
       if (promotionEvidence) {
         throw new FrontendBackendBuildAbandonmentPromotionEvidenceConflict(binding.projectId, binding._id, job._id);
       }
-      if (job.state === 'accepted') {
-        throw new FrontendBackendBuildAbandonmentAcceptedConflict(binding.projectId, binding._id, job._id);
-      }
 
-      const superseded = await deps.engine.supersede(job._id, input.actor, {
-        reason,
-        bindingId: binding._id,
-        session,
-      });
-      supersededJobId = superseded._id;
+      if (job.state === 'accepted') {
+        // Phase 5n: an accepted job may be abandoned only while promotion
+        // has not yet obtained fence authority over it, and only while
+        // nothing already depends on its acceptance.
+        const fence = job.promotionFence ?? null;
+        if (fence) {
+          throw new FrontendBackendBuildPromotionOwned(binding.projectId, binding._id, job._id, fence.promotionId);
+        }
+        const dependent = await deps.store.jobs.findOne({ dependsOn: job._id }, { session });
+        if (dependent) {
+          throw new FrontendBackendBuildAbandonmentDownstreamDependency(binding.projectId, binding._id, job._id, dependent._id);
+        }
+        const superseded = await deps.engine.supersedeAcceptedBeforePromotion(job._id, input.actor, {
+          reason,
+          bindingId: binding._id,
+          session,
+        });
+        supersededJobId = superseded._id;
+      } else {
+        const superseded = await deps.engine.supersede(job._id, input.actor, {
+          reason,
+          bindingId: binding._id,
+          session,
+        });
+        supersededJobId = superseded._id;
+      }
     }
 
     const now = new Date();

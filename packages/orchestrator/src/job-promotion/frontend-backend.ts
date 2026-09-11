@@ -32,11 +32,20 @@
 import type { ArtifactRef } from '@statxai/contracts';
 import type { JobDocument, JobPromotionRecord, StateStore } from '@statxai/state';
 import { ProjectWorkspace, contentHash, scaffoldSite, scaffoldTemplatePaths, type ArtifactRegistry } from '@statxai/workspace';
-import { jobOutputNamespace } from '@statxai/job-engine';
+import { jobOutputNamespace, type JobEngine } from '@statxai/job-engine';
 import { CandidateShape } from '../job-validation/frontend-backend.js';
 import type { BuildCandidate } from '../phases/build.js';
 
 const ROLE = 'frontend_backend';
+
+/**
+ * Fixed control-plane identity for every promotion-fence acquisition this
+ * module performs — never the original build worker's id, never
+ * `sol`/`terra`/`luna`. Mirrors `job-acceptance/frontend-backend.ts`'s own
+ * `ACCEPTANCE_ACTOR`: this names *promotion* authority, which the harness
+ * alone holds.
+ */
+export const PROMOTION_FENCE_ACTOR = 'harness:promoter';
 
 export class PromotionJobNotFound extends Error {
   constructor(jobId: string) {
@@ -194,6 +203,7 @@ export class PromotionWorkingTreeDirty extends Error {
 export interface FrontendBackendPromotionDeps {
   readonly store: StateStore;
   readonly registry: ArtifactRegistry;
+  readonly engine: JobEngine;
   /** Root of the canonical, harness-owned project workspaces — never a disposable/validation root. */
   readonly workspacesRoot: string;
 }
@@ -283,34 +293,59 @@ function isDuplicateKeyError(error: unknown): boolean {
  * The recoverable sequence, every step idempotent on retry:
  *
  *   A. resolve + prove the accepted job/candidate (above)
- *   B. create, or recover, the durable promotion record — `prepared`,
- *      binding recorded, `baseCommit` = canonical HEAD at this moment
- *      (`null` is a valid first-build base, not a placeholder). A
- *      project-scoped partial unique index allows at most one `prepared`
- *      record per project; a second, different promotion racing in gets
- *      {@link PromotionInProgress} instead of co-mingling files.
- *   C. search canonical history — the whole of it, not merely HEAD — for a
+ *   B. read-only preflight, in strict authority order (nothing is mutated
+ *      yet): an existing `promotionFence` on the job wins — its
+ *      `baseCommit` *is* this promotion's base; failing that, an existing
+ *      promotion record's own `baseCommit` (the pre-5n durable shape);
+ *      failing both, canonical HEAD, read exactly once. A fresh HEAD read
+ *      never overrides a base that is already durably recorded, so a
+ *      retry can never re-propose the fence against a HEAD that has moved
+ *      since — see step F2, which is where a moved HEAD is actually
+ *      caught.
+ *   C. **acquire the durable promotion fence** (`JobEngine.acquirePromotionFence`,
+ *      Phase 5n) — `promotionId`/`attempt`/`candidate`/`baseCommit`, before
+ *      *anything* canonical is touched and before a brand-new record is
+ *      ever created. This is the one serialisation point against
+ *      accepted-state abandonment (`supersedeAcceptedBeforePromotion`):
+ *      if abandonment already won, the job is no longer `accepted` and
+ *      this throws {@link JobStateConflict} here, before step D — nothing
+ *      after this point ever runs for a job abandonment has already
+ *      revoked. Idempotent: called unconditionally on every invocation,
+ *      including a pure replay of an already-`committed` historical
+ *      promotion, so this doubles as the "re-prove fence ownership" check
+ *      a resumed or restarted invocation needs before it may touch the
+ *      canonical tree again.
+ *   D. create, or recover, the durable promotion record — `prepared`,
+ *      binding recorded, `baseCommit` = the exact value the fence just
+ *      acquired (never re-read independently, so the two can never
+ *      disagree). A project-scoped partial unique index allows at most one
+ *      `prepared` record per project; a second, different promotion racing
+ *      in gets {@link PromotionInProgress} instead of co-mingling files. A
+ *      pre-existing record (Phase 5n's own legacy-compatibility path) is
+ *      never replaced — the fence was acquired using *its* `baseCommit`, so
+ *      the two already agree by construction.
+ *   E. search canonical history — the whole of it, not merely HEAD — for a
  *      commit carrying this promotion's exact marker.
- *   D1. found: verify it agrees with the record (or the record's own
+ *   F1. found: verify it agrees with the record (or the record's own
  *       `commitSha`, if already `committed`), finalise Mongo to
  *       `committed` if it was still `prepared`, and return — no second
  *       commit is ever created. This is what makes "Git commit succeeded,
  *       process died before Mongo finalised" recoverable: the commit itself
  *       is the evidence, and this is where a retry finds it.
- *   D2. not found: verify canonical HEAD still equals the record's
+ *   F2. not found: verify canonical HEAD still equals the record's
  *       `baseCommit` (else {@link PromotionBaseConflict} — someone else's
  *       canonical write landed first), materialise the exact candidate
  *       (idempotent — the same accepted candidate, written again, is a
  *       no-op if some of it is already on disk from a prior crashed
  *       attempt), and commit once with the marker.
- *   E. finalise the record to `committed` with the commit this attempt
+ *   G. finalise the record to `committed` with the commit this attempt
  *      just created.
  *
  * Once `committed`, calling this again is a pure read-and-verify: it
- * re-derives the same promotion id, finds the same record already
- * `committed`, confirms the marker is still exactly where it was, and
- * returns the same result — no new commit, no new record, no touch to job
- * or artifact-acceptance state.
+ * re-derives the same promotion id, re-acquires (idempotently) the same
+ * fence, finds the same record already `committed`, confirms the marker is
+ * still exactly where it was, and returns the same result — no new commit,
+ * no new record, no touch to job or artifact-acceptance state.
  */
 export async function promoteAcceptedFrontendBackendCandidate(
   jobId: string,
@@ -349,11 +384,47 @@ export async function promoteAcceptedFrontendBackendCandidate(
 
   const ws = await ProjectWorkspace.open(job.projectId, deps.workspacesRoot);
 
+  // Read-only preflight, in strict authority order. Whichever source wins
+  // here is what `baseCommit` *is* for the rest of this call — it is never
+  // re-proposed from a fresh HEAD read once a durable record of it exists,
+  // because HEAD may since have moved and this promotion's own base must
+  // not silently follow it.
+  //
+  //   1. An existing `promotionFence` on the authoritative job document.
+  //      The fence *is* promotion authority (Phase 5n): if one exists, its
+  //      `baseCommit` is the answer, full stop. Reading HEAD here instead
+  //      would mean a retry after "fence acquired, receipt never written"
+  //      re-proposed the fence from whatever HEAD happens to be now, and
+  //      then failed — if it failed at all — only incidentally, because
+  //      the stored fence disagreed with the freshly-read value. The
+  //      base-commit conflict below is where a moved HEAD must be caught,
+  //      against the fence's own recorded base, not here.
+  //   2. Otherwise, an existing promotion receipt — the pre-5n durable
+  //      shape, whose own `baseCommit` is what it was genuinely prepared
+  //      against, and which the fence below is backfilled to match.
+  //   3. Otherwise this promotion has no durable base yet at all: read
+  //      canonical HEAD, exactly once, and that becomes it.
+  const existingFence = job.promotionFence ?? null;
   let record = await deps.store.promotions.findOne({ _id: promotionId });
-  if (record) {
-    assertRecordMatchesBinding(record, binding);
-  } else {
-    const baseCommit = await ws.currentCommit();
+  if (record) assertRecordMatchesBinding(record, binding);
+  const baseCommit = existingFence
+    ? existingFence.baseCommit
+    : record
+      ? record.baseCommit
+      : await ws.currentCommit();
+
+  // The fence, before any canonical mutation and before a new record is
+  // ever created. Fails closed here — before step D — if accepted-state
+  // abandonment already won: the job is no longer `accepted`.
+  await deps.engine.acquirePromotionFence(job._id, {
+    promotionId,
+    attempt: binding.attempt,
+    candidate: outputRef,
+    baseCommit,
+    actor: PROMOTION_FENCE_ACTOR,
+  });
+
+  if (!record) {
     const now = new Date();
     const prepared: JobPromotionRecord = {
       _id: promotionId,

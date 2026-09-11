@@ -14,6 +14,7 @@ import {
   type AgentTier,
   type ArtifactRef,
   type JobOrigin,
+  type JobPromotionFence,
   type JobSpec,
   type JobState,
   type WorkerRole,
@@ -152,6 +153,15 @@ function sameOutputs(current: readonly ArtifactRef[] | null, expected: readonly 
   });
 }
 
+/** Exact `ArtifactRef` field equality — never object identity. Reused by `acquirePromotionFence` for the one-ref (not array) comparisons a fence needs. */
+function sameRef(a: ArtifactRef, b: ArtifactRef): boolean {
+  return a.name === b.name && a.version === b.version && a.contentHash === b.contentHash;
+}
+
+function sameFence(a: JobPromotionFence, b: { promotionId: string; attempt: number; candidate: ArtifactRef; baseCommit: string | null }): boolean {
+  return a.promotionId === b.promotionId && a.attempt === b.attempt && a.baseCommit === b.baseCommit && sameRef(a.candidate, b.candidate);
+}
+
 /**
  * Raised when `claim()` is asked to narrow to a role set that is not a
  * non-empty subset of what the supplied tier may execute (Phase 5d).
@@ -183,6 +193,61 @@ export class InvalidSupersessionReason extends Error {
   }
 }
 
+/**
+ * `acquirePromotionFence` was asked for a fence whose `attempt` or
+ * `candidate` does not match what the authoritative `accepted` job
+ * currently carries (Phase 5n). Never overwritten with the caller's
+ * version — the job's own durable state is authority, not what a caller
+ * believes it accepted.
+ */
+export class PromotionFenceBindingConflict extends Error {
+  constructor(
+    readonly jobId: string,
+    readonly reason: 'attempt' | 'candidate',
+  ) {
+    super(`job ${jobId}: current ${reason} no longer matches what this promotion fence acquisition expected`);
+    this.name = 'PromotionFenceBindingConflict';
+  }
+}
+
+/**
+ * A `promotionFence` already exists on this job, but for a *different*
+ * promotion authority — a different `promotionId`, `attempt`, `candidate`,
+ * or `baseCommit` — than the one just requested. Never overwritten: once
+ * acquired, a fence is permanent evidence that may already describe
+ * canonical filesystem/Git mutation that has happened.
+ */
+export class PromotionFenceConflict extends Error {
+  constructor(
+    readonly jobId: string,
+    readonly existingPromotionId: string,
+    readonly requestedPromotionId: string,
+  ) {
+    super(
+      `job ${jobId} already owns promotion fence "${existingPromotionId}"; refusing to acquire a different one ` +
+        `("${requestedPromotionId}")`,
+    );
+    this.name = 'PromotionFenceConflict';
+  }
+}
+
+/**
+ * `supersedeAcceptedBeforePromotion` found the job still `accepted` but
+ * already owning a `promotionFence` — promotion has already obtained
+ * authority over it, so abandonment loses and must not touch the job.
+ * Distinct from {@link JobStateConflict}: the state guard (`accepted`) is
+ * satisfied here, and this is specifically the fence guard losing instead.
+ */
+export class PromotionFenceOwned extends Error {
+  constructor(
+    readonly jobId: string,
+    readonly promotionId: string,
+  ) {
+    super(`job ${jobId}: promotion fence "${promotionId}" already owns this accepted job; refusing to supersede it`);
+    this.name = 'PromotionFenceOwned';
+  }
+}
+
 export interface EnqueueParams {
   spec: JobSpec;
   origin: JobOrigin;
@@ -210,6 +275,7 @@ export class JobEngine {
       lease: null,
       failure: null,
       executionOutputs: null,
+      promotionFence: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -620,6 +686,193 @@ export class JobEngine {
       options.now,
       { reason: options.reason, ...(options.bindingId !== undefined ? { bindingId: options.bindingId } : {}) },
     );
+  }
+
+  /**
+   * Durably acquire promotion-ownership authority over one `accepted` job
+   * (Phase 5n) — the fence that serialises canonical promotion (Phase 5h)
+   * against accepted-state abandonment (Phase 5m's
+   * `supersedeAcceptedBeforePromotion`, below). Once this returns
+   * successfully, the job's `promotionFence` durably names exactly this
+   * `(promotionId, attempt, candidate, baseCommit)`, and nothing in this
+   * file will ever clear, expire, or overwrite it — there is deliberately
+   * no `releasePromotionFence`. See `JobPromotionFence`'s own doc comment
+   * (`@statxai/contracts`) for why: canonical filesystem/Git mutation may
+   * already have happened by the time anything reads this again, so
+   * nothing may ever "reclaim" it the way a worker lease can.
+   *
+   * Legal only from `state: 'accepted'` — the guarded filter below simply
+   * never matches any other state, so a caller that races this against,
+   * say, a stale `validating` read fails closed with {@link JobStateConflict}
+   * the same way every other guarded method here does.
+   *
+   * Three outcomes:
+   *
+   *   1. **No fence yet**, and `attempt`/`candidate` match the job's own
+   *      current durable state (checked by reading fresh, inside the same
+   *      transaction, before the guarded write — the same "read then
+   *      guard" idiom {@link acceptGuarded} already uses): the fence is
+   *      written, once, and returned.
+   *   2. **The exact same fence already exists** (`promotionId`, `attempt`,
+   *      `candidate`, `baseCommit` all agree): idempotent replay — the
+   *      existing job is returned as-is, no second write, no duplicate
+   *      audit entry. This is what makes calling this on every single
+   *      promotion attempt safe, including pure replays of an
+   *      already-`committed` historical promotion.
+   *   3. **A *different* fence already exists**, or `attempt`/`candidate`
+   *      disagree with the job's own current state: fails closed —
+   *      {@link PromotionFenceConflict} or {@link PromotionFenceBindingConflict}
+   *      respectively. Never overwritten.
+   *
+   * `baseCommit` is accepted as given, not re-derived here — the caller
+   * (Phase 5h) is the one with canonical workspace access; this method
+   * only persists whatever it is told as part of the fence's own
+   * permanent identity.
+   *
+   * `options.session`, when supplied, participates in the caller's own
+   * transaction — no second one opened. Phase 5h calls this with no
+   * session (its own top-level operation); a legacy-receipt backfill or a
+   * future caller sharing a transaction may supply one.
+   */
+  async acquirePromotionFence(
+    jobId: string,
+    options: {
+      promotionId: string;
+      attempt: number;
+      candidate: ArtifactRef;
+      baseCommit: string | null;
+      actor: string;
+      now?: Date;
+      session?: ClientSession;
+    },
+  ): Promise<JobDocument> {
+    const run = async (session: ClientSession): Promise<JobDocument> => {
+      const now = options.now ?? new Date();
+      const current = await this.store.jobs.findOne({ _id: jobId }, { session });
+      if (!current) throw new JobNotFound(jobId);
+      if (current.state !== 'accepted') throw new JobStateConflict(jobId, ['accepted']);
+
+      const existingFence = current.promotionFence ?? null;
+      if (existingFence) {
+        if (sameFence(existingFence, options)) return current;
+        throw new PromotionFenceConflict(jobId, existingFence.promotionId, options.promotionId);
+      }
+
+      if (current.attempt !== options.attempt) throw new PromotionFenceBindingConflict(jobId, 'attempt');
+      if (!sameOutputs(current.executionOutputs, [options.candidate])) {
+        throw new PromotionFenceBindingConflict(jobId, 'candidate');
+      }
+
+      const fence: JobPromotionFence = {
+        promotionId: options.promotionId,
+        attempt: options.attempt,
+        candidate: options.candidate,
+        baseCommit: options.baseCommit,
+        acquiredAt: now,
+      };
+
+      const updated = await this.store.jobs.findOneAndUpdate(
+        // `promotionFence: null` matches both an explicit `null` and a
+        // missing key (Mongo's own query semantics) — exactly the "no
+        // fence acquired" meaning `JobPromotionFence`'s own doc comment
+        // documents, with no special-casing needed here for either shape.
+        { _id: jobId, state: 'accepted', attempt: options.attempt, promotionFence: null },
+        { $set: { promotionFence: fence, updatedAt: now } },
+        { session, returnDocument: 'after' },
+      );
+
+      if (!updated) {
+        // Raced inside this same transaction attempt: re-read and
+        // classify from what is actually there, rather than trust the
+        // read above.
+        const exists = await this.store.jobs.findOne({ _id: jobId }, { session });
+        if (!exists) throw new JobNotFound(jobId);
+        if (exists.state !== 'accepted') throw new JobStateConflict(jobId, ['accepted']);
+        const raceFence = exists.promotionFence ?? null;
+        if (raceFence) {
+          if (sameFence(raceFence, options)) return exists;
+          throw new PromotionFenceConflict(jobId, raceFence.promotionId, options.promotionId);
+        }
+        // Fence still absent, state still accepted, yet the guarded write
+        // did not match: the job's `attempt` moved between the read above
+        // and this write.
+        throw new PromotionFenceBindingConflict(jobId, 'attempt');
+      }
+
+      await this.audit(session, {
+        projectId: updated.projectId,
+        jobId,
+        kind: 'job_transition',
+        actor: options.actor,
+        detail: { event: 'promotion_fence_acquired', promotionId: options.promotionId, attempt: options.attempt, baseCommit: options.baseCommit },
+        at: now,
+      });
+
+      return updated;
+    };
+
+    if (options.session) return run(options.session);
+    return this.store.withTransaction(run);
+  }
+
+  /**
+   * The one narrow edge `accepted -> superseded` is legal through (Phase
+   * 5n) — deliberately not folded into the generic {@link supersede},
+   * which stays exactly what Phase 5m left it: pre-acceptance only, by the
+   * simple absence of `'accepted'` from its own guarded `from` list.
+   *
+   * Requires, atomically, in one guarded filter: `state: 'accepted'` *and*
+   * `promotionFence: null` (matching both a real `null` and a missing
+   * key). An accepted job that already owns a fence fails closed with
+   * {@link PromotionFenceOwned} — promotion already holds authority, and
+   * this never clears or overwrites that fence to make room for itself.
+   *
+   * Everything else mirrors {@link supersede} exactly: `reason` required
+   * and non-empty, `bindingId` carried into the same audit detail shape,
+   * `options.session` used directly when supplied so this can commit
+   * atomically alongside a `FrontendBackendBuildBindingDocument`
+   * `prepared -> abandoned` transition.
+   */
+  async supersedeAcceptedBeforePromotion(
+    jobId: string,
+    actor: string,
+    options: { reason: string; bindingId?: string; now?: Date; session?: ClientSession },
+  ): Promise<JobDocument> {
+    if (options.reason.trim() === '') {
+      throw new InvalidSupersessionReason('JobEngine.supersedeAcceptedBeforePromotion: reason must not be empty');
+    }
+    assertTransition('accepted', 'superseded');
+
+    const run = async (session: ClientSession): Promise<JobDocument> => {
+      const now = options.now ?? new Date();
+      const updated = await this.store.jobs.findOneAndUpdate(
+        { _id: jobId, state: 'accepted', promotionFence: null },
+        { $set: { state: 'superseded', updatedAt: now } },
+        { session, returnDocument: 'after' },
+      );
+
+      if (!updated) {
+        const exists = await this.store.jobs.findOne({ _id: jobId }, { session });
+        if (!exists) throw new JobNotFound(jobId);
+        if (exists.state !== 'accepted') throw new JobStateConflict(jobId, ['accepted']);
+        // State is accepted, so the fence guard is what lost.
+        throw new PromotionFenceOwned(jobId, exists.promotionFence!.promotionId);
+      }
+
+      await this.audit(session, {
+        projectId: updated.projectId,
+        jobId,
+        kind: 'job_transition',
+        actor,
+        detail: { to: 'superseded', attempt: updated.attempt, reason: options.reason, ...(options.bindingId !== undefined ? { bindingId: options.bindingId } : {}) },
+        at: now,
+      });
+
+      return updated;
+    };
+
+    if (options.session) return run(options.session);
+    return this.store.withTransaction(run);
   }
 
   /**

@@ -45,13 +45,19 @@ export type JobState = z.infer<typeof JobState>;
  * resolved forward; `superseded` means this exact execution has been
  * permanently revoked and will never run, validate, or accept again.
  * Reachable from every pre-acceptance state (`draft`, `ready`, `running`,
- * `validating`, `failed`, `repair_requested`, `blocked`) and from nowhere
- * else — deliberately *not* from `accepted`: an accepted job may already be
- * entering Phase 5h's canonical promotion path, and revoking it needs a
- * dedicated promotion-fencing capability this phase does not add (see
- * `docs/upgrade-status.md`'s Phase 5m section). `superseded` itself has no
- * outgoing edges — once reached, permanently terminal, never reclaimed,
- * released, retried, or re-accepted.
+ * `validating`, `failed`, `repair_requested`, `blocked`) — and, as of Phase
+ * 5n, from `accepted` too, but only through the narrow guarded primitive
+ * that requires the accepted job to still own no promotion fence
+ * (`JobEngine.supersedeAcceptedBeforePromotion` — see
+ * `packages/state/src/documents.ts`'s `JobDocument.promotionFence` and
+ * `docs/upgrade-status.md`'s Phase 5n section). The generic
+ * `JobEngine.supersede()` still never offers this edge — its own guarded
+ * filter simply never names `accepted` as a source state, unchanged since
+ * Phase 5m — so this table entry alone does not, by itself, let anything
+ * casually supersede an accepted job; it only makes the edge *structurally*
+ * legal for the one narrow, fence-checked caller that needs it. `superseded`
+ * itself still has no outgoing edges — once reached, permanently terminal,
+ * never reclaimed, released, retried, or re-accepted.
  */
 const TRANSITIONS: Readonly<Record<JobState, readonly JobState[]>> = Object.freeze({
   draft: ['ready', 'blocked', 'superseded'],
@@ -61,7 +67,7 @@ const TRANSITIONS: Readonly<Record<JobState, readonly JobState[]>> = Object.free
   failed: ['ready', 'repair_requested', 'blocked', 'superseded'],
   repair_requested: ['ready', 'accepted', 'blocked', 'superseded'],
   blocked: ['ready', 'failed', 'superseded'],
-  accepted: [],
+  accepted: ['superseded'],
   superseded: [],
 });
 
@@ -188,6 +194,34 @@ export const JobFailure = z.object({
 });
 export type JobFailure = z.infer<typeof JobFailure>;
 
+/**
+ * Durable, non-expiring promotion ownership authority for one `accepted`
+ * job (Phase 5n). Stored on the authoritative `JobDocument` itself rather
+ * than a second collection: canonical promotion (Phase 5h) and
+ * accepted-state abandonment (Phase 5m/5n) already compete over this exact
+ * document, so this is one Mongo serialisation point rather than a second
+ * lock system layered alongside it.
+ *
+ * `promotionId`/`attempt`/`candidate`/`baseCommit` are never re-derived
+ * once acquired — they pin the *exact* execution this fence authorises, so
+ * a later reader never has to guess whether a fence describes the promotion
+ * currently in question. `acquiredAt` is observational only, never the
+ * authority: unlike `JobLease`, this has no `expiresAt`, no heartbeat, and
+ * no release primitive. Once written, it is permanent evidence — canonical
+ * filesystem/Git mutation may already have happened by the time any process
+ * reads it again, so nothing may ever "expire" or "reclaim" it the way a
+ * worker lease can.
+ */
+export const JobPromotionFence = z.object({
+  promotionId: z.string().min(1),
+  attempt: z.number().int().nonnegative(),
+  candidate: ArtifactRef,
+  /** Canonical HEAD this fence was acquired against — `null` for a project's first-ever commit, never a placeholder. */
+  baseCommit: z.string().nullable(),
+  acquiredAt: z.date(),
+});
+export type JobPromotionFence = z.infer<typeof JobPromotionFence>;
+
 export const JobRecord = z.object({
   spec: JobSpec,
   state: JobState,
@@ -201,6 +235,18 @@ export const JobRecord = z.object({
 
   lease: JobLease.nullable().default(null),
   failure: JobFailure.nullable().default(null),
+
+  /**
+   * Set only once, by `JobEngine.acquirePromotionFence` (Phase 5n) —
+   * never by any other write path. `null` and `undefined` both mean "no
+   * fence acquired": a `JobDocument` written before Phase 5n existed
+   * simply lacks this key entirely, which is a normal, valid `accepted`
+   * document, not one needing a migration — every read site treats the two
+   * identically (`== null`), and the Mongo guard this field is checked
+   * through (`{ promotionFence: null }`) already matches both a `null`
+   * value and a missing key by Mongo's own query semantics.
+   */
+  promotionFence: JobPromotionFence.nullable().default(null),
 
   /**
    * What the exact execution that reached `validating` actually produced

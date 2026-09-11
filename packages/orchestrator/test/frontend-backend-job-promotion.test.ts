@@ -50,9 +50,25 @@ describe('the promotion module cannot reach a model, deployment, validation, or 
 });
 
 describe('promotion never asks JobEngine to change job state', () => {
-  it('does not import JobEngine', async () => {
+  /**
+   * Phase 5n narrows this test's original premise rather than dropping it:
+   * promotion now legitimately imports `JobEngine` (as a type only) and
+   * calls exactly one method on it — `acquirePromotionFence`, which never
+   * touches `job.state` at all, only the separate `promotionFence` field.
+   * Every actual state-mutating method (already covered by the sibling
+   * describe block above: `.accept(`, `.submitForValidation(`,
+   * `.requestRepair(`, `.block(`, `.release(`, `.claim(`, `.heartbeat(`)
+   * must still never appear here, and neither must the generic
+   * `.supersede(`/`.supersedeAcceptedBeforePromotion(` — promotion reads
+   * and fences a job; it never supersedes one itself.
+   */
+  it('imports JobEngine only as a type, and calls only acquirePromotionFence on it — never a state-mutating method', async () => {
     const src = await readFile(MODULE_PATH, 'utf8');
-    expect(src).not.toMatch(/JobEngine/);
+    expect(src).toContain("type JobEngine } from '@statxai/job-engine'");
+    expect(src).toContain('.acquirePromotionFence(');
+    for (const call of ['.supersede(', '.supersedeAcceptedBeforePromotion(']) {
+      expect(src).not.toContain(call);
+    }
   });
 });
 
