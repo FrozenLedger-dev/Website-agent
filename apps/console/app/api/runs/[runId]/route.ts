@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { costOf } from '@statxai/agents';
 import { remaining } from '@statxai/state';
+import { requireConsoleOperator } from '@/lib/auth';
 import { getStore } from '@/lib/store';
 
 export const dynamic = 'force-dynamic';
@@ -9,6 +10,9 @@ export async function GET(
   request: Request,
   { params }: { params: Promise<{ runId: string }> },
 ) {
+  const auth = await requireConsoleOperator(request);
+  if (auth instanceof Response) return auth;
+
   const { runId } = await params;
   const store = await getStore();
 

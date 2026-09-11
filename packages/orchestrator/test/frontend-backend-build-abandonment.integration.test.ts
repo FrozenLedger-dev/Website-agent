@@ -618,7 +618,7 @@ describe('structural: scope boundaries', () => {
     expect(contents).toMatch(/reason\.trim\(\) === ''/);
   });
 
-  it('no HTTP route in apps/console exposes abandonment — the console has no authentication', async () => {
+  it('no HTTP route in apps/console exposes abandonment — a separate capability from Phase 5o’s operator boundary', async () => {
     const apiDir = join(process.cwd(), 'apps', 'console', 'app', 'api');
     const walk = async (dir: string): Promise<string[]> => {
       const entries = await readdir(dir, { withFileTypes: true });

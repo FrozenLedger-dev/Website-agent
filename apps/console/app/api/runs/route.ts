@@ -1,16 +1,26 @@
 import { NextResponse } from 'next/server';
 import { ActiveJobLifecycleRollbackConflict, launchRun } from '@statxai/orchestrator';
+import { requireConsoleOperator } from '@/lib/auth';
 import { FRONTEND_BACKEND_EXECUTION_MODE, VALIDATION_WORKSPACES_ROOT, getStore, WORKSPACES_ROOT } from '@/lib/store';
 
 export const dynamic = 'force-dynamic';
 
-export async function GET() {
+export async function GET(request: Request) {
+  const auth = await requireConsoleOperator(request);
+  if (auth instanceof Response) return auth;
+
   const store = await getStore();
   const runs = await store.runs.find({}).sort({ startedAt: -1 }).limit(50).toArray();
   return NextResponse.json({ runs });
 }
 
 export async function POST(request: Request) {
+  // Phase 5o: before the body is even read, and long before a store
+  // connection, a project, a job or a model call exists. An unauthenticated
+  // caller cannot start production website generation.
+  const auth = await requireConsoleOperator(request);
+  if (auth instanceof Response) return auth;
+
   const body = (await request.json()) as { intake?: unknown; autonomyMode?: string };
 
   if (!body.intake || typeof body.intake !== 'object') {

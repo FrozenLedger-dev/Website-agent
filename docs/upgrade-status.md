@@ -4579,6 +4579,135 @@ fence so a restart can never silently adopt a different HEAD. Accepted
 candidate history remains intact after abandonment. No replacement build,
 no HTTP endpoint, no Luna, no deployment change.
 
+## Phase 5o — one authenticated operator boundary for the production console — **DONE**
+
+Phase 5l put the real production website-generation entrypoint in
+`apps/console`, and Phase 5m's inspection recorded what that meant: the
+console had no authentication of any kind, so anyone who could reach the
+port could start production runs and read every run, project and generated
+site. Phase 5o closes that, and nothing else.
+
+**Mechanism: HTTP Basic (RFC 7617), one configured operator.** Chosen from
+how the console is actually used, not from preference: `launch-form.tsx`
+POSTs `/api/runs`, `run-view.tsx` polls `/api/runs/<id>` every two seconds,
+and the preview is an `<iframe>` loading `/api/preview/<projectId>` — all
+browser traffic. A bearer token would have to be handed to that client-side
+JavaScript, which is exactly what a server-side credential must never be.
+Basic is the one browser-safe transport needing no login page, no session
+store, no cookie signing and no new dependency: the browser holds the
+credential in its own credential cache, attaches it to same-origin
+subresources (the preview iframe included) and never exposes it to page
+scripts; `curl -u` works at a terminal for the same reason. No identity
+provider was added (no Auth0/Clerk/NextAuth/Supabase), no user database, no
+roles — Phase 5o has exactly one authority, the console operator.
+
+**The primitive** — `apps/console/lib/auth.ts`, the single authority:
+`requireConsoleOperator(request) -> ConsoleOperatorPrincipal | Response`
+over `authenticateConsoleOperator`. `ConsoleOperatorPrincipal` is
+`{ id, authMethod: 'basic' }` and nothing else; `id` is read from the
+*configuration*, never from the submitted credential, so no byte of request
+content can reach the principal even if the comparison were weakened.
+Runtime-agnostic on purpose — Next middleware runs on the Edge runtime, so
+the file imports no `node:` builtin: `atob`, `TextDecoder` and Web Crypto
+only. Comparison is constant-time over SHA-256 digests of both sides, which
+also makes different-length inputs compare over a fixed 32 bytes; both
+halves of the credential are always compared, so timing never reveals that
+the user id alone was right. Malformed input (wrong scheme, non-base64,
+invalid padding, no colon) returns the ordinary failure rather than
+throwing.
+
+**Configuration** — `CONSOLE_OPERATOR_USER` and `CONSOLE_OPERATOR_PASSWORD`,
+server-side only, read live per request. Missing, empty, whitespace-only, or
+a user id containing a colon (unrepresentable in `user:password`) all
+resolve to "no credential configured", and every caller turns that into a
+**503**, never an anonymous request. There is no environment value in any
+runtime that disables authentication, and no bypass was added.
+
+**The boundary** — `apps/console/middleware.ts` protects the whole console,
+pages included: the dashboard and run pages read run state directly in
+their server components, so protecting only `app/api/**` would leave the
+same data readable one URL over. Only `_next/static`, `_next/image` and
+`favicon.ico` are excluded — framework build output, no run state. Each API
+route handler (`/api/runs` GET and POST, `/api/runs/[runId]` GET,
+`/api/preview/[projectId]/[[...path]]` GET) additionally calls
+`requireConsoleOperator` as its own first statement, before any `await`,
+`getStore` or `launchRun`, so a mistake in the matcher cannot expose one.
+Both paths call the same function — there is no second copy of the
+comparison, the configuration rules or the refusal. **There are no public
+exceptions**: this console has no health, readiness or liveness endpoint,
+and Phase 5o did not invent one to have an exception. The allowlist
+(`PUBLIC_API_ROUTES` in the suite) is empty and asserted empty.
+
+**Refusals** are minimal and identical: no credential, unreadable
+credential and wrong credential all produce the same `401` with
+`{"error":"Authentication required."}` and `WWW-Authenticate: Basic
+realm="STATXAI console", charset="UTF-8"`. No token, configured user id,
+length, hash, or hint about which failure occurred. Misconfiguration is
+`503` with no challenge; a cross-site mutation is `403`.
+
+**CSRF.** Basic credentials are ambient browser authority in the same way a
+cookie is — once cached for the origin the browser attaches them to a
+cross-site form POST too, and a form can send `text/plain` that
+`request.json()` parses happily. So state-changing methods additionally
+require a same-origin signal (`Sec-Fetch-Site`, falling back to `Origin`
+against the request's own host). Secondary, never authentication: a client
+sending neither header is not a browser — an operator's `curl`, which no
+attacker page can make anyone's browser become — and still faces the
+credential check that actually decides. No CSRF framework, token store or
+double-submit cookie was added, because there is no session to protect.
+
+**Logging.** This repository has no logging infrastructure and no generic
+request logging, so Phase 5o added none: no `Authorization` header, cookie,
+credential or hash is written anywhere. Nothing to audit for newly-exposed
+credentials, because nothing logs requests at all.
+
+**Scope held exactly where the brief drew it:** no HTTP abandonment
+endpoint — `scripts/abandon-build.ts` remains the operator surface,
+unchanged apart from the docstring that claimed the console has no
+authentication (`--actor` still absent, `userInfo()` still the actor
+source); zero changes to `packages/job-engine`, `packages/contracts`,
+`runProject`, or Phase 5h/5i/5k/5m/5n promotion, binding and abandonment
+authority; `FRONTEND_BACKEND_EXECUTION_MODE` semantics untouched
+(production still defaults `job_lifecycle`, `runProject` still defaults
+`legacy_direct`), as are `WORKSPACES_ROOT`/`VALIDATION_WORKSPACES_ROOT` and
+`assertDistinctWorkspaceRoots`; no Luna; no deployment-authorization or
+release-policy change — an authenticated console operator is not a website
+publication decision.
+
+**Tests: +27 unit (980 → 1007), in one new file**
+(`apps/console/test/console-auth.test.ts`, the first suite under `apps/`, so
+all three Vitest configs gained an `apps/*/test/**` include and the `@/*`
+alias the console's own imports use — the unit/integration complement is
+preserved). Covered: unauthenticated run start rejected before `launchRun`
+or `getStore` is reached, wrong credential indistinguishable from none,
+malformed Basic rejected without throwing, authenticated start proceeding on
+the unchanged `job_lifecycle` default, the `legacy_direct` rollback still
+working when authenticated, body/header actor spoofing ignored, cross-site
+mutation refused, both read routes and the preview route protected with
+existing behaviour preserved once authenticated, the middleware challenge
+and matcher, fail-closed configuration, principal shape, secret absent from
+body and headers, structural coverage of every route file, no
+`process.env.NEXT_PUBLIC` and no client component importing the primitive,
+and no abandonment route. Ten security mutations attempted, ten killed —
+guard removed from `POST /api/runs`, invalid credential accepted, missing
+config treated as anonymous, principal id taken from a request header, read
+route unguarded, preview route unguarded, execution mode changed by the auth
+work, matcher no longer covering `/api`, cross-site guard removed, and
+malformed base64 throwing instead of failing (this last one initially
+survived and exposed a real test gap — no input reached `atob`'s throw — so
+two payloads that genuinely throw were added).
+
+**Explicitly:** Phase 5o establishes one authenticated operator boundary for
+the existing production console. Unauthenticated callers cannot start
+production website-generation runs, read run state, or reach preview/run
+APIs. Operator identity comes from trusted authentication state, not request
+content. Credentials remain server-side and are never returned or logged.
+Production fails closed when the required configuration is absent or
+invalid. No customer authentication, RBAC or user database; no HTTP
+build-abandonment endpoint; no change to Phase 5l's `job_lifecycle`
+production default or Phase 5n's promotion/abandonment authority; no Luna;
+no deployment-authorization change.
+
 ## Phases 6–17
 
 Not started.

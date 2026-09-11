@@ -1,6 +1,7 @@
 import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import { resolveExportPath, withPreviewPrefix } from '@statxai/workspace';
+import { requireConsoleOperator } from '@/lib/auth';
 import { WORKSPACES_ROOT } from '@/lib/store';
 
 export const dynamic = 'force-dynamic';
@@ -28,6 +29,12 @@ export async function GET(
   request: Request,
   { params }: { params: Promise<{ projectId: string; path?: string[] }> },
 ) {
+  // Unbuilt project source is one thing; this route serves the generated
+  // business website, its content and its structure, before anyone decided to
+  // publish it. Operator-only, like every other console route.
+  const auth = await requireConsoleOperator(request);
+  if (auth instanceof Response) return auth;
+
   const { projectId, path } = await params;
 
   // projectId comes from the URL. Constrain it to the id format rather than

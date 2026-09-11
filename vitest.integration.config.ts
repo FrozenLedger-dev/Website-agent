@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
 /**
@@ -12,6 +13,11 @@ import { defineConfig } from 'vitest/config';
  * docker-compose service.
  */
 export default defineConfig({
+  // Same `@/*` alias as the unit config, for the same reason: an app suite
+  // must resolve its imports the way the framework it runs under does.
+  resolve: {
+    alias: { '@/': `${fileURLToPath(new URL('./apps/console', import.meta.url))}/` },
+  },
   test: {
     include: [
       // Anything named for what it is. A new Mongo-backed suite lands in this
@@ -19,6 +25,7 @@ export default defineConfig({
       // lists silently disagreeing would put a suite needing a replica set into
       // the job that provisions nothing.
       'packages/*/test/**/*.integration.test.ts',
+      'apps/*/test/**/*.integration.test.ts',
       // Older suites, named before the convention existed.
       'packages/state/test/budgets.test.ts',
       'packages/job-engine/test/engine.test.ts',

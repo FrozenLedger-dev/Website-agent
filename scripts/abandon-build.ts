@@ -4,17 +4,18 @@
  *
  *   pnpm build:abandon <projectId> <bindingId> <reason...>
  *
- * Not exposed over HTTP: the console (`apps/console`) has no authentication
- * of any kind — every route is reachable by anyone who can open the port —
- * so an HTTP abandonment endpoint would let an unauthenticated caller
- * revoke a production build. This script is the operator surface instead,
- * following the same trust boundary every other script under `scripts/`
- * already relies on (`db-check.ts`, `gate-check.ts`, `run-agent.ts`):
- * whoever can run a script on this host already has the access an operator
- * action requires. `actor` is derived from the OS user running this
- * process, never from a flag — the same discipline a real authenticated API
- * route would apply to a request body field, applied here to the one
- * identity source this script actually has.
+ * Still not exposed over HTTP. Phase 5o gave the console an authenticated
+ * operator boundary, so the original reason this was CLI-only — every
+ * console route was reachable by anyone who could open the port — no longer
+ * holds; but an abandonment endpoint is a separate capability, and Phase 5o
+ * deliberately shipped the boundary without it. This script remains the
+ * operator surface, following the same trust boundary every other script
+ * under `scripts/` already relies on (`db-check.ts`, `gate-check.ts`,
+ * `run-agent.ts`): whoever can run a script on this host already has the
+ * access an operator action requires. `actor` is derived from the OS user
+ * running this process, never from a flag — the same discipline an
+ * authenticated API route applies to a request body field, applied here to
+ * the one identity source this script actually has.
  *
  * `bindingId` is required and exact — find it first (e.g. via the console's
  * run view, or a direct query against `frontend_backend_build_bindings`

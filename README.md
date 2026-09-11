@@ -36,7 +36,13 @@ runs, once each.
 ## The console
 
 `http://localhost:3100` is the control plane. It launches runs, follows them
-live, and shows what the platform decided and why:
+live, and shows what the platform decided and why.
+
+It is operator-only. Every page and every API route requires HTTP Basic
+authentication against `CONSOLE_OPERATOR_USER` / `CONSOLE_OPERATOR_PASSWORD`;
+the browser prompts once and holds the credential, so no secret reaches page
+JavaScript. Both variables are required — with either missing or blank the
+console refuses every request rather than serving one anonymously.
 
 - **Launch** — paste a business profile, pick an autonomy mode, run.
 - **Timeline** — every phase transition, persisted. A run takes minutes and
