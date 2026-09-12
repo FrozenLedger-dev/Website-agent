@@ -4708,6 +4708,125 @@ build-abandonment endpoint; no change to Phase 5l's `job_lifecycle`
 production default or Phase 5n's promotion/abandonment authority; no Luna;
 no deployment-authorization change.
 
+## Phase 5p — operator-reconciled durable release publication authority — **DONE**
+
+Phase 5p began as *durable post-promotion outer `runProject` resume* and
+stopped twice, correctly, before writing code. The first inspection found
+that resuming across `publishRelease` would replay `deploySite` →
+`vercel.deployments.createDeployment`, which had no durable authority at
+all: a crash after Vercel accepted a deployment but before the manifest was
+written left a live production deployment recorded nowhere, and the next
+invocation deployed again. The second inspection asked whether that could be
+made automatically safe and found it cannot — so this phase is the
+prerequisite, and outer resume is still not implemented.
+
+**The provider limitation, verified not assumed.** `@vercel/sdk@1.28.17`
+contains no occurrence of `idempoten`; `POST /v13/deployments` documents only
+`forceNew`, `skipAutoDetectionConfirmation`, `teamId` and `slug` — no
+idempotency key, and no client-supplied deployment identity (`name` is the
+project, `uid` is server-assigned). Deployment `meta` exists and is readable
+back from `GET /v13/deployments/{id}`, but `GET /v7/deployments` has **no
+metadata filter**, so "find the deployment for this release" is a scan whose
+empty result proves nothing — least of all after a crash mid-request. The
+`forceNew` flag implies a "deployment deduplication" whose key, window and
+concurrency behaviour are specified nowhere, so nothing here relies on it.
+
+**So the guarantee is narrower than "exactly one deployment", and true:**
+after an external attempt becomes ambiguous, STATXAI issues no further
+automatic deployment for that release until a trusted operator resolves it.
+
+**`release_publications`** (`ReleasePublicationDocument`) — `_id` is the
+deterministic `releaseId`, so the collection is its own idempotency ledger,
+the shape Phase 5h's `job_promotions` established. `releaseId =
+contentHash(projectId + the exact release-authorization ArtifactRef)`. Two
+things are deliberately *not* inputs: `baseCommit`, because it is HEAD
+*before* this release's own publication commit and would make the identity
+unstable exactly when a retry needs to find its own receipt; and the
+deployment target, because hashing it in would make a changed
+`VERCEL_TEAM_ID` mint a *different* release and silently publish elsewhere —
+bound in the receipt instead, the same change is detected as drift and fails
+closed. Statuses: `prepared` (authority exists, nothing sent),
+`publishing` (**a request may have reached Vercel; automatic retry
+forbidden**, and never expiring — no timeout, restart or provider error
+returns it to `prepared`), `retry_authorized` (one further attempt,
+authorised by a human), `committed` (one exact deployment durably known). `attempts[]` is
+immutable history — an ambiguous attempt is never erased to make room for
+the next one, because it may correspond to a real production deployment.
+One unfinished publication per project, enforced by a partial unique index
+on `{ projectId }` filtered on `active: true` (a separate field because
+Mongo's `partialFilterExpression` has no `$in` and "unfinished" spans three
+statuses). `prepared`, `publishing` and `retry_authorized` all hold the slot;
+it is released by the same guarded write that records final authority —
+`$unset: { active }` in the *same* update as `status: 'committed'`, on both
+the ordinary-success and operator-adoption paths — so a later release for the
+project can never be blocked by a stale flag, and never starts while an
+earlier one is unresolved.
+
+**The ordering that is the whole phase:** receipt `prepared` → release
+Git commit established → `prepared|retry_authorized -> publishing` with the
+attempt appended, guarded by CAS on the exact `(status, attempt)` pair →
+**only then** `createDeployment`. A process that dies one instruction after
+that CAS leaves `publishing` behind, and every later invocation throws
+`ReleasePublicationReconciliationRequired` instead of deploying. The same
+CAS makes two concurrent publishers produce exactly one attempt, and makes
+an operator's retry authorisation single-use.
+
+**Git.** The release-authorized commit now carries `Statx-Release-Id:
+<releaseId>`, and a retry recovers it by marker rather than making a second
+one — Phase 5h's pattern, unchanged. Zero markers means nothing was
+published yet, and then HEAD must still equal `receipt.baseCommit` or
+publication fails closed (`ReleasePublicationBaseConflict`): no reset, no
+rebase, no adopting a newer lineage. A clean tree legitimately produces no
+commit, and the release then publishes `baseCommit` itself.
+
+**Operator surface:** `pnpm release:reconcile show|adopt|retry`
+(`scripts/reconcile-release.ts`), CLI only — Phase 5o's authenticated
+console boundary exists, but a reconciliation API is a separate capability
+and was not added. Actor comes from `userInfo()`, never a flag, as in
+`abandon-build.ts`. **adopt** takes one exact deployment id the operator
+found in the dashboard; the harness re-reads that deployment and refuses it
+unless its `statxReleaseId` marker, Vercel project and target all match —
+an operator cannot assert a URL into the receipt. **retry** authorises
+exactly one more attempt and records who and why. Both name the exact
+attempt they resolve, so a stale command can never resolve a newer one. This
+is trusted, destructive authority: nothing can prove the process that
+started the ambiguous attempt is dead.
+
+**Behaviour changes, stated plainly.** A failed deployment request no longer
+retries under the `failedDeployments` budget and no longer falls through to
+a "local preview" manifest — after an ambiguous attempt that manifest would
+be a claim the harness cannot support. Publication with no `VERCEL_TOKEN`
+configured is unchanged and takes no receipt: nothing leaves the machine, so
+there is nothing to fence. A `committed` release replays with zero provider
+calls and zero new release commits, reconstructing the manifest from the
+receipt — which covers both the crash-before-manifest and
+manifest-written-but-project-not-`released` windows. Legacy releases have no
+receipt; that means "historical", never "stuck publishing", and a legacy
+manifest is still read as the next release's rollback target.
+
+**Tests: +22 integration (1007 → 1029), one new file.** Receipt-before-
+provider ordering, the mandatory crash-after-external-success window, a
+failed request stopping identically, adoption and its three refusals, the
+one-shot retry and a second ambiguity stopping again, stale reconciliation,
+both concurrency races against real Mongo, committed replay in three crash
+shapes, HEAD and target drift, legacy non-adoption, and release policy
+untouched. Thirteen focused mutations attempted, twelve killed. The thirteenth —
+dropping `attempt` from the `prepared|retry_authorized -> publishing` CAS
+filter — survived, and only there: every transition *into* `publishing`
+also moves the status, so that one guard is already sufficient by itself.
+`attempt` is load-bearing in the other direction, where the status does
+*not* move: `publishing(N)` and `publishing(N+1)` share a status, so the
+success and adoption updates both pin the exact attempt. That is what stops
+a late result from a superseded attempt committing over a newer one, and it
+is covered by its own tests rather than assumed.
+
+**Scope held:** zero changes to `packages/job-engine`, Phase 5n's promotion
+fence, Phase 5m abandonment, Phase 5o authentication, Luna, the hosting
+provider, or release authorization policy — the receipt proves publication
+identity, never permission to release. No outer `runProject` resume, no
+repair/replan cursor, no provider scanning as authority, no deployment
+deletion, no Git reset/rebase, no artifact deletion.
+
 ## Phases 6–17
 
 Not started.

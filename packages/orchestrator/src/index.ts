@@ -21,3 +21,13 @@ export * from './job-promotion/frontend-backend.js';
 export * from './job-lifecycle/frontend-backend.js';
 export * from './job-specs/frontend-backend.js';
 export * from './run-binding/frontend-backend.js';
+export * from './release-publication/publication.js';
+// The publish phase's own surface — the deployment gateway an operator tool or
+// a test substitutes, and the options `publishRelease` now takes.
+export {
+  publishRelease,
+  vercelReleaseGateway,
+  type PublishOptions,
+  type PublishResult,
+  type ReleaseDeploymentGateway,
+} from './phases/publish.js';

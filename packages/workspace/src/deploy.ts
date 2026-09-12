@@ -17,6 +17,33 @@ export interface DeployResult {
   rollbackRef: string | null;
   fileCount: number;
   durationMs: number;
+  /**
+   * Whatever metadata the provider echoed back, when it echoes any.
+   *
+   * Optional because the create response is a union of views and need not
+   * carry it — absent metadata is "no evidence either way", never "the wrong
+   * deployment".
+   */
+  meta?: Record<string, string>;
+}
+
+/**
+ * One existing deployment, read back by its exact id.
+ *
+ * The only provider read Phase 5p performs, and only ever for an id an
+ * operator supplied by hand. There is deliberately no "find the deployment
+ * for this release" search: `GET /v7/deployments` has no metadata filter, so
+ * any such search would be a scan whose empty result proves nothing.
+ */
+export interface ExistingDeployment {
+  deploymentId: string;
+  url: string;
+  /** Deployment metadata as stored at creation — carries our release marker. */
+  meta: Record<string, string>;
+  /** The Vercel project name, as the provider reports it. */
+  project: string | null;
+  /** `production`, `staging`, or null for a preview deployment. */
+  target: string | null;
 }
 
 export class DeploymentUnavailable extends Error {
@@ -70,7 +97,18 @@ export function deploymentConfigured(): boolean {
 export async function deploySite(
   siteRoot: string,
   projectId: string,
-  options: { target?: 'production' | 'staging'; previousDeploymentId?: string | null } = {},
+  options: {
+    target?: 'production' | 'staging';
+    previousDeploymentId?: string | null;
+    /**
+     * Non-secret provider metadata. Phase 5p puts the release identity here
+     * so a deployment can be tied back to the exact release that created it —
+     * the evidence an operator reconciles an ambiguous attempt against. It is
+     * recovery and audit evidence, never an idempotency key: Vercel offers no
+     * idempotency key for deployment creation, and this metadata is not one.
+     */
+    meta?: Record<string, string>;
+  } = {},
 ): Promise<DeployResult> {
   const token = process.env.VERCEL_TOKEN;
   if (!token) throw new DeploymentUnavailable('VERCEL_TOKEN is not set');
@@ -91,6 +129,7 @@ export async function deploySite(
     requestBody: {
       name: toProjectName(projectId),
       target: options.target ?? 'production',
+      ...(options.meta ? { meta: options.meta } : {}),
       files: [
         ...files.map((f) => ({
           file: f.path,
@@ -138,5 +177,53 @@ export async function deploySite(
     rollbackRef: options.previousDeploymentId ?? null,
     fileCount: files.length,
     durationMs: Date.now() - started,
+    meta: readMeta(created),
   };
+}
+
+/**
+ * Read one exact deployment back from the provider.
+ *
+ * Used only by operator-driven adoption (Phase 5p): a human who has found the
+ * deployment in the Vercel dashboard supplies its id, and this is what proves
+ * the id is real, belongs to the expected project/target, and carries the
+ * expected release marker before it is adopted as a release's outcome.
+ */
+export async function getDeploymentById(deploymentId: string): Promise<ExistingDeployment> {
+  const token = process.env.VERCEL_TOKEN;
+  if (!token) throw new DeploymentUnavailable('VERCEL_TOKEN is not set');
+
+  const vercel = new Vercel({ bearerToken: token });
+  const found = await vercel.deployments.getDeployment({
+    idOrUrl: deploymentId,
+    teamId: process.env.VERCEL_TEAM_ID,
+  });
+
+  // The response is a union of full and reduced views, so every field is read
+  // defensively rather than cast — the same discipline `deploySite` uses.
+  const id = 'id' in found && found.id != null ? String(found.id) : deploymentId;
+  const host = 'url' in found && typeof found.url === 'string' ? found.url : '';
+  const project = 'name' in found && typeof found.name === 'string' ? found.name : null;
+  const target = 'target' in found && typeof found.target === 'string' ? found.target : null;
+
+  return {
+    deploymentId: id,
+    url: host.startsWith('http') ? host : `https://${host}`,
+    meta: readMeta(found),
+    project,
+    target,
+  };
+}
+
+/** Provider metadata, as string pairs, however sparse the response view is. */
+function readMeta(response: unknown): Record<string, string> {
+  if (typeof response !== 'object' || response === null || !('meta' in response)) return {};
+  const meta = (response as { meta?: unknown }).meta;
+  if (typeof meta !== 'object' || meta === null) return {};
+
+  const pairs: Record<string, string> = {};
+  for (const [key, value] of Object.entries(meta as Record<string, unknown>)) {
+    if (typeof value === 'string') pairs[key] = value;
+  }
+  return pairs;
 }

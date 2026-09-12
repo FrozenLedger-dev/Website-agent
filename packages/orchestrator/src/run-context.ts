@@ -25,7 +25,7 @@
  * no authority of any kind — a context carries facts, it does not conclude
  * anything.
  */
-import type { AgentTier, BusinessProfile, SitePlan, TerminalOutcome } from '@statxai/contracts';
+import type { AgentTier, ArtifactRef, BusinessProfile, SitePlan, TerminalOutcome } from '@statxai/contracts';
 import type { ArtifactRegistry, ProjectWorkspace } from '@statxai/workspace';
 import type { ModelClient } from '@statxai/agents';
 import type { BudgetLimits, StateStore } from '@statxai/state';
@@ -95,6 +95,12 @@ export interface RunProgress {
   readonly repairHistory: readonly { defectId: string; fingerprint: string; outcome: string }[];
   readonly terminalDecision: TerminalOutcome | undefined;
   readonly authorization: ReleaseAuthorization | null;
+  /**
+   * The exact `release-authorization` artifact the authorisation above was
+   * written as — Phase 5p's release identity is derived from it, so it is
+   * carried rather than looked up again when publication happens.
+   */
+  readonly releaseAuthorizationRef: ArtifactRef | null;
   /** Provenance for the manifest: who recommended, and on which artifact. */
   readonly approvalArtifactVersion: number | null;
   readonly approvalModel: string | null;
@@ -131,6 +137,7 @@ export interface MutableRunProgress {
   repairHistory: { defectId: string; fingerprint: string; outcome: string }[];
   terminalDecision: TerminalOutcome | undefined;
   authorization: ReleaseAuthorization | null;
+  releaseAuthorizationRef: ArtifactRef | null;
   approvalArtifactVersion: number | null;
   approvalModel: string | null;
   approvalDecision: 'accept' | 'reject' | 'human_review' | null;
@@ -153,6 +160,7 @@ export function createRunProgress(): MutableRunProgress {
     repairHistory: [],
     terminalDecision: undefined,
     authorization: null,
+    releaseAuthorizationRef: null,
     approvalArtifactVersion: null,
     approvalModel: null,
     approvalDecision: null,

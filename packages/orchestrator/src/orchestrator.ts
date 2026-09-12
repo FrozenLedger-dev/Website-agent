@@ -522,6 +522,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       });
 
       progress.authorization = release.decision;
+      progress.releaseAuthorizationRef = release.authorizationRef;
       progress.approvalArtifactVersion = release.provenance.approvalArtifactVersion;
       progress.approvalModel = release.provenance.approvalModel;
       progress.approvalDecision = release.provenance.approvalDecision;
@@ -753,7 +754,12 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     return concluded(ctx(), 'blocked', terminalForRefusal(progress.authorization?.action ?? null));
   }
 
-  const { manifest, finalCommit } = await publishRelease(ctx(), progress.authorization);
+  const { manifest, finalCommit } = await publishRelease(ctx(), progress.authorization, {
+    // Non-null on every path that reaches publication: the guard above proves
+    // an authorisation exists, and `seekRelease` writes the artifact the
+    // authorisation came from before returning it.
+    releaseAuthorizationRef: progress.releaseAuthorizationRef!,
+  });
 
   return { ...(await concluded(ctx(), 'released', undefined)), commit: finalCommit, manifest };
 }

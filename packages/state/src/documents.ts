@@ -282,3 +282,113 @@ export interface FrontendBackendBuildBindingDocument {
   createdAt: Date;
   updatedAt: Date;
 }
+
+// ---------------------------------------------------------------------------
+// Release publication (Phase 5p)
+// ---------------------------------------------------------------------------
+
+/**
+ * Where one release publishes to, in non-secret terms.
+ *
+ * Persisted so a retry can prove it is still publishing to the same
+ * destination. Deliberately excluded from the release identity itself: if the
+ * target were part of `releaseId`, changing `VERCEL_TEAM_ID` mid-flight would
+ * silently mint a *different* release rather than being detected as drift, and
+ * an in-flight publication would migrate to another Vercel project without
+ * anyone deciding to. Bound here instead, so drift fails closed.
+ *
+ * Never holds a token: `VERCEL_TOKEN` is read at call time and never stored.
+ */
+export interface ReleaseDeploymentTarget {
+  /** The Vercel project name this release deploys to (`toProjectName`). */
+  project: string;
+  /** `VERCEL_TEAM_ID`, or `null` for a personal account. Not a secret. */
+  team: string | null;
+  /** The Vercel deployment target — `production` for a real release. */
+  environment: string;
+}
+
+/**
+ * Release publication status (Phase 5p).
+ *
+ * `publishing` is the state that matters: it means a `createDeployment`
+ * request *may already have reached Vercel*, and its outcome is not durably
+ * known here. @vercel/sdk@1.28.17 exposes no idempotency key for deployment
+ * creation and no server-side metadata filter to find a deployment by our own
+ * marker, so nothing in this process can prove whether that request created a
+ * production deployment. Automation therefore stops: `publishing` is never
+ * retried automatically, and never expires, times out, or reverts to
+ * `prepared` because a process died.
+ *
+ * `retry_authorized` is the *only* way out other than adoption, and it is
+ * written by a human operator through `scripts/reconcile-release.ts`, who has
+ * reconciled the ambiguous attempt against the Vercel dashboard themselves.
+ */
+export type ReleasePublicationStatus = 'prepared' | 'publishing' | 'retry_authorized' | 'committed';
+
+/** What one external publication attempt did. Never rewritten, never removed. */
+export interface ReleasePublicationAttempt {
+  attempt: number;
+  startedAt: Date;
+  /** The exact canonical revision this attempt published. */
+  releaseCommitSha: string | null;
+  status: 'publishing' | 'succeeded' | 'adopted' | 'retry_authorized';
+  deploymentId?: string;
+  deploymentUrl?: string;
+  /** When an operator (or a known-success outcome) resolved this attempt. */
+  resolvedAt?: Date;
+  /** Operator evidence, present only on an operator-resolved attempt. */
+  resolution?: { actor: string; reason: string };
+}
+
+/**
+ * The durable authority for one logical production release (Phase 5p).
+ *
+ * `_id` is the deterministic `releaseId` (see `computeReleaseId`), so this
+ * collection is itself the idempotency ledger — the same shape Phase 5h's
+ * `job_promotions` uses one layer down. What it adds over that pattern is an
+ * immutable *attempt history*: canonical Git promotion can prove its own
+ * replay from a commit marker, but an external Vercel deployment cannot be
+ * proven from inside this process at all, so every attempt that may have
+ * reached the provider is kept as evidence for the operator who has to
+ * reconcile it.
+ *
+ * A document with no `active` key is finished history (`committed`); a
+ * pre-Phase-5p release has no document here at all, which means "legacy
+ * historical release", never "stuck publishing".
+ */
+export interface ReleasePublicationDocument {
+  /** The deterministic release identity. */
+  _id: string;
+  projectId: string;
+  /** The exact authorisation this release publishes — immutable binding. */
+  releaseAuthorization: ArtifactRef;
+  /**
+   * Canonical HEAD at the moment this release was prepared, before its own
+   * release-authorized commit — `null` when the workspace had no commit at
+   * all. Authority on retry: HEAD that has moved without this release's Git
+   * marker fails closed rather than being adopted.
+   */
+  baseCommit: string | null;
+  deploymentTarget: ReleaseDeploymentTarget;
+  status: ReleasePublicationStatus;
+  /**
+   * Present only while this release is unfinished, and absent once
+   * `committed`. This is the project's one-active-publication slot: the
+   * partial unique index in `StateStore.ensureIndexes` is filtered on it.
+   * A separate field rather than a filter on `status` because Mongo's
+   * `partialFilterExpression` has no `$in` — the same reason Phase 5h's
+   * index filters on one exact status value.
+   */
+  active?: true;
+  /** The exact canonical revision published, once Git identity is established. */
+  releaseCommitSha: string | null;
+  deploymentId: string | null;
+  deploymentUrl: string | null;
+  /** How many external attempts have been started. `0` before the first. */
+  attempt: number;
+  attempts: ReleasePublicationAttempt[];
+  preparedAt: Date;
+  committedAt: Date | null;
+  updatedAt: Date;
+}

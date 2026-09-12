@@ -18,7 +18,7 @@ import {
 } from '@statxai/policy-engine';
 import { recommendApproval } from '@statxai/agents';
 import { deploymentConfigured } from '@statxai/workspace';
-import type { SolApprovalRecommendation } from '@statxai/contracts';
+import type { ArtifactRef, SolApprovalRecommendation } from '@statxai/contracts';
 import type { ApprovalRecord, AuthorizationRecord } from '../release.js';
 import type { Defect } from '../defects.js';
 import type { RunContext } from '../run-context.js';
@@ -45,6 +45,16 @@ export interface ApprovalProvenance {
 export interface ReleaseOutcome {
   decision: ReleaseAuthorization;
   provenance: ApprovalProvenance;
+  /**
+   * The exact `release-authorization` artifact this decision was written as.
+   *
+   * Returned rather than re-resolved by the publisher as "the latest
+   * release-authorization for this project": Phase 5p derives the release's
+   * durable identity from it, and an identity that came from a `sort({version:
+   * -1})` lookup would silently follow a newer decision written by a
+   * concurrent run.
+   */
+  authorizationRef: ArtifactRef;
 }
 
 export async function seekRelease(
@@ -188,6 +198,7 @@ export async function seekRelease(
 
   return {
     decision,
+    authorizationRef: authRef,
     provenance: {
       approvalArtifactVersion: approvalDoc?.version ?? null,
       approvalModel: record.model,

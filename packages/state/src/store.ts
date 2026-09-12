@@ -14,6 +14,7 @@ import type {
   JobDocument,
   JobPromotionRecord,
   ProjectDocument,
+  ReleasePublicationDocument,
   ReviewDocument,
 } from './documents.js';
 import type { RunDocument, RunEventDocument } from './runs.js';
@@ -99,6 +100,15 @@ export class StateStore {
    */
   get frontendBackendBuildBindings(): Collection<FrontendBackendBuildBindingDocument> {
     return this.db.collection<FrontendBackendBuildBindingDocument>('frontend_backend_build_bindings');
+  }
+  /**
+   * Durable release-publication authority (Phase 5p) — one document per
+   * logical production release, keyed by its deterministic `releaseId`, plus
+   * the immutable history of every external deployment attempt made under it.
+   * See `ReleasePublicationDocument`'s own doc comment.
+   */
+  get releasePublications(): Collection<ReleasePublicationDocument> {
+    return this.db.collection<ReleasePublicationDocument>('release_publications');
   }
 
   /**
@@ -187,6 +197,18 @@ export class StateStore {
     await this.frontendBackendBuildBindings.createIndexes([
       { key: { projectId: 1 }, unique: true, partialFilterExpression: { status: 'prepared' } },
       { key: { projectId: 1, jobId: 1 } },
+    ]);
+
+    // At most one unfinished release publication per project (Phase 5p) — the
+    // same project-scoped active-slot shape again, but filtered on `active`
+    // rather than on one status value: a release is unfinished across three
+    // statuses (`prepared`, `publishing`, `retry_authorized`) and Mongo's
+    // `partialFilterExpression` does not support `$in`. Two different releases
+    // must never be mid-publication for one project at the same time, because
+    // each of them can create a production deployment.
+    await this.releasePublications.createIndexes([
+      { key: { projectId: 1 }, unique: true, partialFilterExpression: { active: true } },
+      { key: { projectId: 1, preparedAt: -1 } },
     ]);
   }
 
