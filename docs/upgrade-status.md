@@ -4913,6 +4913,90 @@ no `clearSite` or recursive deletion exists.
 promotion materialises. Phase 5p release publication, the replan path and
 `legacy_direct` are untouched.
 
+## Phase 5q0 — durable authority for post-replan frontend/backend rebuilds — **DONE**
+
+The initial `job_lifecycle` build already had strong durable authority — exact
+profile and site-plan refs, a deterministic `JobSpec`, a build binding, a
+fenced job, isolated validation, guarded acceptance, canonical promotion. A
+*replanned* rebuild had none of it: the replan branch called `clearSite()` then
+`buildFromPlan()` regardless of execution mode, so the resulting canonical tree
+carried no evidence tying it to the plan it implements. That was the last
+blocker before safe post-promotion outer-run recovery, because a recovering
+process could not tell which plan the tree was built from without resolving
+"latest", which is wrong the moment two generations exist.
+
+**Canonical build authority is now an explicit chain.** The binding gained two
+fields, written together or not at all: `predecessorBindingId` and
+`replanDecision`. An initial build has neither — absent means "initial or
+legacy", never "successor whose lineage was lost". A replan successor names the
+exact binding it replaces and the exact `replan-decision` ArtifactRef that
+authorised it, so `B0 -> B1 -> B2` is readable from durable state without
+timestamps, newest-binding selection, or current HEAD as semantic identity.
+
+**Exact refs, threaded rather than re-resolved.** `revisePlan` now returns
+`RevisedPlan` carrying the `replanDecisionRef` it previously persisted and
+dropped on the floor; the revised `sitePlanRef` was already exact. The
+successor inherits the predecessor's exact `businessProfile` ref — discovery
+never reruns — and its `JobSpec` is built from those exact refs, so
+`computeBindingId({projectId, runIntentHash, jobSpecHash})` yields a
+deterministic successor identity with no new id scheme: same profile means the
+same `runIntentHash`, and the revised plan changes `jobSpecHash`.
+
+**One successor per predecessor, enforced by the database.** A partial unique
+index on `{ projectId, predecessorBindingId }` filtered on the field's
+existence. Deliberately *not* filtered on `status` like the active-slot index:
+that one frees the project once a build promotes, which is right for "may
+another generation start?" and wrong for lineage — a promoted successor still
+means its predecessor was replaced, so a second successor must stay impossible
+forever. Pre-5q0 bindings lack the field, sit outside the index, and need no
+backfill; the index builds against existing documents unchanged. A losing
+racer gets `FrontendBackendBuildLineageConflict`, distinct from the run-intent
+conflict the older index raises, because the recovery now asks which
+constraint actually holds rather than assuming the older one.
+
+**Lineage is immutable.** Exact replay converges on the same successor;
+presenting a different predecessor, decision, plan or spec for the same
+deterministic identity fails closed rather than rewriting stored authority —
+including presenting a successor as though it were an initial build.
+
+**The rebuild uses the ordinary lifecycle.** In `job_lifecycle` mode the replan
+branch prepares the successor, commits its specification, and runs the same
+coordinator with `JobOrigin { kind: 'replan', reviewCycle }` — same role, Terra
+handler, tools, candidate convention, isolated validation, guarded acceptance,
+Phase 5n fence and Phase 5h promotion identity. No `clearSite()`: the canonical
+tree keeps implementing the predecessor while the successor is built and
+validated elsewhere, and the exact-replacement promotion then removes the
+routes the revision dropped. The coordinator is constructed once per
+invocation and reused across the initial build and every replan, so there is
+never a second `JobRunner` claiming the same role for the same project.
+`canonicalBuild` advances only after a successful promotion — never when a
+successor is merely prepared, built, validated or accepted.
+
+**One guard had to learn a new fact.** `ensureSpecificationCommitted` refuses
+foreign dirt, and on a first build the only dirty paths are the profile and
+plan. A successor is prepared mid-run, when adjudication and the revision have
+already materialised their own `decisions/…` records; the caller now names
+those explicitly as expected. They are harness-authored and swept into the
+commit by `git add -A` either way — the initial build passes nothing and is
+unchanged.
+
+**Tests: +11 integration, one new file** driving the real orchestrator through
+two successive replans: exact R1/P1 and R2/P2 refs, `B1.predecessor = B0` and
+`B2.predecessor = B1`, replan origin, one job per generation each fenced and
+promoted with ordinary Phase 5h identity, `/services` and `/about` actually
+absent from the canonical tree, `app/.gitignore` untouched. Separate focused
+tests cover the concurrency race, replay convergence, immutable-lineage
+refusal, prepared-successor survival across reconstructed objects, an
+unpromoted successor leaving the predecessor canonical, an initial build with
+no lineage fields, `legacy_direct` still taking the direct path, index
+migration against historical bindings, and unchanged replan budgeting.
+
+**Unchanged:** `legacy_direct`, Phase 5n fencing, Phase 5p release
+publication, Luna repair, the JobEngine state machine, and replan policy and
+budgets. Outer `runProject` recovery is still not implemented — that is Phase
+5q, and it should now read the explicit `B0 -> B1 -> B2` lineage rather than
+adding a workflow cursor of its own.
+
 ## Phases 6–17
 
 Not started.

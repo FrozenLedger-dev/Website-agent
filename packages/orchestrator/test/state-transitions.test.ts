@@ -44,13 +44,14 @@ describe('the project state transition surface', () => {
 
     expect(counts).toEqual({
       planning: 1,
-      // Two, and they are mutually exclusive by construction (Phase 5j):
-      // `orchestrator.ts` writes it only on the `job_lifecycle` branch of the
-      // frontend_backend build boundary, `build.ts` only on the
-      // `legacy_direct` branch — exactly one of the two ever runs for a
-      // given build, the same "mutually exclusive" shape `blocked` below
-      // already has.
-      building: 2,
+      // Three, across two build boundaries, and at most one runs per build:
+      // `orchestrator.ts` writes it on the `job_lifecycle` branch of the
+      // initial boundary and again on the `job_lifecycle` replan rebuild
+      // (Phase 5q0 — a replanned rebuild is a real build and announces
+      // itself as one); `build.ts` writes it on the `legacy_direct` branch
+      // both times. The same "mutually exclusive" shape `blocked` below has,
+      // one cycle at a time.
+      building: 3,
       validating: 1,
       releasing: 1,
       released: 1,
@@ -68,9 +69,11 @@ describe('the project state transition surface', () => {
     const writes = await stateWrites();
 
     expect(writes['validating']).toEqual(['evaluate.ts']);
-    // `.sort()`: which of the two mutually-exclusive owners `readdir` visits
-    // first is not a claim this test makes.
-    expect(writes['building']?.slice().sort()).toEqual(['build.ts', 'orchestrator.ts']);
+    // `.sort()`: which of the mutually-exclusive owners `readdir` visits first
+    // is not a claim this test makes. `orchestrator.ts` appears twice because
+    // it owns the transition for both job-mode build boundaries — the initial
+    // one and the replan rebuild.
+    expect(writes['building']?.slice().sort()).toEqual(['build.ts', 'orchestrator.ts', 'orchestrator.ts']);
     expect(writes['releasing']).toEqual(['publish.ts']);
     expect(writes['released']).toEqual(['publish.ts']);
   });

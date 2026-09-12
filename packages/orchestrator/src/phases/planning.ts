@@ -20,6 +20,20 @@ export interface ProducedPlan {
   readonly sitePlanRef: ArtifactRef;
 }
 
+/**
+ * A revision, plus the exact decision that authorised it.
+ *
+ * `replanDecisionRef` used to be a local: the record was persisted and its
+ * ref dropped on the floor, which left a rebuilt site with no durable link
+ * back to the decision that caused it. Recovering that link later would mean
+ * resolving the *latest* `replan-decision`, and "latest" is exactly what a
+ * second concurrent revision makes wrong. Returned here so the caller binds
+ * the exact one.
+ */
+export interface RevisedPlan extends ProducedPlan {
+  readonly replanDecisionRef: ArtifactRef;
+}
+
 export async function producePlan(ctx: FixedContext, attempt: number): Promise<ProducedPlan> {
   const { deps, facts } = ctx;
   deps.say({
@@ -114,7 +128,7 @@ export async function revisePlan(
     gateFindings: readonly string[];
     reviewSummary: string | null;
   },
-): Promise<ProducedPlan | null> {
+): Promise<RevisedPlan | null> {
   const { deps, facts, progress } = ctx;
   const budget = (await deps.store.budgets.findOne({ _id: facts.projectId }))!;
 
@@ -216,8 +230,8 @@ export async function revisePlan(
     }
   }
 
-  const ref = await deps.registry.put(facts.projectId, 'replan-decision', record);
-  await deps.registry.accept(facts.projectId, ref);
+  const replanDecisionRef = await deps.registry.put(facts.projectId, 'replan-decision', record);
+  await deps.registry.accept(facts.projectId, replanDecisionRef);
   await deps.workspace.materialiseArtifact(
     `decisions/replan-${String(progress.reviewCycle).padStart(2, '0')}.json`,
     record,
@@ -255,5 +269,5 @@ export async function revisePlan(
     level: 'ok',
   });
 
-  return { plan: revisedPlan!, sitePlanRef };
+  return { plan: revisedPlan!, sitePlanRef, replanDecisionRef };
 }

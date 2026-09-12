@@ -81,6 +81,32 @@ export class FrontendBackendBuildBindingConflict extends Error {
  * recorded alongside it. Never silently repaired by rerunning discovery or
  * substituting newer artifacts.
  */
+/**
+ * The exact predecessor already has a different durable successor (Phase 5q0).
+ *
+ * Distinct from {@link FrontendBackendBuildBindingConflict}, which is about a
+ * *different logical request* being mid-build for the project. This one is
+ * about lineage: canonical build authority is a chain, and a predecessor may
+ * be replaced once. A second, different replacement is refused rather than
+ * allowed to branch it — including long after the first successor promoted,
+ * because a promoted successor still means the predecessor was replaced.
+ */
+export class FrontendBackendBuildLineageConflict extends Error {
+  constructor(
+    readonly projectId: string,
+    readonly predecessorBindingId: string,
+    readonly existingSuccessorId: string,
+    readonly incomingSuccessorId: string,
+  ) {
+    super(
+      `frontend_backend build "${predecessorBindingId}" (project "${projectId}") already has successor ` +
+        `"${existingSuccessorId}"; refusing to create a second, different successor ` +
+        `"${incomingSuccessorId}" — canonical build lineage does not branch`,
+    );
+    this.name = 'FrontendBackendBuildLineageConflict';
+  }
+}
+
 export class FrontendBackendBuildBindingCorrupt extends Error {
   constructor(bindingId: string, detail: string) {
     super(`frontend_backend build binding "${bindingId}" is corrupt — ${detail}`);
@@ -240,7 +266,29 @@ function sameRef(a: ArtifactRef, b: ArtifactRef): boolean {
  * corruption — a hand-edited or otherwise inconsistent record — and is
  * never silently repaired.
  */
-export function verifyBindingConsistency(binding: FrontendBackendBuildBindingDocument, spec: JobSpec): void {
+export function verifyBindingConsistency(
+  binding: FrontendBackendBuildBindingDocument,
+  spec: JobSpec,
+  lineage?: PrepareBindingInput['lineage'],
+): void {
+  // Checked before the spec fields below, because lineage is what makes two
+  // otherwise-identical successors different builds. The stored record is
+  // never edited to match the caller: exact replay converges, anything else
+  // fails closed.
+  if (lineage) {
+    if (binding.predecessorBindingId !== lineage.predecessorBindingId) {
+      throw new FrontendBackendBuildBindingCorrupt(
+        binding._id,
+        `binding.predecessorBindingId is ${binding.predecessorBindingId ?? '(absent)'}, not "${lineage.predecessorBindingId}"`,
+      );
+    }
+    if (!binding.replanDecision || !sameRef(binding.replanDecision, lineage.replanDecisionRef)) {
+      throw new FrontendBackendBuildBindingCorrupt(binding._id, 'binding.replanDecision does not match the exact replan decision presented');
+    }
+  } else if (binding.predecessorBindingId !== undefined) {
+    throw new FrontendBackendBuildBindingCorrupt(binding._id, 'binding is a replan successor but was presented as an initial build');
+  }
+
   if (binding.projectId !== spec.projectId) {
     throw new FrontendBackendBuildBindingCorrupt(binding._id, 'binding.projectId does not match spec.projectId');
   }
@@ -275,6 +323,17 @@ export interface PrepareBindingInput {
   readonly jobSpec: JobSpec;
   /** Canonical HEAD at the moment of preparation, before the specification commit — `null` for a project's first-ever commit. */
   readonly specificationBaseCommit: string | null;
+  /**
+   * The exact canonical build this one replaces, and the exact decision that
+   * authorised it (Phase 5q0). Supplied together by a replan successor and
+   * omitted together by an initial build — a successor that recorded one
+   * without the other would be precisely the unprovable state this exists to
+   * remove.
+   */
+  readonly lineage?: {
+    readonly predecessorBindingId: string;
+    readonly replanDecisionRef: ArtifactRef;
+  };
 }
 
 function isDuplicateKeyError(error: unknown): boolean {
@@ -301,7 +360,7 @@ export async function prepareFrontendBackendBuildBinding(
 
   const existing = await store.frontendBackendBuildBindings.findOne({ _id: bindingId });
   if (existing) {
-    verifyBindingConsistency(existing, input.jobSpec);
+    verifyBindingConsistency(existing, input.jobSpec, input.lineage);
     return existing;
   }
 
@@ -320,6 +379,12 @@ export async function prepareFrontendBackendBuildBinding(
     specificationCommitSha: null,
     promotionId: null,
     promotionCommitSha: null,
+    ...(input.lineage
+      ? {
+          predecessorBindingId: input.lineage.predecessorBindingId,
+          replanDecision: input.lineage.replanDecisionRef,
+        }
+      : {}),
     createdAt: now,
     updatedAt: now,
   };
@@ -335,9 +400,29 @@ export async function prepareFrontendBackendBuildBinding(
     // exists now, not by parsing the driver's error shape.
     const raced = await store.frontendBackendBuildBindings.findOne({ _id: bindingId });
     if (raced) {
-      verifyBindingConsistency(raced, input.jobSpec);
+      verifyBindingConsistency(raced, input.jobSpec, input.lineage);
       return raced;
     }
+
+    // Two partial unique indexes can now refuse this insert, and they mean
+    // different things — so ask which constraint actually holds rather than
+    // assuming the older one, which would report a branched lineage as "a
+    // different request is mid-build".
+    if (input.lineage) {
+      const rival = await store.frontendBackendBuildBindings.findOne({
+        projectId: input.projectId,
+        predecessorBindingId: input.lineage.predecessorBindingId,
+      });
+      if (rival) {
+        throw new FrontendBackendBuildLineageConflict(
+          input.projectId,
+          input.lineage.predecessorBindingId,
+          rival._id,
+          bindingId,
+        );
+      }
+    }
+
     const other = await store.frontendBackendBuildBindings.findOne({ projectId: input.projectId, status: 'prepared' });
     throw new FrontendBackendBuildBindingConflict(input.projectId, other?.runIntentHash ?? '(unknown)', input.runIntentHash);
   }
@@ -400,6 +485,18 @@ export async function ensureSpecificationCommitted(
   workspace: ProjectWorkspace,
   binding: FrontendBackendBuildBindingDocument,
   plan: SitePlan,
+  /**
+   * Further repo-relative paths this caller knows are its own.
+   *
+   * The guard below exists to stop a *foreign* change riding into the
+   * specification commit, and on a first build the only dirty paths are the
+   * profile and the plan. A replan successor is prepared mid-run, when the
+   * harness has also materialised its own decision records (`decisions/…`)
+   * that nothing has committed yet — authored by the harness, never by a
+   * model, and swept in by `commit()`'s `git add -A` either way. The caller
+   * names them rather than this module widening the rule for everyone.
+   */
+  alsoExpected: readonly string[] = [],
 ): Promise<string> {
   const marker = bindingMarker(binding._id);
   const shas = await workspace.findCommitsByMarker(marker);
@@ -433,7 +530,7 @@ export async function ensureSpecificationCommitted(
     throw new FrontendBackendBuildBindingBaseConflict(binding.projectId, binding._id, binding.specificationBaseCommit, currentHead);
   }
 
-  const expectedSpecificationPaths = new Set([BUSINESS_PROFILE_ARTIFACT_PATH, ...sitePlanArtifactPaths(plan)]);
+  const expectedSpecificationPaths = new Set([BUSINESS_PROFILE_ARTIFACT_PATH, ...sitePlanArtifactPaths(plan), ...alsoExpected]);
   const dirty = await workspace.dirtyPaths();
   const unexpected = dirty.filter((path) => !expectedSpecificationPaths.has(path));
   if (unexpected.length > 0) {

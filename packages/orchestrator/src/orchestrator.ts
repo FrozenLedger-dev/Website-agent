@@ -43,7 +43,10 @@ import { producePlan, revisePlan } from './phases/planning.js';
 import { executeRepairs } from './phases/repair.js';
 import { publishRelease } from './phases/publish.js';
 import { seekRelease } from './phases/release.js';
-import { createFrontendBackendLifecycleCoordinator } from './job-lifecycle/frontend-backend.js';
+import {
+  createFrontendBackendLifecycleCoordinator,
+  type FrontendBackendLifecycleCoordinator,
+} from './job-lifecycle/frontend-backend.js';
 import { createFrontendBackendJobSpec } from './job-specs/frontend-backend.js';
 import {
   computeRunIntentHash,
@@ -204,6 +207,21 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   // rehydrating durable state directly, never by calling `discoverProject`
   // or `producePlan` at all.
   let discovery: DiscoverResult;
+  /**
+   * The exact promoted `frontend_backend` binding the canonical tree
+   * currently implements — `B0`, then `B1` after a replan successor
+   * promotes, and so on. Held explicitly rather than rediscovered as "the
+   * newest promoted binding", which stops being the right answer the moment
+   * a project has more than one generation.
+   */
+  let canonicalBuild: FrontendBackendBuildBindingDocument | null = null;
+  /**
+   * The one `frontend_backend` lifecycle rig for this invocation, assigned at
+   * the build boundary below and reused by a replan rebuild in the evaluate
+   * loop. Hoisted rather than rebuilt there: two rigs would mean two
+   * `JobRunner`s claiming the same role for the same project.
+   */
+  let lifecycleCoordinator: FrontendBackendLifecycleCoordinator | null = null;
   let activeBinding: FrontendBackendBuildBindingDocument | null = null;
   let resumedPlan: SitePlan | null = null;
   let resumedSpec: JobSpec | null = null;
@@ -373,7 +391,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     // `JobEngine`, no lifecycle coordinator, no job inspected or enqueued on
     // the legacy path.
     const engine = new JobEngine(store);
-    const coordinator = createFrontendBackendLifecycleCoordinator({
+    const coordinator = (lifecycleCoordinator = createFrontendBackendLifecycleCoordinator({
       store,
       registry,
       engine,
@@ -385,7 +403,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       validationWorkspacesRoot: options.validationWorkspacesRoot!,
       say,
       track,
-    });
+    }));
 
     // Phase 5k: on resume, the stored spec is authority — the factory is
     // never called again, and its output is never treated as though it
@@ -477,6 +495,12 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       promotionId: result.promotionId,
       promotionCommitSha: result.commitSha,
     });
+
+    // Canonical build authority, advanced only here. A replan successor
+    // becomes canonical when its own promotion succeeds, never when it is
+    // merely prepared, built, validated or accepted — until then the
+    // predecessor is still what the canonical tree implements.
+    canonicalBuild = binding;
 
     say({ phase: 'build', detail: `frontend_backend promoted: commit ${result.commitSha}`, level: 'ok' });
   } else {
@@ -649,16 +673,92 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         break;
       }
 
-      await workspace.clearSite();
       progress.replansUsed += 1;
       progress.plan = revised.plan;
-      // A replan-triggered rebuild always uses the legacy direct path,
-      // regardless of `frontendBackendExecutionMode` — Phase 5j cuts over
-      // only the initial build boundary above. This is a documented scope
-      // limitation (see docs/upgrade-status.md's Phase 5j section), not a
-      // double-build: a replanned rebuild is a new request from a new plan
-      // version, not a second attempt at the request Phase 5i already
-      // handled.
+
+      if (frontendBackendExecutionMode === 'job_lifecycle' && canonicalBuild && lifecycleCoordinator) {
+        /**
+         * A replanned rebuild is a new request from a new plan version, and
+         * it earns the same durable authority the initial build has: a
+         * successor binding naming the exact predecessor it replaces and the
+         * exact decision that authorised it, then the ordinary lifecycle —
+         * Terra, isolated validation, guarded acceptance, the promotion
+         * fence, and canonical promotion.
+         *
+         * No `clearSite()` here, and that is the point of the whole slice:
+         * the canonical tree keeps implementing the predecessor while the
+         * successor is built and validated somewhere else, and promotion
+         * replaces it exactly — removing the routes this revision dropped —
+         * only once the candidate has been accepted.
+         */
+        const successorSpec = createFrontendBackendJobSpec({
+          projectId,
+          businessProfileRef,
+          sitePlanRef: revised.sitePlanRef,
+        });
+        const successor = await prepareFrontendBackendBuildBinding(store, {
+          projectId,
+          runIntentHash: computeRunIntentHash({ projectId, profile }),
+          businessProfileRef,
+          sitePlanRef: revised.sitePlanRef,
+          jobSpec: successorSpec,
+          specificationBaseCommit: await workspace.currentCommit(),
+          lineage: {
+            predecessorBindingId: canonicalBuild._id,
+            replanDecisionRef: revised.replanDecisionRef,
+          },
+        });
+
+        await store.projects.updateOne(
+          { _id: projectId },
+          { $set: { state: 'building', updatedAt: new Date() } },
+        );
+
+        // The revised specification has to exist on disk before the
+        // replay-safe specification commit can find or create it.
+        await rehydrateSpecificationFiles(workspace, profile, revised.plan);
+
+        // Adjudication and the revision itself materialise their own records
+        // before this point; they are this run's own harness-written evidence,
+        // not a foreign change, so the specification commit expects them.
+        const harnessRecords = (await workspace.dirtyPaths()).filter((p) => p.startsWith('decisions/'));
+        await ensureSpecificationCommitted(store, workspace, successor, revised.plan, harnessRecords);
+
+        say({
+          phase: 'build',
+          detail: `Rebuilding frontend_backend via job_lifecycle after replan (job ${successorSpec.jobId})`,
+        });
+
+        const rebuilt = await lifecycleCoordinator.run(successorSpec, {
+          kind: 'replan',
+          reviewCycle: progress.reviewCycle,
+        });
+
+        if (rebuilt.outcome !== 'promoted') {
+          say({
+            phase: 'build',
+            detail: `frontend_backend replan rebuild did not complete this invocation (${rebuilt.outcome})`,
+            level: 'fail',
+          });
+          // Canonical authority stays on the predecessor: an unpromoted
+          // successor never becomes what the tree implements.
+          return { ...(await concluded(ctx(), 'blocked', undefined)), jobLifecycleOutcome: rebuilt.outcome };
+        }
+
+        await finalizeBindingPromoted(store, successor._id, {
+          promotionId: rebuilt.promotionId,
+          promotionCommitSha: rebuilt.commitSha,
+        });
+        canonicalBuild = successor;
+
+        say({ phase: 'build', detail: `frontend_backend replan promoted: commit ${rebuilt.commitSha}`, level: 'ok' });
+        progress.repairedSinceReview = [];
+        continue;
+      }
+
+      // `legacy_direct` (and any job-mode run with no promoted predecessor to
+      // replace) keeps the original direct rebuild, unchanged.
+      await workspace.clearSite();
       await buildFromPlan(ctx(), revised.plan);
       progress.repairedSinceReview = [];
       continue;

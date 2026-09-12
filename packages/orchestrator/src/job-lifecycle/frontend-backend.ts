@@ -19,7 +19,7 @@
  * or a deployment pipeline. It drives exactly one `frontend_backend`
  * `JobSpec`, to at most one Terra worker execution attempt, per call.
  */
-import type { ArtifactRef, JobSpec, JobState } from '@statxai/contracts';
+import type { ArtifactRef, JobOrigin, JobSpec, JobState } from '@statxai/contracts';
 import type { JobDocument, StateStore } from '@statxai/state';
 import { contentHash, type ArtifactRegistry, type BuildResult } from '@statxai/workspace';
 import type { ModelClient } from '@statxai/agents';
@@ -147,7 +147,7 @@ export type FrontendBackendLifecycleResult =
     };
 
 export interface FrontendBackendLifecycleCoordinator {
-  run(spec: JobSpec): Promise<FrontendBackendLifecycleResult>;
+  run(spec: JobSpec, origin?: JobOrigin): Promise<FrontendBackendLifecycleResult>;
 }
 
 function isDuplicateKeyError(error: unknown): boolean {
@@ -234,14 +234,14 @@ export function createFrontendBackendLifecycleCoordinator(
    * caller that loses the race on the unique `_id` re-reads and verifies
    * the same way, rather than ever producing a second job.
    */
-  async function ensureJob(spec: JobSpec): Promise<{ job: JobDocument; enqueued: boolean }> {
+  async function ensureJob(spec: JobSpec, origin: JobOrigin): Promise<{ job: JobDocument; enqueued: boolean }> {
     const existing = await deps.store.jobs.findOne({ _id: spec.jobId });
     if (existing) {
       if (!sameJobSpec(existing.spec, spec)) throw new FrontendBackendLifecycleJobConflict(spec.jobId);
       return { job: existing, enqueued: false };
     }
     try {
-      const created = await deps.engine.enqueue({ spec, origin: { kind: 'plan' } });
+      const created = await deps.engine.enqueue({ spec, origin });
       return { job: created, enqueued: true };
     } catch (error) {
       if (!isDuplicateKeyError(error)) throw error;
@@ -396,12 +396,22 @@ export function createFrontendBackendLifecycleCoordinator(
   }
 
   return {
-    async run(spec: JobSpec): Promise<FrontendBackendLifecycleResult> {
+    /**
+     * `origin` says *why* this build exists, and defaults to the initial-plan
+     * case so every existing caller is unchanged.
+     *
+     * Forwarded to `JobEngine.enqueue` verbatim and never inspected here: this
+     * lifecycle executes one role and has no opinion about the cause a caller
+     * records against it. Deciding that cause is the orchestrator's business,
+     * and keeping it out of this module is what stops the executor growing
+     * policy authority it should not have.
+     */
+    async run(spec: JobSpec, origin: JobOrigin = { kind: 'plan' }): Promise<FrontendBackendLifecycleResult> {
       if (spec.role !== ROLE) throw new FrontendBackendLifecycleRoleMismatch(spec.role);
       requirePinnedInput(spec, FRONTEND_BACKEND_INPUT.businessProfile);
       requirePinnedInput(spec, FRONTEND_BACKEND_INPUT.sitePlan);
 
-      const { job, enqueued } = await ensureJob(spec);
+      const { job, enqueued } = await ensureJob(spec, origin);
       return advance(job, enqueued, false);
     },
   };

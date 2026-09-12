@@ -270,6 +270,27 @@ export interface FrontendBackendBuildBindingDocument {
   promotionId: string | null;
   promotionCommitSha: string | null;
   /**
+   * The exact canonical build this one replaces, and the exact decision that
+   * authorised replacing it (Phase 5q0).
+   *
+   * Absent together on an initial build — there is nothing to replace — and
+   * present together on a replan successor, never one without the other.
+   * That makes canonical build authority an explicit chain (`B0 -> B1 -> B2`)
+   * rather than something a later reader has to infer from timestamps or by
+   * picking the newest promoted binding, both of which are wrong the moment
+   * two generations exist for one project.
+   *
+   * Optional rather than `| null`-defaulted, for the same reason the
+   * abandonment fields below are: a binding written before Phase 5q0 simply
+   * has neither key, which is a valid historical initial build and not a
+   * document awaiting migration. Absent therefore means "initial or legacy",
+   * never "successor whose lineage was lost".
+   *
+   * Immutable once written: a successor is defined by what it replaces.
+   */
+  predecessorBindingId?: string;
+  replanDecision?: ArtifactRef;
+  /**
    * Operator evidence, set only once `status` becomes `abandoned` (Phase
    * 5m) — all three together, never individually. Optional, not
    * `| null`-defaulted: a binding written before Phase 5m existed simply

@@ -197,6 +197,21 @@ export class StateStore {
     await this.frontendBackendBuildBindings.createIndexes([
       { key: { projectId: 1 }, unique: true, partialFilterExpression: { status: 'prepared' } },
       { key: { projectId: 1, jobId: 1 } },
+      // At most one replan successor per exact predecessor (Phase 5q0).
+      // Deliberately *not* filtered on `status` like the active-slot index
+      // above: that one frees the project once a build promotes, which is
+      // right for "may another generation start?" and wrong for lineage. A
+      // promoted successor still means its predecessor has been replaced, so
+      // a second successor of the same predecessor must stay impossible
+      // forever, not just while the first is unfinished. Partial on the
+      // field's existence, so every pre-5q0 binding — which has no such
+      // field — is outside the index and the build succeeds without any
+      // backfill.
+      {
+        key: { projectId: 1, predecessorBindingId: 1 },
+        unique: true,
+        partialFilterExpression: { predecessorBindingId: { $exists: true } },
+      },
     ]);
 
     // At most one unfinished release publication per project (Phase 5p) — the
