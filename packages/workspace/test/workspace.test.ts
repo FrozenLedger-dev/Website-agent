@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -157,5 +157,91 @@ describe('commit marker lookup', () => {
     await ws.writeSiteFiles([{ path: 'other.html', contents: '<h1>real</h1>' }]);
     const realSha = await ws.commit(`Promote accepted frontend/backend candidate\n\n${marker}`);
     expect(await ws.findCommitByMarker(marker)).toBe(realSha);
+  });
+});
+
+/**
+ * The two APIs canonical promotion uses to decide what it may delete.
+ *
+ * Both exist because a path alone cannot answer the question promotion has to
+ * ask. "This file is absent from what I am about to promote" is true of a
+ * route the plan dropped, of somebody's half-finished edit, and of a scratch
+ * file nobody tracks — and only one of those may be removed.
+ */
+describe('managed site membership and dirty status', () => {
+  /** A committed site with a file outside the managed root, plus local changes. */
+  async function workspaceWithChanges(suffix: string): Promise<ProjectWorkspace> {
+    const ws = await ProjectWorkspace.open(`${PROJECT}_${suffix}`, root);
+    await ws.writeSiteFiles([
+      { path: 'app/page.tsx', contents: 'home' },
+      { path: 'app/services/page.tsx', contents: 'services' },
+      { path: 'components/site/mark.tsx', contents: 'mark' },
+    ]);
+    // Outside the site root: an artifact materialisation, never site content.
+    await ws.materialiseArtifact('specs/sitemap.json', { pages: [] });
+    await ws.commit('baseline');
+    return ws;
+  }
+
+  it('distinguishes a modified file from a deleted one and from an untracked one', async () => {
+    const ws = await workspaceWithChanges('dirty_status');
+    const siteRoot = join(root, `${PROJECT}_dirty_status`, 'app');
+
+    await writeFile(join(siteRoot, 'app/page.tsx'), 'EDITED', 'utf8');
+    await rm(join(siteRoot, 'app/services/page.tsx'));
+    await writeFile(join(siteRoot, 'scratch.txt'), 'x', 'utf8');
+
+    const byPath = new Map((await ws.dirtyEntries()).map((e) => [e.path, e.status]));
+
+    // Git's own codes, kept verbatim: the caller asks the question, not this API.
+    expect(byPath.get('app/app/page.tsx')).toBe(' M');
+    expect(byPath.get('app/app/services/page.tsx')).toBe(' D');
+    expect(byPath.get('app/scratch.txt')).toBe('??');
+  });
+
+  it('reports the same paths through dirtyPaths as before', async () => {
+    const ws = await workspaceWithChanges('dirty_compat');
+    const siteRoot = join(root, `${PROJECT}_dirty_compat`, 'app');
+
+    await writeFile(join(siteRoot, 'app/page.tsx'), 'EDITED', 'utf8');
+    await rm(join(siteRoot, 'app/services/page.tsx'));
+    await writeFile(join(siteRoot, 'scratch.txt'), 'x', 'utf8');
+
+    // The path-level view is exactly the entries' paths — existing callers
+    // (the specification and promotion guards) see no change.
+    expect(await ws.dirtyPaths()).toEqual((await ws.dirtyEntries()).map((e) => e.path));
+    expect(await ws.dirtyPaths()).toEqual(
+      expect.arrayContaining(['app/app/page.tsx', 'app/app/services/page.tsx', 'app/scratch.txt']),
+    );
+  });
+
+  it('tracks only managed site files, never artifacts outside the site root', async () => {
+    const ws = await workspaceWithChanges('tracked_scope');
+    const tracked = await ws.trackedSiteFiles();
+
+    expect(tracked).toEqual(
+      expect.arrayContaining(['app/app/page.tsx', 'app/app/services/page.tsx', 'app/components/site/mark.tsx']),
+    );
+    // `specs/sitemap.json` is tracked, and deliberately not site membership.
+    expect(tracked.every((path) => path.startsWith('app/'))).toBe(true);
+    expect(tracked).not.toContain('specs/sitemap.json');
+  });
+
+  it('still lists a tracked file deleted in the working tree but not staged', async () => {
+    // This is what lets an interrupted promotion recompute the identical
+    // stale set on its retry instead of losing track of its own unfinished
+    // deletion: the file is gone from disk but still in the index.
+    const ws = await workspaceWithChanges('tracked_deleted');
+    await rm(join(root, `${PROJECT}_tracked_deleted`, 'app', 'app/services/page.tsx'));
+
+    expect(await ws.trackedSiteFiles()).toContain('app/app/services/page.tsx');
+  });
+
+  it('never lists an untracked site file', async () => {
+    const ws = await workspaceWithChanges('tracked_untracked');
+    await writeFile(join(root, `${PROJECT}_tracked_untracked`, 'app', 'scratch.txt'), 'x', 'utf8');
+
+    // Absent from the index, so it can never become a deletion candidate.
+    expect(await ws.trackedSiteFiles()).not.toContain('app/scratch.txt');
   });
 });

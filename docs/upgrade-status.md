@@ -4827,6 +4827,92 @@ identity, never permission to release. No outer `runProject` resume, no
 repair/replan cursor, no provider scanning as authority, no deployment
 deletion, no Git reset/rebase, no artifact deletion.
 
+## Phase 5h prerequisite — promotion materialises the exact accepted site tree — **DONE**
+
+Canonical promotion was an overlay: `scaffoldSite(ws.siteRoot)` then
+`ws.writeSiteFiles(candidate.files)`, with nothing removing a predecessor
+file the accepted candidate no longer contains. That is indistinguishable
+from a replacement until a candidate *drops* something — a revised plan that
+removes a route produces a candidate with no file for it, and the
+predecessor's page stayed committed and deployable. No gate caught it:
+`spec-coverage` asks only whether every planned route was exported, never
+whether an exported route is still planned. Found while scoping Phase 5q0,
+which cannot route a replan rebuild through the lifecycle until promoting a
+candidate actually yields that candidate.
+
+**The promoted tree is now a set, not a diff.** `desiredPaths` (unchanged in
+formula, renamed from `expectedPaths`) is `scaffoldTemplatePaths() ∪
+candidate.files`, each resolved through `ws.siteFileRepoPath`; `stalePaths`
+is `trackedSiteFiles() − desiredPaths`. Every stale member is therefore
+tracked by git, inside the managed namespace, and provably absent from what
+was accepted — no other file is eligible for deletion.
+
+**`app/**` is the managed namespace, proven rather than assumed.** Every
+desired path resolves through `safeSitePath` against `siteRoot`, so all 23
+scaffold paths land under `app/` (`package.json` → `app/package.json`,
+`lib/utils.ts` → `app/lib/utils.ts`) and traversal is refused with
+`PathEscapesWorkspace`. Verified against a real workspace: 29 tracked files
+under `app/` = 23 scaffold-owned + 6 candidate-supplied, while everything
+tracked outside `app/` is artifact materialisation (`client/`, `decisions/`,
+`design/`, `specs/`) and is never eligible. `app/.gitignore` is scaffold-owned
+and so always in `desiredPaths` — deleting it would make `.next/`, `out/` and
+`node_modules/` trackable and poison every later dirty check.
+
+**Two new workspace APIs.** `dirtyEntries()` keeps git's two-letter `XY`
+status beside each path; `dirtyPaths()` is now its path-level view, so the
+specification and promotion guards that only ever asked "is this path
+unexpectedly dirty?" are unchanged. `trackedSiteFiles()` reads `git ls-files
+-z -- app` — the index, never a directory walk, which would also sweep up
+untracked scratch files and ignored build output. A tracked file deleted in
+the worktree but unstaged is still listed, which is what lets an interrupted
+attempt recompute an identical stale set on retry.
+
+**The dirty authority admits exactly two mutation classes**, and the
+distinction is the safety property: a path in `desiredPaths`, or a git `D`
+status on a path in `stalePaths`. A stale path that is *modified* rather than
+deleted is somebody's uncommitted work on a file this promotion wants gone —
+erasing it because the destination matches would be silent data loss, so only
+a deletion qualifies. An untracked path can never qualify, because
+`stalePaths` is drawn from the index; it is refused, not tidied away. The
+post-mutation allowlist is `desiredPaths ∪ stalePaths`, never "anything under
+the site root".
+
+**Order:** scaffold → candidate writes → delete exact stale paths → one
+commit. Deletion is last because `scaffoldSite` copies with `force: false`
+and `writeSiteFiles` writes candidate paths, so deleting first would let
+either resurrect a path the attempt had already removed. Writes and deletions
+reach the index through the existing `git add -A`, so both land in the single
+commit carrying `Statx-Promotion-Id` — no cleanup commit, no second marker,
+no replacement receipt. Exact `rm` per stale path; no `clearSite`, no
+recursive sweep.
+
+**Unchanged:** `promotionId`, the receipt and its lifecycle, the Phase 5n
+fence, `baseCommit` authority (still checked before any mutation, still
+fail-closed on drift), and the marker-replay branch — which returns before
+materialisation, so a committed replay deletes nothing and produces no churn.
+
+**Crash windows.** Because deletion runs last, "interrupted after deleting"
+and "interrupted after all filesystem mutations" are the same seam, and the
+exact retry converges: the deleted file is still in the index, so
+`stalePaths` recomputes identically and `dirtyEntries` reports the deletion
+as this promotion's own expected work. Commit-succeeded-before-receipt still
+recovers through the marker with the stale paths staying deleted.
+
+**Tests: +5 workspace (12 → 17) and +14 promotion (35 → 49).** The workspace
+five pin `dirtyEntries`' modified/deleted/untracked distinction, `dirtyPaths`
+compatibility, and `trackedSiteFiles` scope including the deleted-but-indexed
+and untracked cases. The promotion fourteen prove initial-promotion
+regression, same-path-set update, route removal, rename, nested stale files,
+`.gitignore` survival, outside-`app/` preservation, modified-stale refusal,
+untracked preservation, single-marker commit, exact final-tree set equality,
+committed replay without churn, crash-before-commit convergence,
+commit-before-receipt marker recovery, base drift, and a structural check that
+no `clearSite` or recursive deletion exists.
+
+**Phase 5q0 remains unimplemented**; this prerequisite only changes what a
+promotion materialises. Phase 5p release publication, the replan path and
+`legacy_direct` are untouched.
+
 ## Phases 6–17
 
 Not started.

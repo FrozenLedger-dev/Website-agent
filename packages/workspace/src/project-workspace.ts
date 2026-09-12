@@ -25,6 +25,21 @@ export class PathEscapesWorkspace extends Error {
   }
 }
 
+/**
+ * One uncommitted working-tree change, as git reports it.
+ *
+ * `status` is git's raw two-character `XY` code — index status then
+ * working-tree status — kept verbatim rather than interpreted into an enum
+ * here, so a caller can ask the exact question it needs (`is this a
+ * deletion?`, `is this untracked?`) without this module having to anticipate
+ * every such question. `' D'` is a tracked file deleted in the working tree,
+ * `' M'` one that was modified, `'??'` an untracked path.
+ */
+export interface DirtyEntry {
+  readonly status: string;
+  readonly path: string;
+}
+
 export class ProjectWorkspace {
   private constructor(
     readonly projectId: string,
@@ -141,16 +156,23 @@ export class ProjectWorkspace {
   }
 
   /**
-   * Every path with an uncommitted change in the working tree, repo-root
-   * relative — `git status --porcelain -z` (`-z` so a path is never subject
-   * to git's own quoting/escaping, unlike the plain porcelain format
-   * `commit()` uses for its own simpler empty-vs-nonempty check). A rename
-   * or copy entry is reported by its destination path only; git does not
-   * detect renames in unstaged working-tree status by default, so this is a
-   * defensive allowance rather than behaviour anything here currently
-   * exercises.
+   * Every uncommitted working-tree change, with git's own two-letter status
+   * code preserved alongside the repo-root-relative path.
+   *
+   * The code is the part that distinguishes "somebody edited this file" from
+   * "this file is already gone". A caller deciding whether it may delete a
+   * path cannot tell those apart from the path alone, and treating them the
+   * same is how local work gets silently erased — so the status travels with
+   * the path rather than being discarded here.
+   *
+   * `git status --porcelain -z`: `-z` so a path is never subject to git's own
+   * quoting/escaping, unlike the plain porcelain format `commit()` uses for
+   * its own simpler empty-vs-nonempty check. A rename or copy entry is
+   * reported by its destination path only; git does not detect renames in
+   * unstaged working-tree status by default, so that is a defensive
+   * allowance rather than behaviour anything here currently exercises.
    */
-  async dirtyPaths(): Promise<string[]> {
+  async dirtyEntries(): Promise<DirtyEntry[]> {
     // `--untracked-files=all`: without it, a wholly-new untracked directory
     // (the common case for `app/` on a first-ever promotion, before
     // anything has committed it) is reported as one collapsed `app/` entry
@@ -166,14 +188,52 @@ export class ProjectWorkspace {
       { maxBuffer: 16 * 1024 * 1024 },
     );
     const fields = stdout.split('\0').filter((field) => field.length > 0);
-    const paths: string[] = [];
+    const entries: DirtyEntry[] = [];
     for (let i = 0; i < fields.length; i++) {
       const entry = fields[i]!;
-      paths.push(entry.slice(3));
+      entries.push({ status: entry.slice(0, 2), path: entry.slice(3) });
       // Rename/copy entries carry the original path as a second field.
       if (entry[0] === 'R' || entry[0] === 'C') i++;
     }
-    return paths;
+    return entries;
+  }
+
+  /**
+   * Every path with an uncommitted change in the working tree, repo-root
+   * relative. The path-level view of {@link dirtyEntries}, unchanged for the
+   * callers that only ever asked "is this path unexpectedly dirty?".
+   */
+  async dirtyPaths(): Promise<string[]> {
+    return (await this.dirtyEntries()).map((entry) => entry.path);
+  }
+
+  /**
+   * The managed generated-site files git actually tracks, repo-root relative.
+   *
+   * Git's index, never a directory walk: what a promotion must reason about
+   * is the *committed* membership of the predecessor site, and a filesystem
+   * scan would additionally sweep up untracked scratch files and ignored
+   * build output (`.next/`, `out/`, `node_modules/`) that no promotion owns.
+   *
+   * A tracked file deleted in the working tree but not yet staged is still
+   * listed here, because it is still in the index — which is what lets an
+   * interrupted promotion recompute exactly the same set on its retry
+   * instead of concluding the file was never its concern.
+   *
+   * Empty before a project's first site commit, which is exactly right: a
+   * first promotion has no predecessor membership to reconcile against.
+   */
+  async trackedSiteFiles(): Promise<string[]> {
+    const { stdout } = await exec(
+      'git',
+      [
+        '-c', `safe.directory=${this.root}`,
+        '-C', this.root,
+        'ls-files', '-z', '--', relative(this.root, this.siteRoot),
+      ],
+      { maxBuffer: 16 * 1024 * 1024 },
+    );
+    return stdout.split('\0').filter((path) => path.length > 0);
   }
 
   /** Commit the working tree. Returns the commit SHA, or null if nothing changed. */

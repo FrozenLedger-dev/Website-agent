@@ -29,6 +29,8 @@
  * `promoteAcceptedFrontendBackendCandidate`'s own doc comment for the
  * sequence.
  */
+import { rm } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { ArtifactRef } from '@statxai/contracts';
 import type { JobDocument, JobPromotionRecord, StateStore } from '@statxai/state';
 import { ProjectWorkspace, contentHash, scaffoldSite, scaffoldTemplatePaths, type ArtifactRegistry } from '@statxai/workspace';
@@ -499,13 +501,53 @@ export async function promoteAcceptedFrontendBackendCandidate(
   // the tree at all, or found dirty afterwards for some other reason — is a
   // foreign, unrelated change that must block the commit rather than ride
   // along inside it.
-  const expectedPaths = new Set([
+  const desiredPaths = new Set([
     ...candidate.files.map((f) => ws.siteFileRepoPath(f.path)),
     ...(await scaffoldTemplatePaths()).map((p) => ws.siteFileRepoPath(p)),
   ]);
 
-  const foreignBeforeStart = (await ws.dirtyPaths()).filter((p) => !expectedPaths.has(p));
-  if (foreignBeforeStart.length > 0) throw new PromotionWorkingTreeDirty(promotionId, foreignBeforeStart);
+  /**
+   * What the predecessor site still tracks that this promotion does not want.
+   *
+   * Promotion used to be an overlay: scaffold, then write the candidate's
+   * files over whatever was already there. That is indistinguishable from a
+   * replacement right up until an accepted candidate *removes* something — a
+   * revised plan that drops a route produces a candidate with no file for it,
+   * and the predecessor's page stayed committed and deployable, with no gate
+   * to catch it (`spec-coverage` asks only whether every planned route was
+   * exported, never whether an exported route is still planned).
+   *
+   * So the promoted result is defined as a set rather than a diff:
+   * `desiredPaths` is the whole managed site, and anything the index still
+   * tracks under the site root that is absent from it is stale. Every member
+   * is therefore tracked by git, inside the managed namespace, and provably
+   * not part of what was accepted — no other file is eligible.
+   */
+  const stalePaths = (await ws.trackedSiteFiles()).filter((p) => !desiredPaths.has(p));
+  const staleSet = new Set(stalePaths);
+
+  /**
+   * Two mutation classes are legitimate here, and exactly two: writing a path
+   * this promotion owns, and removing a stale one.
+   *
+   * The deletion allowance is deliberately narrow. A stale path that is
+   * *modified* rather than deleted is somebody's uncommitted work sitting on
+   * a file this promotion happens to want gone — erasing it because the
+   * destination matches would be silent data loss, so only git's own `D`
+   * status qualifies. An untracked path can never qualify at all, because
+   * `stalePaths` is drawn from the index. What that buys is convergence: a
+   * promotion interrupted after deleting leaves those paths reported deleted,
+   * and its exact retry recomputes the identical `stalePaths` — the deleted
+   * file is still in the index — and recognises its own unfinished work
+   * instead of refusing forever.
+   */
+  const isExpectedMutation = (entry: { status: string; path: string }): boolean =>
+    desiredPaths.has(entry.path) || (entry.status.includes('D') && staleSet.has(entry.path));
+
+  const foreignBeforeStart = (await ws.dirtyEntries()).filter((e) => !isExpectedMutation(e));
+  if (foreignBeforeStart.length > 0) {
+    throw new PromotionWorkingTreeDirty(promotionId, foreignBeforeStart.map((e) => e.path));
+  }
 
   // Idempotent materialisation: the harness scaffold never overwrites
   // existing files, and writing the same accepted candidate's files again —
@@ -514,12 +556,27 @@ export async function promoteAcceptedFrontendBackendCandidate(
   await scaffoldSite(ws.siteRoot);
   await ws.writeSiteFiles(candidate.files);
 
-  // Nothing either call above does can dirty a path outside `expectedPaths`
-  // on its own; this re-check is a consistency guard against that same
-  // class of problem from the other side, not expected to ever actually
-  // fire in ordinary operation.
-  const unexpectedAfterWrite = (await ws.dirtyPaths()).filter((p) => !expectedPaths.has(p));
-  if (unexpectedAfterWrite.length > 0) throw new PromotionWorkingTreeDirty(promotionId, unexpectedAfterWrite);
+  /**
+   * Removal comes last, and the order is load-bearing rather than tidy:
+   * `scaffoldSite` copies with `force: false` and `writeSiteFiles` writes the
+   * candidate's own paths, so deleting first would let either of them
+   * resurrect a path this attempt had already removed. Exact files only —
+   * never `clearSite`, never a recursive sweep of the site root — so an
+   * unrelated untracked file in the tree is refused above rather than
+   * quietly tidied away here.
+   */
+  for (const stale of stalePaths) {
+    await rm(join(ws.root, stale), { force: true });
+  }
+
+  // Nothing the three mutations above do can dirty a path outside the two
+  // expected classes; this re-check is a consistency guard against that same
+  // class of problem from the other side, not expected to ever actually fire
+  // in ordinary operation.
+  const unexpectedAfterWrite = (await ws.dirtyEntries()).filter((e) => !isExpectedMutation(e));
+  if (unexpectedAfterWrite.length > 0) {
+    throw new PromotionWorkingTreeDirty(promotionId, unexpectedAfterWrite.map((e) => e.path));
+  }
 
   const commitSha = await ws.commit(promotionCommitMessage(promotionId));
   if (!commitSha) throw new PromotionCommitProducedNothing(promotionId);

@@ -11,13 +11,14 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFile } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { Collection } from 'mongodb';
 import { StateStore } from '@statxai/state';
-import { ArtifactRegistry, ProjectWorkspace, contentHash } from '@statxai/workspace';
+import { ArtifactRegistry, ProjectWorkspace, contentHash, scaffoldTemplatePaths } from '@statxai/workspace';
 import { JobEngine, PromotionFenceConflict, jobOutputNamespace } from '@statxai/job-engine';
 import type { ArtifactRef, JobSpec } from '@statxai/contracts';
 import type { BuildCandidate } from '../src/phases/build.js';
@@ -1150,5 +1151,353 @@ describe('Phase 5n — the promotion fence', () => {
     const stillThere = (await store.jobs.findOne({ _id: jobId }))?.promotionFence;
     expect(stillThere?.acquiredAt.getTime()).toBe(acquiredAt);
     expect(stillThere?.promotionId).toBe(fenceAfterFailure!.promotionId);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Exact replacement: promotion materialises the accepted site, not an overlay
+// ---------------------------------------------------------------------------
+
+/**
+ * Promotion used to scaffold and then write the candidate's files over
+ * whatever was already committed. That is indistinguishable from a
+ * replacement until an accepted candidate *removes* something: a revised plan
+ * that drops a route yields a candidate with no file for it, and the
+ * predecessor's page stayed committed and deployable — with no gate to catch
+ * it, since `spec-coverage` only asks whether every planned route was
+ * exported, never whether an exported route is still planned.
+ *
+ * These prove the promoted tree is now defined as a set: scaffold ∪ candidate,
+ * with tracked managed files outside it removed in the same commit.
+ */
+describe('promotion replaces the managed site tree', () => {
+  const multiCandidate = (files: { path: string; contents: string }[]): BuildCandidate => ({
+    routeDecisions: [],
+    files,
+  });
+
+  /** An accepted job whose candidate is an arbitrary exact file set. */
+  async function stageAccepted(
+    projectId: string,
+    jobId: string,
+    files: { path: string; contents: string }[],
+  ): Promise<ArtifactRef> {
+    await engine.enqueue({
+      spec: { ...jobSpec(projectId, jobId), output: ['app/'] },
+      origin: { kind: 'plan' },
+      maxAttempts: 3,
+    });
+    const claimed = await engine.claim('promotion-fixture-worker', 'terra', { roles: ['frontend_backend'], leaseMs: LEASE_MS });
+    if (!claimed || claimed._id !== jobId) throw new Error('fixture setup: could not claim the fixture job');
+
+    const candidateRef = await registry.put(projectId, frontendBackendCandidateName(jobId, claimed.attempt), multiCandidate(files));
+    await engine.submitForValidation(jobId, 'promotion-fixture-worker', claimed.attempt, { outputs: [candidateRef] });
+    await registry.accept(projectId, candidateRef);
+    await engine.accept(jobId, 'harness:validator');
+    return candidateRef;
+  }
+
+  /** The exact tree a promotion of `files` is supposed to leave behind. */
+  async function desiredPathsFor(ws: ProjectWorkspace, files: { path: string }[]): Promise<Set<string>> {
+    return new Set([
+      ...files.map((f) => ws.siteFileRepoPath(f.path)),
+      ...(await scaffoldTemplatePaths()).map((p) => ws.siteFileRepoPath(p)),
+    ]);
+  }
+
+  const BASE_FILES = [
+    { path: 'app/page.tsx', contents: 'home' },
+    { path: 'app/services/page.tsx', contents: 'services' },
+    { path: 'app/about/page.tsx', contents: 'about' },
+  ];
+
+  /** Promote a predecessor site, leaving canonical Git on it. */
+  async function promoteBase(projectId: string, files = BASE_FILES) {
+    await stageAccepted(projectId, `job_${projectId}_b0`, files);
+    return promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b0`, promotionDeps());
+  }
+
+  it('leaves the initial promotion unchanged — nothing stale to remove', async () => {
+    const projectId = 'proj_replace_initial';
+    const ws = await canonicalWorkspace(projectId);
+    expect(await ws.trackedSiteFiles()).toEqual([]);
+
+    const result = await promoteBase(projectId);
+
+    const tracked = new Set(await ws.trackedSiteFiles());
+    expect(tracked).toEqual(await desiredPathsFor(ws, BASE_FILES));
+    expect(await countCommitsWithMarker(ws.root, promotionMarker(result.promotionId))).toBe(1);
+  });
+
+  it('overwrites content without deleting anything when the path set is unchanged', async () => {
+    const projectId = 'proj_replace_same_set';
+    await promoteBase(projectId);
+    const ws = await canonicalWorkspace(projectId);
+    const before = new Set(await ws.trackedSiteFiles());
+
+    const revised = BASE_FILES.map((f) => ({ ...f, contents: `${f.contents} v2` }));
+    await stageAccepted(projectId, `job_${projectId}_b1`, revised);
+    await promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps());
+
+    expect(new Set(await ws.trackedSiteFiles())).toEqual(before);
+    await expect(ws.readSiteFile('app/services/page.tsx')).resolves.toBe('services v2');
+  });
+
+  it('removes a route the accepted candidate dropped, in the same promotion commit', async () => {
+    const projectId = 'proj_replace_route_removed';
+    await promoteBase(projectId);
+    const ws = await canonicalWorkspace(projectId);
+    expect(await ws.trackedSiteFiles()).toContain('app/app/services/page.tsx');
+
+    const kept = [BASE_FILES[0]!, BASE_FILES[2]!];
+    await stageAccepted(projectId, `job_${projectId}_b1`, kept);
+    const result = await promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps());
+
+    // Gone from the working tree, the index, and therefore the commit.
+    const tracked = await ws.trackedSiteFiles();
+    expect(tracked).not.toContain('app/app/services/page.tsx');
+    expect(existsSync(join(ws.siteRoot, 'app/services/page.tsx'))).toBe(false);
+    expect(new Set(tracked)).toEqual(await desiredPathsFor(ws, kept));
+
+    // One logical canonicalization, not cleanup plus promotion.
+    expect(await countCommitsWithMarker(ws.root, promotionMarker(result.promotionId))).toBe(1);
+    expect(await ws.currentCommit()).toBe(result.commitSha);
+  });
+
+  it('replaces a renamed route with no predecessor residue', async () => {
+    const projectId = 'proj_replace_rename';
+    await promoteBase(projectId, [{ path: 'app/old-route/page.tsx', contents: 'old' }]);
+    const ws = await canonicalWorkspace(projectId);
+
+    const renamed = [{ path: 'app/new-route/page.tsx', contents: 'new' }];
+    await stageAccepted(projectId, `job_${projectId}_b1`, renamed);
+    await promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps());
+
+    const tracked = await ws.trackedSiteFiles();
+    expect(tracked).not.toContain('app/app/old-route/page.tsx');
+    expect(tracked).toContain('app/app/new-route/page.tsx');
+    expect(new Set(tracked)).toEqual(await desiredPathsFor(ws, renamed));
+  });
+
+  it('removes stale files at any depth, not just top-level routes', async () => {
+    const projectId = 'proj_replace_nested';
+    await promoteBase(projectId, [
+      { path: 'app/page.tsx', contents: 'home' },
+      { path: 'app/services/joinery/page.tsx', contents: 'deep route' },
+      { path: 'components/site/hero.tsx', contents: 'hero' },
+      { path: 'components/site/old-widget.tsx', contents: 'widget' },
+    ]);
+    const ws = await canonicalWorkspace(projectId);
+
+    const kept = [
+      { path: 'app/page.tsx', contents: 'home v2' },
+      { path: 'components/site/hero.tsx', contents: 'hero v2' },
+    ];
+    await stageAccepted(projectId, `job_${projectId}_b1`, kept);
+    await promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps());
+
+    const tracked = await ws.trackedSiteFiles();
+    expect(tracked).not.toContain('app/app/services/joinery/page.tsx');
+    expect(tracked).not.toContain('app/components/site/old-widget.tsx');
+    expect(new Set(tracked)).toEqual(await desiredPathsFor(ws, kept));
+  });
+
+  it('keeps the scaffold-owned .gitignore, which no candidate supplies', async () => {
+    // Deleting it would make `.next/`, `out/` and `node_modules/` trackable
+    // and poison every later dirty-tree check.
+    const projectId = 'proj_replace_gitignore';
+    await promoteBase(projectId);
+    const ws = await canonicalWorkspace(projectId);
+
+    const kept = [BASE_FILES[0]!];
+    await stageAccepted(projectId, `job_${projectId}_b1`, kept);
+    await promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps());
+
+    expect(await ws.trackedSiteFiles()).toContain('app/.gitignore');
+    expect(existsSync(join(ws.siteRoot, '.gitignore'))).toBe(true);
+  });
+
+  it('never touches tracked files outside the managed site root', async () => {
+    const projectId = 'proj_replace_outside';
+    await promoteBase(projectId);
+    const ws = await canonicalWorkspace(projectId);
+
+    // Artifact materialisations: tracked, absent from desiredPaths, and not
+    // site content — they must survive a replacement promotion untouched.
+    await ws.materialiseArtifact('specs/sitemap.json', { pages: ['/'] });
+    await ws.materialiseArtifact('client/business-profile.json', { businessName: 'Acme' });
+    await ws.commit('artifacts');
+
+    const kept = [BASE_FILES[0]!];
+    await stageAccepted(projectId, `job_${projectId}_b1`, kept);
+    await promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps());
+
+    expect(existsSync(join(ws.root, 'specs/sitemap.json'))).toBe(true);
+    expect(JSON.parse(await readFile(join(ws.root, 'client/business-profile.json'), 'utf8'))).toEqual({ businessName: 'Acme' });
+    expect(new Set(await ws.trackedSiteFiles())).toEqual(await desiredPathsFor(ws, kept));
+  });
+
+  it('refuses to delete a stale file that has local modifications', async () => {
+    const projectId = 'proj_replace_modified_stale';
+    await promoteBase(projectId);
+    const ws = await canonicalWorkspace(projectId);
+
+    // Somebody edited the very file the next promotion wants gone. A path-only
+    // check cannot tell this from an interrupted deletion; the status can.
+    await writeFile(join(ws.siteRoot, 'app/services/page.tsx'), 'LOCAL WORK', 'utf8');
+
+    const kept = [BASE_FILES[0]!, BASE_FILES[2]!];
+    await stageAccepted(projectId, `job_${projectId}_b1`, kept);
+    const headBefore = await ws.currentCommit();
+
+    await expect(
+      promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps()),
+    ).rejects.toBeInstanceOf(PromotionWorkingTreeDirty);
+
+    expect(await readFile(join(ws.siteRoot, 'app/services/page.tsx'), 'utf8')).toBe('LOCAL WORK');
+    expect(await ws.currentCommit()).toBe(headBefore);
+  });
+
+  it('never deletes an untracked file merely for being absent from the desired tree', async () => {
+    const projectId = 'proj_replace_untracked';
+    await promoteBase(projectId);
+    const ws = await canonicalWorkspace(projectId);
+    await writeFile(join(ws.siteRoot, 'scratch.txt'), 'not mine', 'utf8');
+
+    await stageAccepted(projectId, `job_${projectId}_b1`, [BASE_FILES[0]!]);
+
+    await expect(
+      promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps()),
+    ).rejects.toBeInstanceOf(PromotionWorkingTreeDirty);
+
+    // Refused, not tidied away.
+    expect(existsSync(join(ws.siteRoot, 'scratch.txt'))).toBe(true);
+  });
+
+  it('converges when an attempt is interrupted after its mutations but before the commit', async () => {
+    /**
+     * Deletion runs last, so "crashed after deleting" and "crashed after all
+     * filesystem mutations" are the same seam: failing the commit lands after
+     * the scaffold, the candidate writes and the deletions alike.
+     */
+    const projectId = 'proj_replace_crash_before_commit';
+    await promoteBase(projectId);
+    const kept = [BASE_FILES[0]!, BASE_FILES[2]!];
+    await stageAccepted(projectId, `job_${projectId}_b1`, kept);
+
+    const commitSpy = vi
+      .spyOn(ProjectWorkspace.prototype, 'commit')
+      .mockRejectedValueOnce(new Error('simulated crash before the promotion commit'));
+    await expect(
+      promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps()),
+    ).rejects.toThrow('simulated crash before the promotion commit');
+    commitSpy.mockRestore();
+
+    // The stale file is gone from disk but still in the index, which is what
+    // lets the retry recompute the identical stale set and recognise its own
+    // unfinished work rather than refusing forever.
+    const reopened = await canonicalWorkspace(projectId);
+    expect(existsSync(join(reopened.siteRoot, 'app/services/page.tsx'))).toBe(false);
+    expect(await reopened.trackedSiteFiles()).toContain('app/app/services/page.tsx');
+
+    const result = await promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps());
+
+    expect(new Set(await reopened.trackedSiteFiles())).toEqual(await desiredPathsFor(reopened, kept));
+    expect(await countCommitsWithMarker(reopened.root, promotionMarker(result.promotionId))).toBe(1);
+  });
+
+  it('recovers by marker when the commit succeeded but the receipt did not finalise', async () => {
+    const projectId = 'proj_replace_crash_after_commit';
+    await promoteBase(projectId);
+    const ws = await canonicalWorkspace(projectId);
+    const kept = [BASE_FILES[0]!, BASE_FILES[2]!];
+    await stageAccepted(projectId, `job_${projectId}_b1`, kept);
+
+    const spy = mockPromotionsFinalizeCrash('simulated crash after the promotion commit');
+    await expect(
+      promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps()),
+    ).rejects.toThrow('simulated crash after the promotion commit');
+    spy.mockRestore();
+
+    const result = await promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps());
+
+    // Same commit recovered through its marker; the deletion stayed deleted.
+    expect(await countCommitsWithMarker(ws.root, promotionMarker(result.promotionId))).toBe(1);
+    expect(await ws.trackedSiteFiles()).not.toContain('app/app/services/page.tsx');
+    expect(new Set(await ws.trackedSiteFiles())).toEqual(await desiredPathsFor(ws, kept));
+  });
+
+  it('performs no deletion or churn when an exact committed promotion replays', async () => {
+    const projectId = 'proj_replace_committed_replay';
+    await promoteBase(projectId);
+    const ws = await canonicalWorkspace(projectId);
+    const kept = [BASE_FILES[0]!, BASE_FILES[2]!];
+    await stageAccepted(projectId, `job_${projectId}_b1`, kept);
+    const first = await promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps());
+    const headAfterFirst = await ws.currentCommit();
+
+    const again = await promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps());
+
+    expect(again.commitSha).toBe(first.commitSha);
+    expect(await ws.currentCommit()).toBe(headAfterFirst);
+    expect(await countCommitsWithMarker(ws.root, promotionMarker(first.promotionId))).toBe(1);
+    expect(new Set(await ws.trackedSiteFiles())).toEqual(await desiredPathsFor(ws, kept));
+
+    // Tracked membership alone cannot see this: `trackedSiteFiles` reads the
+    // index, so files deleted from disk but never staged still appear there.
+    // A replay that touched the tree at all shows up here instead.
+    expect(await ws.dirtyEntries()).toEqual([]);
+    expect(existsSync(join(ws.siteRoot, 'app/page.tsx'))).toBe(true);
+    expect(existsSync(join(ws.siteRoot, '.gitignore'))).toBe(true);
+  });
+
+  it('still fails closed when canonical HEAD drifted before promotion', async () => {
+    const projectId = 'proj_replace_base_drift';
+    await promoteBase(projectId);
+    const ws = await canonicalWorkspace(projectId);
+    const kept = [BASE_FILES[0]!];
+    await stageAccepted(projectId, `job_${projectId}_b1`, kept);
+
+    // A prepared receipt with no commit at all: fail the first canonical
+    // write, so no marker is ever produced. Crashing the Mongo finalize
+    // instead would leave the commit — and the marker — already in place,
+    // and the retry would recover by marker before reaching the base guard.
+    const writeSpy = vi
+      .spyOn(ProjectWorkspace.prototype, 'writeSiteFiles')
+      .mockImplementationOnce(async () => {
+        throw new Error('simulated crash before any canonical file write');
+      });
+    await expect(
+      promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps()),
+    ).rejects.toThrow('simulated crash before any canonical file write');
+    writeSpy.mockRestore();
+    expect((await store.promotions.findOne({ jobId: `job_${projectId}_b1` }))?.status).toBe('prepared');
+
+    // …then HEAD moves underneath it, with no promotion marker anywhere.
+    await ws.materialiseArtifact('specs/unrelated.json', { moved: true });
+    const drifted = await ws.commit('unrelated canonical movement');
+    expect(drifted).not.toBeNull();
+
+    await expect(
+      promoteAcceptedFrontendBackendCandidate(`job_${projectId}_b1`, promotionDeps()),
+    ).rejects.toBeInstanceOf(PromotionBaseConflict);
+  });
+
+  it('does not use clearSite or broad recursive deletion', async () => {
+    const { readFile: read } = await import('node:fs/promises');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join: joinPath } = await import('node:path');
+    const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
+    const code = await read(joinPath(src, 'job-promotion/frontend-backend.ts'), 'utf8');
+
+    // Comments stripped first: this module's own doc comment states the
+    // guarantee in prose ("never `clearSite`"), and a raw substring scan
+    // would match that instead of real code.
+    const executable = code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+
+    expect(executable).not.toMatch(/clearSite\s*\(/);
+    expect(executable).not.toMatch(/rm\([^)]*recursive:\s*true/);
+    // Deletion is driven by the exact stale set, never by a directory sweep.
+    expect(executable).toContain('for (const stale of stalePaths)');
   });
 });
