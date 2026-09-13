@@ -5151,6 +5151,90 @@ Runs and run events remain telemetry. **Phase 5q is still not implemented**;
 its gate should be re-run, including the window where an authorisation exists
 but its receipt was never prepared.
 
+## Phase 5q — durable post-promotion outer runProject recovery — **DONE**
+
+**The gap.** A `job_lifecycle` run whose build had already promoted could die
+during evaluation, repair, approval or publication. The next invocation reached
+`discoverProject`, which deletes the project document and its budgets — or, since
+the active-lineage prerequisite, was refused outright. Unfinished work could be
+neither lost nor continued.
+
+**Checked before any destructive step.** Intake validation stays first, so
+malformed intake still has no side effects. Phase 5k keeps precedence: a
+`prepared` binding resumes exactly as before. Only when nothing is mid-build does
+`resolvePostPromotionRecovery` run, and only when it returns nothing does
+discovery run.
+
+**Derived, not remembered — no cursor and no recovery document.** The project's
+active lineage root (one indexed read) leads to the structural tip, and the tip
+must be `promoted`. Its promotion is re-proven from its own evidence: the
+accepted job, its promotion fence, the committed promotion receipt, the matching
+commit SHA, and exactly one commit carrying that promotion's known marker. The
+tip's exact bound profile and plan refs are reused — `B2`'s plan after two
+replans, never a newer artifact. The incoming run intent must equal the lineage's
+own, otherwise `ActiveContinuationIntentConflict` is raised with nothing reset,
+rebound or committed. Runs and run events are never consulted; a recovery under
+`launchRun` simply gets a new run id.
+
+**Budgets are kept.** The project and budget documents are reused as they are.
+`reviewCycle` is not reset to zero: it is exactly `used.reviewRejections`, because
+that spend is the counter's only writer. Every limit remains the existing durable
+database guard.
+
+**Workspace safety.** A clean tree is evaluated as it is, including a committed
+repair after the promotion, with no requirement that HEAD equal the promotion
+SHA. Uncommitted harness decision records (`decisions/**`, the deployment
+manifest) are tolerated. Anything else — typically an interrupted Luna repair
+under `app/**` — fails closed with `ActiveContinuationWorkspaceDirty` and is left
+untouched.
+
+**Normal continuation re-enters `evaluateSite`,** skipping discovery, planning,
+routing, build, validation, acceptance and promotion. A run parked in
+`awaiting_human_review` is refused rather than re-evaluated, so a pending human
+decision can never be overtaken by a fresh approval.
+
+**An existing release wins.** `findReleasePublicationForLineage` plus the exact
+canonical-build match picks the lineage's receipt; historical receipts are
+unreachable. With a receipt, recovery never evaluates, approves or authorises
+again. It rebuilds the manifest inputs from the receipt's own authorisation and
+the exact approval, test-report and review versions it recorded, then hands off
+to Phase 5p unchanged:
+
+- `prepared` publishes;
+- `publishing` stops with reconciliation required and no provider call;
+- `retry_authorized` spends its one attempt;
+- `committed` finishes the manifest and the atomic terminal release with no
+  deployment.
+
+**Authorisation stored, receipt not yet prepared.** Nothing external or canonical
+has happened in that window — the receipt precedes the release commit and the
+provider call — so recovery re-evaluates. That mints a new, unused-safe
+authorisation version, and lineage uniqueness still admits exactly one receipt.
+No link from the authorisation to the build was needed.
+
+**`legacy_direct` cannot bypass it.** `runProject` itself now refuses a
+`legacy_direct` run while a `job_lifecycle` lineage owns the project, in addition
+to the `launchRun` guard. Terminal history holds no active lineage, so later
+legitimate work proceeds normally.
+
+**Tests: +26 integration, one new file,** each crashing a real run at an exact
+point:
+
+- the first evaluation compile;
+- the publish phase before any receipt exists;
+- the release commit;
+- the provider call;
+- plus the atomic committed-receipt window, reproduced exactly.
+
+They cover matching recovery, exact refs, two replans, budgets, repaired and
+dirty trees, harness dirt, malformed intake, conflicting intent, human review,
+four corruption variants (binding, receipt, fence, marker), a non-promoted tip,
+Phase 5k precedence, `legacy_direct`, every receipt status, a historical
+receipt, missing run history with a new run id, and terminal-then-fresh.
+
+**Unchanged:** Phases 5h, 5n and 5p semantics, the JobEngine, release
+authorisation, and the Phase 5k resume.
+
 ## Phases 6–17
 
 Not started.

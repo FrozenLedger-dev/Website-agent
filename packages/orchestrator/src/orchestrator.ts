@@ -35,6 +35,13 @@ import {
   type ReplanScope,
 } from '@statxai/policy-engine';
 import { concluded, withoutDelivery, type RunResult } from './phases/conclude.js';
+import {
+  assertNoActiveLineageForLegacyDirect,
+  publishRecoveredRelease,
+  rehydrateRecoveredRelease,
+  resolvePostPromotionRecovery,
+  type PostPromotionRecovery,
+} from './run-recovery/frontend-backend.js';
 import { buildFromPlan } from './phases/build.js';
 import { discoverProject, validateIntake, type DiscoverResult } from './phases/discover.js';
 import { adjudicateDefects } from './phases/adjudicate.js';
@@ -225,6 +232,12 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
    */
   let lifecycleCoordinator: FrontendBackendLifecycleCoordinator | null = null;
   let activeBinding: FrontendBackendBuildBindingDocument | null = null;
+  /**
+   * Set only when this invocation continues a promoted build whose run never
+   * finished (Phase 5q) — resolved from durable lineage authority before
+   * discovery could reset anything, and `null` on every other path.
+   */
+  let recovered: PostPromotionRecovery | null = null;
   let resumedPlan: SitePlan | null = null;
   let resumedSpec: JobSpec | null = null;
 
@@ -300,20 +313,55 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
           budgetLimits: budgetDoc.limits,
         };
       } else {
-        // No active binding: the fresh path, identical to what
-        // `legacy_direct` always runs.
-        discovery = await discoverProject({
-          projectId,
-          intake: options.intake,
-          store,
-          registry,
-          workspacesRoot,
-          autonomyMode,
-          say,
-        });
+        // Phase 5q: nothing is mid-build, but a build that already promoted
+        // may belong to a run that never finished. Asked here, before
+        // discovery, whose first act is to delete the project document and its
+        // budgets — and answered from durable lineage authority, never from
+        // the run history.
+        recovered = await resolvePostPromotionRecovery({ store, registry, workspacesRoot, projectId, runIntentHash });
+
+        if (recovered) {
+          say({ phase: 'discover', detail: 'Validating intake against the canonical schema' });
+          say({
+            phase: 'discover',
+            detail: `${validated.profile.businessName} — ${validated.profile.services.length} services`,
+            level: 'ok',
+          });
+          // Stable ids only — telemetry, never consulted to decide anything.
+          say({
+            phase: 'discover',
+            detail:
+              `Recovering unfinished run: lineage ${recovered.root._id}, canonical build ${recovered.tip._id}, ` +
+              `promotion ${recovered.tip.promotionId}`,
+            level: 'ok',
+          });
+          discovery = {
+            ok: true,
+            profile: recovered.profile,
+            businessProfileRef: recovered.tip.businessProfile,
+            workspace: recovered.workspace,
+            budgetLimits: recovered.budgetLimits,
+          };
+        } else {
+          // No active binding and no unfinished lineage: the fresh path,
+          // identical to what `legacy_direct` always runs.
+          discovery = await discoverProject({
+            projectId,
+            intake: options.intake,
+            store,
+            registry,
+            workspacesRoot,
+            autonomyMode,
+            say,
+          });
+        }
       }
     }
   } else {
+    // `legacy_direct` never writes a canonical workspace an unfinished
+    // `job_lifecycle` lineage still owns. Malformed intake keeps reporting
+    // itself first, with no read or side effect of any kind.
+    if (validateIntake(options.intake).ok) await assertNoActiveLineageForLegacyDirect(store, projectId);
     discovery = await discoverProject({
       projectId,
       intake: options.intake,
@@ -336,6 +384,15 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   }
 
   const { profile, businessProfileRef, workspace, budgetLimits } = discovery;
+
+  if (recovered) {
+    // Derived, not remembered. A review cycle is counted exactly when its
+    // rejection allowance is spent — that spend is the counter's only writer —
+    // so the durable budget is the cycle. Replans are informational only; the
+    // durable count is their conservative equivalent.
+    progress.reviewCycle = recovered.budgetUsed.reviewRejections;
+    progress.replansUsed = recovered.budgetUsed.replans;
+  }
 
   /**
    * What a phase is handed.
@@ -362,7 +419,9 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   // which source it came from.
   const { plan: initialPlan, sitePlanRef: initialSitePlanRef } = activeBinding
     ? { plan: resumedPlan!, sitePlanRef: activeBinding.sitePlan }
-    : await producePlan({ deps, facts }, 0);
+    : recovered
+      ? { plan: recovered.plan, sitePlanRef: recovered.tip.sitePlan }
+      : await producePlan({ deps, facts }, 0);
   progress.plan = initialPlan;
 
   // Defined here, not after the build boundary: Phase 5j's job-mode exit
@@ -407,106 +466,134 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       track,
     }));
 
-    // Phase 5k: on resume, the stored spec is authority — the factory is
-    // never called again, and its output is never treated as though it
-    // were. On the fresh path, the factory is still the one source of the
-    // exact `JobSpec`, and a durable binding is prepared for it before
-    // Phase 5i ever runs.
-    let spec: JobSpec;
-    let binding: FrontendBackendBuildBindingDocument;
-    if (activeBinding) {
-      spec = resumedSpec!;
-      binding = activeBinding;
+    if (recovered) {
+      // Phase 5q: the build already promoted and was just re-proven; nothing
+      // here is built, validated, accepted or promoted again. The coordinator
+      // above still exists, for any replan evaluation leads to.
+      canonicalBuild = recovered.tip;
+      say({ phase: 'build', detail: `Continuing promoted frontend_backend build ${recovered.tip._id}`, level: 'ok' });
     } else {
-      spec = createFrontendBackendJobSpec({
-        projectId,
-        businessProfileRef,
-        sitePlanRef: initialSitePlanRef,
-      });
-      binding = await prepareFrontendBackendBuildBinding(store, {
-        projectId,
-        runIntentHash: computeRunIntentHash({ projectId, profile }),
-        businessProfileRef,
-        sitePlanRef: initialSitePlanRef,
-        jobSpec: spec,
-        // Canonical HEAD *before* the specification commit below — `null`
-        // is a legitimate first-ever commit, not a placeholder.
-        specificationBaseCommit: await workspace.currentCommit(),
-      });
-    }
+      // Phase 5k: on resume, the stored spec is authority — the factory is
+      // never called again, and its output is never treated as though it
+      // were. On the fresh path, the factory is still the one source of the
+      // exact `JobSpec`, and a durable binding is prepared for it before
+      // Phase 5i ever runs.
+      let spec: JobSpec;
+      let binding: FrontendBackendBuildBindingDocument;
+      if (activeBinding) {
+        spec = resumedSpec!;
+        binding = activeBinding;
+      } else {
+        spec = createFrontendBackendJobSpec({
+          projectId,
+          businessProfileRef,
+          sitePlanRef: initialSitePlanRef,
+        });
+        binding = await prepareFrontendBackendBuildBinding(store, {
+          projectId,
+          runIntentHash: computeRunIntentHash({ projectId, profile }),
+          businessProfileRef,
+          sitePlanRef: initialSitePlanRef,
+          jobSpec: spec,
+          // Canonical HEAD *before* the specification commit below — `null`
+          // is a legitimate first-ever commit, not a placeholder.
+          specificationBaseCommit: await workspace.currentCommit(),
+        });
+      }
 
-    // Mirrors `buildFromPlan`'s own first write: the outer project-state
-    // transition belongs to `runProject`, the harness/run owner, not to the
-    // job handler or Phase 5i, neither of which touches project state at all.
-    await store.projects.updateOne(
-      { _id: projectId },
-      { $set: { state: 'building', updatedAt: new Date() } },
-    );
+      // Mirrors `buildFromPlan`'s own first write: the outer project-state
+      // transition belongs to `runProject`, the harness/run owner, not to the
+      // job handler or Phase 5i, neither of which touches project state at all.
+      await store.projects.updateOne(
+        { _id: projectId },
+        { $set: { state: 'building', updatedAt: new Date() } },
+      );
 
-    if (activeBinding) {
-      // Discovery/planning never ran this invocation, so the bound
-      // specification never touched this process's canonical workspace —
-      // re-materialise it idempotently before the replay-safe commit below
-      // can find (or create) anything. A no-op if it is already there.
-      await rehydrateSpecificationFiles(workspace, profile, initialPlan);
-    }
+      if (activeBinding) {
+        // Discovery/planning never ran this invocation, so the bound
+        // specification never touched this process's canonical workspace —
+        // re-materialise it idempotently before the replay-safe commit below
+        // can find (or create) anything. A no-op if it is already there.
+        await rehydrateSpecificationFiles(workspace, profile, initialPlan);
+      }
 
-    // Replay-safe, marker-aware handoff — see `run-binding/frontend-backend.ts`
-    // for the full recovery sequence (Phase 5h's own promotion pattern,
-    // applied one step earlier in the pipeline). No site file is touched
-    // here either way: `writeSiteFiles`/`publishBuildDirectly` are never
-    // called from this branch, only 5h's own promotion writes `app/`.
-    await ensureSpecificationCommitted(store, workspace, binding, initialPlan);
+      // Replay-safe, marker-aware handoff — see `run-binding/frontend-backend.ts`
+      // for the full recovery sequence (Phase 5h's own promotion pattern,
+      // applied one step earlier in the pipeline). No site file is touched
+      // here either way: `writeSiteFiles`/`publishBuildDirectly` are never
+      // called from this branch, only 5h's own promotion writes `app/`.
+      await ensureSpecificationCommitted(store, workspace, binding, initialPlan);
 
-    say({
-      phase: 'build',
-      detail: activeBinding
-        ? `Resuming frontend_backend via job_lifecycle (job ${spec.jobId})`
-        : `Executing frontend_backend via job_lifecycle (job ${spec.jobId})`,
-    });
-
-    // Exactly one call. Every outcome but `promoted` stops this invocation
-    // through the existing non-delivery exit below — never a second call,
-    // never a fallback to `buildFromPlan`.
-    const result = await coordinator.run(spec);
-
-    if (result.outcome !== 'promoted') {
       say({
         phase: 'build',
-        detail: `frontend_backend job_lifecycle build did not complete this invocation (${result.outcome})`,
-        level: 'fail',
+        detail: activeBinding
+          ? `Resuming frontend_backend via job_lifecycle (job ${spec.jobId})`
+          : `Executing frontend_backend via job_lifecycle (job ${spec.jobId})`,
       });
-      // `RunResult.outcome` has no vocabulary for "not yet promoted" beyond
-      // the existing `'blocked'` bucket (see docs/upgrade-status.md's Phase
-      // 5j section for why a broader outcome hierarchy was not added).
-      // `jobLifecycleOutcome` carries the exact Phase 5i outcome alongside
-      // it, so this never collapses "retry_ready" and "validation_failed"
-      // into an indistinguishable "blocked" — the bucket is the same, but
-      // what actually happened is not lost. No `terminalDecision` is set:
-      // no policy adjudication occurred here. The binding is deliberately
-      // left `prepared` — a later invocation must be able to resume it.
-      return { ...(await concluded(ctx(), 'blocked', undefined)), jobLifecycleOutcome: result.outcome };
+
+      // Exactly one call. Every outcome but `promoted` stops this invocation
+      // through the existing non-delivery exit below — never a second call,
+      // never a fallback to `buildFromPlan`.
+      const result = await coordinator.run(spec);
+
+      if (result.outcome !== 'promoted') {
+        say({
+          phase: 'build',
+          detail: `frontend_backend job_lifecycle build did not complete this invocation (${result.outcome})`,
+          level: 'fail',
+        });
+        // `RunResult.outcome` has no vocabulary for "not yet promoted" beyond
+        // the existing `'blocked'` bucket (see docs/upgrade-status.md's Phase
+        // 5j section for why a broader outcome hierarchy was not added).
+        // `jobLifecycleOutcome` carries the exact Phase 5i outcome alongside
+        // it, so this never collapses "retry_ready" and "validation_failed"
+        // into an indistinguishable "blocked" — the bucket is the same, but
+        // what actually happened is not lost. No `terminalDecision` is set:
+        // no policy adjudication occurred here. The binding is deliberately
+        // left `prepared` — a later invocation must be able to resume it.
+        return { ...(await concluded(ctx(), 'blocked', undefined)), jobLifecycleOutcome: result.outcome };
+      }
+
+      // Finalised only after Phase 5i itself reports `promoted` — never
+      // speculatively. If this write fails, the promotion itself is not
+      // undone and the binding stays `prepared`; a later invocation resumes
+      // it, replays Phase 5i (a pure read-and-verify at that point), and
+      // retries only this finalisation.
+      await finalizeBindingPromoted(store, binding._id, {
+        promotionId: result.promotionId,
+        promotionCommitSha: result.commitSha,
+      });
+
+      // Canonical build authority, advanced only here. A replan successor
+      // becomes canonical when its own promotion succeeds, never when it is
+      // merely prepared, built, validated or accepted — until then the
+      // predecessor is still what the canonical tree implements.
+      canonicalBuild = binding;
+
+      say({ phase: 'build', detail: `frontend_backend promoted: commit ${result.commitSha}`, level: 'ok' });
     }
-
-    // Finalised only after Phase 5i itself reports `promoted` — never
-    // speculatively. If this write fails, the promotion itself is not
-    // undone and the binding stays `prepared`; a later invocation resumes
-    // it, replays Phase 5i (a pure read-and-verify at that point), and
-    // retries only this finalisation.
-    await finalizeBindingPromoted(store, binding._id, {
-      promotionId: result.promotionId,
-      promotionCommitSha: result.commitSha,
-    });
-
-    // Canonical build authority, advanced only here. A replan successor
-    // becomes canonical when its own promotion succeeds, never when it is
-    // merely prepared, built, validated or accepted — until then the
-    // predecessor is still what the canonical tree implements.
-    canonicalBuild = binding;
-
-    say({ phase: 'build', detail: `frontend_backend promoted: commit ${result.commitSha}`, level: 'ok' });
   } else {
     await buildFromPlan({ deps, facts }, initialPlan);
+  }
+
+  /**
+   * Phase 5q: a release this lineage already started is stronger authority than
+   * a fresh evaluation. Continued through Phase 5p exactly as it stands — no
+   * evaluation, approval or new authorisation — so a `publishing` receipt still
+   * stops for an operator and a `committed` one finishes without deploying.
+   */
+  if (recovered?.publication) {
+    const release = await rehydrateRecoveredRelease(registry, projectId, recovered.publication);
+    progress.authorization = release.authorization;
+    progress.releaseAuthorizationRef = release.releaseAuthorizationRef;
+    progress.qualityScore = release.qualityScore;
+    progress.gatesCertified = release.gatesCertified;
+    progress.approvalArtifactVersion = release.approvalArtifactVersion;
+    progress.approvalModel = release.approvalModel;
+    progress.approvalDecision = release.approvalDecision;
+
+    const { manifest, finalCommit } = await publishRecoveredRelease(ctx(), release, recovered.tip._id);
+    return { ...(await concluded(ctx(), 'released', undefined)), commit: finalCommit, manifest };
   }
 
   // -- Phases 4/5: Evaluate, repair, escalate -------------------------------

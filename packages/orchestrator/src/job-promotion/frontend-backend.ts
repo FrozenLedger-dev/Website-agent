@@ -244,7 +244,7 @@ function computePromotionId(binding: PromotionBinding): string {
   });
 }
 
-function promotionMarker(promotionId: string): string {
+export function promotionMarker(promotionId: string): string {
   return `Statx-Promotion-Id: ${promotionId}`;
 }
 
