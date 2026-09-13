@@ -6,6 +6,7 @@
  * reasoning belongs to the model").
  */
 import type { ArtifactRef, AutonomyMode, JobRecord, JobSpec, ReviewOutcomeRecord, WorkerRole } from '@statxai/contracts';
+import type { Binary } from 'mongodb';
 
 /** Project lifecycle, distinct from job lifecycle. */
 export type ProjectState =
@@ -484,4 +485,20 @@ export interface ReleasePublicationDocument {
   preparedAt: Date;
   committedAt: Date | null;
   updatedAt: Date;
+}
+
+/**
+ * Durable, content-addressed binary evidence (a screenshot, today).
+ *
+ * `_id` is `sha256:<hex>` of `data`, so identical bytes are one document and a
+ * write is one atomic insert. Immutable: never updated, never deleted here.
+ * Bounded by what writers allow per object — far below the 16 MB document limit.
+ */
+export interface BlobDocument {
+  _id: string;
+  sha256: string;
+  bytes: number;
+  contentType: string;
+  data: Binary;
+  createdAt: Date;
 }

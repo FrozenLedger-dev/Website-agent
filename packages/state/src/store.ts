@@ -7,6 +7,7 @@ import type { ClientSession, Collection, Db } from 'mongodb';
 import type {
   ArtifactDocument,
   ArtifactSequenceDocument,
+  BlobDocument,
   AuditEvent,
   BudgetDocument,
   DefectBudgetDocument,
@@ -69,6 +70,11 @@ export class StateStore {
    * Deliberately separate from `projects`: a run deletes and recreates the
    * project record at startup, and artifact history outlives that lifecycle.
    */
+  /** Content-addressed binary evidence; `_id` is the hash, so it needs no other index. */
+  get blobs(): Collection<BlobDocument> {
+    return this.db.collection<BlobDocument>('blobs');
+  }
+
   get artifactSequences(): Collection<ArtifactSequenceDocument> {
     return this.db.collection<ArtifactSequenceDocument>('artifact_sequences');
   }

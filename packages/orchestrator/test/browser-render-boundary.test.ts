@@ -4,7 +4,8 @@
  * Generated client JavaScript is untrusted: production opens a generated site in
  * a browser only through the isolated `BrowserRenderer`, only from canonical
  * evaluation, and only as observation. The renderer holds no job, promotion,
- * release or model authority, is not a model tool, and captures no screenshot.
+ * release or model authority, is not a model tool, and takes screenshots only
+ * inside its isolated runner.
  */
 import { readdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -34,6 +35,20 @@ async function allProductionFiles(): Promise<string[]> {
 }
 
 const RENDERER = 'packages/workspace/src/browser-renderer.ts';
+
+/**
+ * The renderer, split: the trusted runner source exactly as written, and the
+ * harness code around it with comments stripped. Stripping the whole file would
+ * read the runner's \`'**\/*'\` route glob as a comment opener and hide code.
+ */
+async function rendererParts(): Promise<{ raw: string; runner: string; outside: string }> {
+  const raw = await readFile(join(REPO, RENDERER), 'utf8');
+  const start = raw.indexOf('export const BROWSER_RUNNER_SOURCE = String.raw`');
+  const end = raw.indexOf('`;\n', start) + 3;
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  return { raw, runner: raw.slice(start, end), outside: strip(raw.slice(0, start) + raw.slice(end)) };
+}
 const EVALUATE = 'packages/orchestrator/src/phases/evaluate.ts';
 
 function body(code: string, start: string, end: string): string {
@@ -70,10 +85,9 @@ describe('a generated site reaches a browser only through the BrowserRenderer', 
   });
 
   it('the browser launches only inside the container runner, from a digest-pinned image, with no network', async () => {
-    const renderer = await src(RENDERER);
-    expect(renderer.match(/chromium\.launch\(/g)).toHaveLength(1);
-    expect(renderer.indexOf('chromium.launch(')).toBeGreaterThan(renderer.indexOf('export const BROWSER_RUNNER_SOURCE = String.raw`'));
-    expect(renderer.indexOf('chromium.launch(')).toBeLessThan(renderer.indexOf('export function defaultBrowserRuntimeRoot('));
+    const { raw, runner, outside: renderer } = await rendererParts();
+    expect(raw.match(/chromium\.launch\(/g)).toHaveLength(1);
+    expect(runner).toContain('chromium.launch(');
     expect(renderer).toMatch(/export const BROWSER_IMAGE =\s*'mcr\.microsoft\.com\/playwright:v1\.63\.0-noble@sha256:[0-9a-f]{64}';/);
     const create = body(renderer, 'export function browserCreateArgs(', '\nfunction readonlyMount(');
     expect(create).toContain("'--network', 'none',");
@@ -85,8 +99,7 @@ describe('a generated site reaches a browser only through the BrowserRenderer', 
   });
 
   it('the renderer starts no process itself and forwards no environment', async () => {
-    const renderer = await src(RENDERER);
-    const outside = renderer.replace(/export const BROWSER_RUNNER_SOURCE = String\.raw`[\s\S]*?`;/, '');
+    const { outside } = await rendererParts();
     expect(outside).not.toMatch(/child_process|\bexec(File|Sync)?\(|\bspawn\(|process\.env/);
     expect(outside).toMatch(/const created = await docker\(browserCreateArgs\(/);
     expect(outside).toMatch(/const attached = await attach\(name, runLimits, options\.signal\);/);
@@ -94,10 +107,10 @@ describe('a generated site reaches a browser only through the BrowserRenderer', 
   });
 
   it('routes come only from the plan, through the route grammar', async () => {
-    const renderer = await src(RENDERER);
-    const run = body(renderer, 'export async function renderInBrowser(', '\nfunction parseRenders(');
+    const { outside: renderer } = await rendererParts();
+    const run = body(renderer, 'async function runBrowser(', '\nfunction parseRenders(');
     expect(run).toContain('const { targets, omittedRoutes } = planRenderTargets(options.plan);');
-    const plan = body(renderer, 'export function planRenderTargets(', '\nexport const BROWSER_RUNNER_SOURCE');
+    const plan = body(renderer, 'export function planRenderTargets(', '\nexport function defaultBrowserRuntimeRoot(');
     expect(plan).toContain('const routes = plan.sitemap.pages.map((page) => page.route);');
     expect(plan).toContain('if (typeof route !== \'string\' || !ROUTE.test(route)) throw new BrowserRouteRefused(String(route));');
   });
@@ -105,10 +118,9 @@ describe('a generated site reaches a browser only through the BrowserRenderer', 
 
 describe('authority separation', () => {
   it('the renderer imports only Node built-ins, the contracts and the sandbox primitives', async () => {
-    const renderer = await src(RENDERER);
-    const outside = renderer.replace(/export const BROWSER_RUNNER_SOURCE = String\.raw`[\s\S]*?`;/, '');
+    const { outside } = await rendererParts();
     const imports = [...outside.matchAll(/from '([^']+)'/g)].map((m) => m[1]!);
-    expect(imports.filter((name) => !name.startsWith('node:')).sort()).toEqual(['./sandbox.js', '@statxai/contracts']);
+    expect(imports.filter((name) => !name.startsWith('node:')).sort()).toEqual(['./sandbox.js', '@statxai/contracts', 'zod/v4']);
     expect(outside).not.toMatch(/JobEngine|StateStore|ArtifactRegistry|ModelRuntime|\.invoke\(|accept\w*Candidate|promot|releas|budget|lineage|job-engine|@statxai\/(state|agents|orchestrator)/i);
   });
 
@@ -123,10 +135,19 @@ describe('authority separation', () => {
     }
   });
 
-  it('no production code captures a screenshot, a PDF or a video yet', async () => {
+  it('a screenshot is taken only inside the isolated runner, and no production code makes a PDF or a video', async () => {
+    const taking: string[] = [];
     for (const file of await allProductionFiles()) {
-      expect(await src(file), file).not.toMatch(/\.screenshot\(|\.pdf\(|recordVideo|toBuffer\(\)\s*;?\s*\/\/\s*screenshot/);
+      // Raw source: the runner's own \`'**/*'\` route glob would read as a comment opener to the stripper.
+      const code = await readFile(join(REPO, file), 'utf8');
+      expect(code, file).not.toMatch(/\.pdf\(|recordVideo/);
+      if (/\.screenshot\(/.test(code)) taking.push(file);
     }
+    expect(taking).toEqual([RENDERER]);
+    const { raw, runner, outside } = await rendererParts();
+    expect(raw.match(/\.screenshot\(/g)).toHaveLength(1);
+    expect(runner).toContain('page.screenshot(');
+    expect(outside).not.toContain('screenshot(');
   });
 });
 
@@ -134,17 +155,17 @@ describe('canonical evaluation renders the exact build it evaluates', () => {
   it('evaluateSite renders after the deterministic gates and before review, bound to the exact subject', async () => {
     const evaluate = await src(EVALUATE);
     const site = body(evaluate, 'export async function evaluateSite(', '\nfunction firstErrors(');
-    const order = ['await runDeterministicGates(deps.workspace.siteRoot', 'await renderInBrowser({', 'await reviewSite('].map((m) => site.indexOf(m));
+    const order = ['await runDeterministicGates(deps.workspace.siteRoot', 'await captureInBrowser({', 'await persistScreenshotSet({', 'await reviewSite('].map((m) => site.indexOf(m));
     expect(order.every((i) => i > -1)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
-    const render = site.slice(site.indexOf('await renderInBrowser({'), site.indexOf('  if (browserRender) {'));
+    const render = site.slice(site.indexOf('await captureInBrowser({'), site.indexOf('const browserRender = '));
     expect(render).toContain('exportDir: compiled.outDir,');
     expect(render).toContain('plan: progress.plan,');
     expect(render).toContain('projectId: facts.projectId,');
     expect(render).toContain('sitePlan: subject.sitePlan,');
     expect(render).toContain('sourceCommit: await deps.workspace.currentCommit(),');
     expect(render).toContain('authority: subject.authority,');
-    expect(site).toMatch(/const browserRender = compiled\.ok\s*\?\s*await renderInBrowser\(/);
+    expect(site).toMatch(/const captured = compiled\.ok\s*\?\s*await captureInBrowser\(/);
     // Evidence only: browser findings do not become defects in this slice.
     expect(site.slice(site.indexOf('const gateDefects'))).not.toMatch(/browserRender\.(renders|findings)/);
   });
@@ -152,7 +173,7 @@ describe('canonical evaluation renders the exact build it evaluates', () => {
   it('evaluateSite is the only production caller, and runProject hands it the exact plan version and authority', async () => {
     const callers: string[] = [];
     for (const file of await allProductionFiles()) {
-      if (/renderInBrowser\(/.test(await src(file)) && file !== RENDERER) callers.push(file);
+      if (/(renderInBrowser|captureInBrowser)\(/.test(await src(file)) && file !== RENDERER) callers.push(file);
     }
     expect(callers).toEqual([EVALUATE]);
 
@@ -165,5 +186,59 @@ describe('canonical evaluation renders the exact build it evaluates', () => {
     expect(authority).toContain("if (frontendBackendExecutionMode !== 'job_lifecycle') return { mode: 'legacy_direct' };");
     expect(authority).toContain('buildBindingId: canonicalBuild._id,');
     expect(orchestrator.match(/canonicalPromotion = \{/g)).toHaveLength(3);
+  });
+});
+
+describe('durable screenshot evidence', () => {
+  const EVIDENCE = 'packages/workspace/src/screenshot-evidence.ts';
+  const BLOBS = 'packages/workspace/src/blob-store.ts';
+
+  it('holds no model, job, promotion or release authority', async () => {
+    for (const file of [EVIDENCE, BLOBS]) {
+      const code = await src(file);
+      expect(code, file).not.toMatch(/ModelRuntime|\.invoke\(|@statxai\/(agents|job-engine|orchestrator)|JobEngine|accept\w*Candidate|promot|releas|lineage|budget/i);
+    }
+    const imports = [...(await src(EVIDENCE)).matchAll(/from '([^']+)'/g)].map((m) => m[1]!).sort();
+    expect(imports).toEqual(['./blob-store.js', './browser-renderer.js', './registry.js', '@statxai/contracts', 'node:crypto']);
+  });
+
+  it('never looks screenshot evidence up by name: the set is written, and its exact ref returned', async () => {
+    const evidence = await src(EVIDENCE);
+    expect(evidence.match(/registry\.\w+\(/g)).toEqual(['registry.put(']);
+    expect(evidence).toContain('return { ref, set };');
+    const offenders: string[] = [];
+    for (const file of await allProductionFiles()) {
+      const code = await src(file);
+      if (file !== EVIDENCE && /screenshot-set|SCREENSHOT_SET_ARTIFACT/.test(code)) offenders.push(file);
+      // The collection itself is touched only by the blob store, which verifies every write and read.
+      if (file !== BLOBS && /\bstore\.blobs\b|collection\(['"]blobs['"]\)/.test(code) && file !== 'packages/state/src/store.ts') offenders.push(`${file} (blobs)`);
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('images are stored before the one set that names them, and a mismatched store is never claimed', async () => {
+    const evidence = await src(EVIDENCE);
+    const persist = body(evidence, 'export async function persistScreenshotSet(', '\n}\n');
+    expect(persist.indexOf('await input.blobs.put(')).toBeGreaterThan(-1);
+    expect(persist.indexOf('await input.blobs.put(')).toBeLessThan(persist.indexOf('await input.registry.put('));
+    expect(persist.match(/await input\.registry\.put\(/g)).toHaveLength(1);
+    expect(persist).toContain("if (stored.sha256 !== sha256 || stored.bytes !== capture.png.length) throw new Error(");
+    expect(persist).toMatch(/complete: captures\.length > 0 && capturedCount === captures\.length && report\.status === 'completed',/);
+  });
+
+  it('evaluateSite captures, persists, and returns the exact screenshot-set reference', async () => {
+    const evaluate = await src(EVALUATE);
+    const site = body(evaluate, 'export async function evaluateSite(', '\nfunction firstErrors(');
+    expect(site).toContain('await persistScreenshotSet({ registry: deps.registry, blobs: new BlobStore(deps.store), projectId: facts.projectId, outcome: captured })');
+    expect(site).toContain('screenshotSet: screenshots?.ref ?? null,');
+    expect(site).not.toMatch(/registry\.(get|latest)\(/);
+  });
+
+  it('no tool adapter or model skill reaches screenshots or blobs', async () => {
+    for (const dir of ['packages/orchestrator/src/tool-gateway', 'packages/agents/src']) {
+      for (const file of await productionFiles(dir)) {
+        expect(await src(file), file).not.toMatch(/screenshot|captureInBrowser|BlobStore|blobs/i);
+      }
+    }
   });
 });

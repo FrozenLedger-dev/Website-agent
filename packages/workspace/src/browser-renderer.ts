@@ -39,12 +39,16 @@ import { fileURLToPath } from 'node:url';
 import {
   BLOCKING_BROWSER_FINDINGS,
   BrowserRouteRender,
+  SCREENSHOT_POLICY_VERSION,
+  ScreenshotCaptureReason,
   type BrowserFinding,
   type BrowserRenderReport,
   type BrowserRenderSubject,
   type BrowserViewport,
+  type ScreenshotPolicy,
   type SitePlan,
 } from '@statxai/contracts';
+import * as z from 'zod/v4';
 import {
   SANDBOX_LABEL,
   SandboxUnavailable,
@@ -134,6 +138,31 @@ export const BROWSER_REPORT_BOUNDS = Object.freeze({
 /** The one local origin the server listens on inside the container. */
 export const BROWSER_ORIGIN_PORT = 4173;
 
+/**
+ * How every screenshot is made: a PNG of the whole page from the top, at the
+ * viewport's width and CSS scale, after the render's own readiness, with motion
+ * reduced and animations stopped — cropped at `maxCaptureHeight` and marked
+ * truncated when the page is taller. Measured: a 40-section page is 17,280 CSS
+ * pixels and 711 KB at desktop, 25,120 and 584 KB at mobile, and captures of an
+ * unchanged page are byte-identical.
+ */
+export const SCREENSHOT_POLICY: ScreenshotPolicy = Object.freeze({
+  version: SCREENSHOT_POLICY_VERSION,
+  format: 'png',
+  viewports: [...BROWSER_VIEWPORTS],
+  fullPage: true,
+  maxCaptureHeight: 16_000,
+  maxCaptureBytes: 8 * 1024 * 1024,
+  maxSetBytes: 64 * 1024 * 1024,
+  reducedMotion: 'reduce',
+  animations: 'disabled',
+  caret: 'hide',
+  scale: 'css',
+});
+
+/** The bounds a capture run may tighten (never loosen past the blob limit), recorded in the set it produces. */
+export type ScreenshotLimits = Pick<ScreenshotPolicy, 'maxCaptureHeight' | 'maxCaptureBytes' | 'maxSetBytes'>;
+
 /** The route grammar a plan's `PageSpec.route` already obeys, enforced again here. */
 const ROUTE = /^\/([a-z0-9]+(-[a-z0-9]+)*(\/[a-z0-9]+(-[a-z0-9]+)*)*)?$/;
 
@@ -187,6 +216,8 @@ const SITE = '/site';
 const ORIGIN = 'http://127.0.0.1:' + job.port;
 const TYPES = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.json': 'application/json', '.txt': 'text/plain; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.avif': 'image/avif', '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf', '.otf': 'font/otf', '.map': 'application/json', '.webmanifest': 'application/manifest+json', '.xml': 'application/xml' };
 const emit = (value) => process.stdout.write('@@render ' + JSON.stringify(value) + '\n');
+const emitCapture = (value) => process.stdout.write('@@capture ' + JSON.stringify(value) + '\n');
+let capturedBytes = 0;
 // A page cannot take the runner down with it: a stray error in an event is not a crash.
 process.on('uncaughtException', () => {});
 process.on('unhandledRejection', () => {});
@@ -339,8 +370,38 @@ for (const target of job.targets) {
     else { status = 'failed'; add('navigation_failed', outcome.slice(6)); }
   }
 
+  // Captured only after the same readiness, and only for a page that answered and became ready.
+  let capture = null;
+  if (job.capture) {
+    capture = { route: target.route, viewport: name, reason: 'render_not_ready', page: null, truncated: false, width: null, height: null, png: null, detail: null };
+    if (httpStatus !== null && httpStatus < 400 && readyMs !== null) {
+      try {
+        const size = await Promise.race([
+          page.evaluate(() => {
+            const root = document.documentElement;
+            const body = document.body;
+            return [Math.ceil(Math.max(root.scrollWidth, body ? body.scrollWidth : 0)), Math.ceil(Math.max(root.scrollHeight, body ? body.scrollHeight : 0))];
+          }),
+          sleep(job.capture.timeoutMs).then(() => null),
+        ]);
+        if (!size) throw new Error('page size not measured within ' + job.capture.timeoutMs + 'ms');
+        capture.page = { width: size[0], height: size[1] };
+        const height = Math.max(1, Math.min(size[1], job.capture.maxHeight));
+        capture.truncated = size[1] > job.capture.maxHeight;
+        const png = await page.screenshot({ type: 'png', fullPage: true, clip: { x: 0, y: 0, width, height }, animations: 'disabled', caret: 'hide', scale: 'css', timeout: job.capture.timeoutMs });
+        if (png.length > job.capture.maxBytes) { capture.reason = 'capture_too_large'; capture.detail = png.length + ' bytes'; }
+        else if (capturedBytes + png.length > job.capture.maxSetBytes) { capture.reason = 'set_limit_reached'; capture.detail = png.length + ' bytes'; }
+        else { capturedBytes += png.length; capture.reason = 'captured'; capture.width = width; capture.height = height; capture.png = png.toString('base64'); }
+      } catch (error) {
+        capture.reason = 'capture_failed';
+        capture.detail = firstLine(error && error.message);
+      }
+    }
+  }
+
   await Promise.race([context.close().catch(() => {}), sleep(job.readiness.closeTimeoutMs)]);
   emit({ route: target.route, viewport: name, status, httpStatus, navigationMs, readyMs, findings });
+  if (capture) emitCapture(capture);
 }
 
 await Promise.race([browser.close().catch(() => {}), sleep(job.readiness.closeTimeoutMs)]);
@@ -451,6 +512,29 @@ export interface BrowserRenderOptions {
   /** Where the runtime cache and disposable run directories live. */
   readonly workRoot?: string;
   readonly runtimeRoot?: string;
+  /** Tighter screenshot bounds for this run; the set records what was actually applied. */
+  readonly screenshotLimits?: Partial<ScreenshotLimits>;
+}
+
+/** One target's capture, validated by the harness: bytes only when they are a PNG of the policy's shape. */
+export interface BrowserCapture {
+  readonly route: string;
+  readonly viewport: BrowserViewport;
+  readonly reason: ScreenshotCaptureReason;
+  readonly page: { width: number; height: number } | null;
+  readonly truncated: boolean;
+  readonly png: Buffer | null;
+  readonly width: number | null;
+  readonly height: number | null;
+  readonly detail: string | null;
+}
+
+export interface BrowserCaptureOutcome {
+  readonly report: BrowserRenderReport;
+  /** One per target, in target order — every target accounted for, captured or not. */
+  readonly captures: readonly BrowserCapture[];
+  /** The policy these captures were made under, with the bounds actually applied. */
+  readonly policy: ScreenshotPolicy;
 }
 
 /**
@@ -463,7 +547,22 @@ export interface BrowserRenderOptions {
  * every file of the run are gone.
  */
 export async function renderInBrowser(options: BrowserRenderOptions): Promise<BrowserRenderReport> {
+  return (await runBrowser(options, false)).report;
+}
+
+/**
+ * The same render, in the same isolated execution, also capturing a screenshot
+ * of every target that answered and became ready (see {@link SCREENSHOT_POLICY}).
+ * Returns the report exactly as {@link renderInBrowser} would, the validated
+ * captures, and the effective policy. Nothing is stored here.
+ */
+export async function captureInBrowser(options: BrowserRenderOptions): Promise<BrowserCaptureOutcome> {
+  return runBrowser(options, true);
+}
+
+async function runBrowser(options: BrowserRenderOptions, capture: boolean): Promise<BrowserCaptureOutcome> {
   const started = Date.now();
+  const policy: ScreenshotPolicy = { ...SCREENSHOT_POLICY, viewports: [...BROWSER_VIEWPORTS], ...options.screenshotLimits };
   const limits: BrowserLimits = { ...BROWSER_LIMITS, ...options.limits };
   const readiness: RenderReadiness = { ...RENDER_READINESS, ...options.readiness };
   options.signal?.throwIfAborted();
@@ -490,6 +589,11 @@ export async function renderInBrowser(options: BrowserRenderOptions): Promise<Br
       durationMs: Date.now() - started,
       reason: reason === null ? null : sanitizeSandboxOutput(reason).slice(0, BROWSER_REPORT_BOUNDS.maxDetailChars),
     });
+  const outcome = (built: BrowserRenderReport, output: string | null): BrowserCaptureOutcome => ({
+    report: built,
+    captures: capture ? parseCaptures(output ?? '', targets, policy) : [],
+    policy,
+  });
   const notRun = (done: readonly BrowserRouteRender[]) =>
     targets.slice(done.length).map((t): BrowserRouteRender => ({ route: t.route, viewport: t.viewport.name, status: 'not_run', httpStatus: null, navigationMs: null, readyMs: null, findings: [] }));
 
@@ -498,14 +602,14 @@ export async function renderInBrowser(options: BrowserRenderOptions): Promise<Br
     const site = join(runRoot, 'site');
     const snapshot = await snapshotExport(options.exportDir, site);
     exportDigest = snapshot.digest;
-    if (snapshot.files === 0) return report('unavailable', notRun([]), 'There is no static export to render.');
+    if (snapshot.files === 0) return outcome(report('unavailable', notRun([]), 'There is no static export to render.'), null);
 
     let runtime: string;
     try {
       runtime = await prepareTrustedDependencies(options.runtimeRoot ?? defaultBrowserRuntimeRoot(), workRoot);
       await ensureBrowserImage();
     } catch (error) {
-      if (error instanceof SandboxUnavailable) return report('unavailable', notRun([]), error.message);
+      if (error instanceof SandboxUnavailable) return outcome(report('unavailable', notRun([]), error.message), null);
       throw error;
     }
     options.signal?.throwIfAborted();
@@ -515,24 +619,35 @@ export async function renderInBrowser(options: BrowserRenderOptions): Promise<Br
     await writeFile(join(app, 'runner.mjs'), BROWSER_RUNNER_SOURCE);
     await writeFile(
       join(app, 'job.json'),
-      JSON.stringify({ port: BROWSER_ORIGIN_PORT, startupMs: limits.startupMs, targets, readiness, bounds: BROWSER_REPORT_BOUNDS }),
+      JSON.stringify({
+        port: BROWSER_ORIGIN_PORT,
+        startupMs: limits.startupMs,
+        targets,
+        readiness,
+        bounds: BROWSER_REPORT_BOUNDS,
+        capture: capture
+          ? { maxHeight: policy.maxCaptureHeight, maxBytes: policy.maxCaptureBytes, maxSetBytes: policy.maxSetBytes, timeoutMs: readiness.readyTimeoutMs }
+          : null,
+      }),
     );
 
     name = `statxai-browser-${randomBytes(8).toString('hex')}`;
     const created = await docker(browserCreateArgs({ name, site, runtime, app, limits, user: sandboxUser() }));
     if (created.code !== 0) {
       name = null;
-      return report('unavailable', notRun([]), `Browser container could not be created: ${created.stderr}`);
+      return outcome(report('unavailable', notRun([]), `Browser container could not be created: ${created.stderr}`), null);
     }
     options.signal?.throwIfAborted();
 
-    const perTarget = readiness.navigationTimeoutMs + readiness.readyTimeoutMs + readiness.closeTimeoutMs + 2_000;
+    // A capture adds a size measurement and an image, each bounded by the readiness timeout.
+    const perTarget = readiness.navigationTimeoutMs + readiness.readyTimeoutMs * (capture ? 3 : 1) + readiness.closeTimeoutMs + 2_000;
     const runLimits: SandboxLimits = {
       memoryBytes: limits.memoryBytes,
       cpus: limits.cpus,
       pids: limits.pids,
       tmpBytes: limits.tmpBytes,
-      outputBytes: limits.outputBytes,
+      // Images travel back base64-encoded on the runner's output, within the set's byte bound.
+      outputBytes: limits.outputBytes + (capture ? Math.ceil((policy.maxSetBytes * 4) / 3) + targets.length * 1024 : 0),
       timeoutMs: Math.min(limits.maxRunMs, limits.startupMs + targets.length * perTarget),
     };
     const attached = await attach(name, runLimits, options.signal);
@@ -540,12 +655,14 @@ export async function renderInBrowser(options: BrowserRenderOptions): Promise<Br
 
     const renders = parseRenders(attached.output, targets);
     const finished = /^@@render \{"done":true\}$/m.test(attached.output);
-    if (attached.timedOut) return report('timed_out', [...renders, ...notRun(renders)], `The render run exceeded its ${Math.round(runLimits.timeoutMs / 1000)}s limit.`);
-    if (!finished || renders.length !== targets.length) {
-      const tail = attached.output.split('\n').filter((line) => !line.startsWith('@@render')).slice(-5).join(' ');
-      return report('unavailable', [...renders, ...notRun(renders)], `The browser did not finish rendering: ${tail}`);
+    if (attached.timedOut) {
+      return outcome(report('timed_out', [...renders, ...notRun(renders)], `The render run exceeded its ${Math.round(runLimits.timeoutMs / 1000)}s limit.`), attached.output);
     }
-    return report('completed', renders, null);
+    if (!finished || renders.length !== targets.length) {
+      const tail = attached.output.split('\n').filter((line) => !line.startsWith('@@')).slice(-5).join(' ');
+      return outcome(report('unavailable', [...renders, ...notRun(renders)], `The browser did not finish rendering: ${tail}`), attached.output);
+    }
+    return outcome(report('completed', renders, null), attached.output);
   } finally {
     try {
       if (name !== null) await removeContainer(name);
@@ -575,6 +692,65 @@ function parseRenders(output: string, targets: readonly RenderTarget[]): Browser
     renders.push(parsed.data.status === 'rendered' && blocked ? { ...parsed.data, status: 'failed' } : parsed.data);
   }
   return renders;
+}
+
+const CaptureLine = z.strictObject({
+  route: z.string(),
+  viewport: z.string(),
+  reason: ScreenshotCaptureReason,
+  page: z.strictObject({ width: z.number().int().nonnegative(), height: z.number().int().nonnegative() }).nullable(),
+  truncated: z.boolean(),
+  width: z.number().int().positive().nullable(),
+  height: z.number().int().positive().nullable(),
+  png: z.string().regex(/^[A-Za-z0-9+/]*={0,2}$/).nullable(),
+  detail: z.string().nullable(),
+});
+
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+/** Width and height from a PNG's IHDR, or null when the bytes are not a PNG. */
+export function pngDimensions(bytes: Buffer): { width: number; height: number } | null {
+  if (bytes.length < 24 || !bytes.subarray(0, 8).equals(PNG_SIGNATURE) || bytes.toString('latin1', 12, 16) !== 'IHDR') return null;
+  return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+}
+
+/**
+ * One capture per target, in target order. The runner's claims are checked, not
+ * trusted: an image is kept only if it decodes as a PNG exactly the claimed size,
+ * as wide as the viewport, within the height, byte and set bounds. Anything else
+ * is reported without bytes; a target with no line was not run.
+ */
+function parseCaptures(output: string, targets: readonly RenderTarget[], policy: ScreenshotPolicy): BrowserCapture[] {
+  const lines = new Map<string, z.infer<typeof CaptureLine>>();
+  for (const line of output.split('\n')) {
+    if (!line.startsWith('@@capture {')) continue;
+    try {
+      const parsed = CaptureLine.safeParse(JSON.parse(line.slice('@@capture '.length)));
+      if (parsed.success) lines.set(`${parsed.data.route}\0${parsed.data.viewport}`, parsed.data);
+    } catch {
+      // A truncated or garbled line is simply no capture for its target.
+    }
+  }
+
+  let setBytes = 0;
+  return targets.map((target): BrowserCapture => {
+    const line = lines.get(`${target.route}\0${target.viewport.name}`);
+    const base = { route: target.route, viewport: target.viewport, png: null, width: null, height: null };
+    if (!line) return { ...base, reason: 'not_run', page: null, truncated: false, detail: null };
+    const detail = line.detail === null ? null : sanitizeSandboxOutput(line.detail).slice(0, BROWSER_REPORT_BOUNDS.maxDetailChars);
+    const described = { ...base, page: line.page, truncated: line.truncated, detail };
+    if (line.reason !== 'captured') return { ...described, reason: line.reason === 'not_run' ? 'not_run' : line.reason };
+
+    const png = line.png === null ? null : Buffer.from(line.png, 'base64');
+    const size = png ? pngDimensions(png) : null;
+    if (!png || !size || size.width !== line.width || size.height !== line.height || size.width !== target.viewport.width || size.height > policy.maxCaptureHeight) {
+      return { ...described, reason: 'invalid_image', detail: 'the image is not a PNG of the policy’s dimensions' };
+    }
+    if (png.length > policy.maxCaptureBytes) return { ...described, reason: 'capture_too_large', detail: `${png.length} bytes` };
+    if (setBytes + png.length > policy.maxSetBytes) return { ...described, reason: 'set_limit_reached', detail: `${png.length} bytes` };
+    setBytes += png.length;
+    return { ...described, reason: 'captured', png, width: size.width, height: size.height };
+  });
 }
 
 /**

@@ -328,6 +328,8 @@ describe('a delivery that is released', () => {
       'site-plan@1',
       'route-decision@1',
       'test-report@1',
+      // The browser's screenshots of the exact build (no export exists under this suite's faked compiler, so the set is honestly empty).
+      'screenshot-set@1',
       'visual-review@1',
       'approval-recommendation@1',
       'release-authorization@1',

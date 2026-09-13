@@ -194,7 +194,11 @@ describe('the trusted runner', () => {
     expect(BROWSER_RUNNER_SOURCE).toContain("reducedMotion: 'reduce'");
     expect(BROWSER_RUNNER_SOURCE).toContain("waitUntil: 'load'");
     expect(BROWSER_RUNNER_SOURCE).not.toContain('networkidle');
-    expect(BROWSER_RUNNER_SOURCE).not.toMatch(/screenshot|\.pdf\(|video/);
+    // One screenshot call, after readiness, PNG only; never a PDF or video.
+    expect(BROWSER_RUNNER_SOURCE.match(/page\.screenshot\(/g)).toHaveLength(1);
+    expect(BROWSER_RUNNER_SOURCE.indexOf('page.screenshot(')).toBeGreaterThan(BROWSER_RUNNER_SOURCE.indexOf('page.evaluate(readiness, job.readiness)'));
+    expect(BROWSER_RUNNER_SOURCE).toMatch(/page\.screenshot\(\{ type: 'png', fullPage: true, clip: \{ x: 0, y: 0, width, height \}, animations: 'disabled', caret: 'hide', scale: 'css'/);
+    expect(BROWSER_RUNNER_SOURCE).not.toMatch(/\.pdf\(|recordVideo|type: 'jpeg'|type: "jpeg"/);
   });
 });
 

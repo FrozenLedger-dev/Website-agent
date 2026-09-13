@@ -169,7 +169,7 @@ vi.mock('@statxai/workspace', async (importOriginal) => {
     readSourceFiles: vi.fn(async () => [{ path: 'app/page.tsx', contents: 'x' }]),
     deploymentConfigured: vi.fn(() => false),
     // Real: it renders nothing here (the compiler is faked, so there is no export), but what it is asked to render is the subject under test.
-    renderInBrowser: vi.fn(actual.renderInBrowser),
+    captureInBrowser: vi.fn(actual.captureInBrowser),
   };
 });
 
@@ -698,7 +698,7 @@ describe('browser render subject identity', () => {
     const projectId = 'proj_render_subject_legacy';
     await run(projectId, { frontendBackendExecutionMode: 'legacy_direct' });
 
-    const calls = vi.mocked(workspaceModule.renderInBrowser).mock.calls;
+    const calls = vi.mocked(workspaceModule.captureInBrowser).mock.calls;
     expect(calls).toHaveLength(1);
     const { subject, plan } = calls[0]![0];
     const planDoc = await store.artifacts.findOne({ projectId, name: 'site-plan' }, { sort: { version: -1 } });
@@ -713,13 +713,26 @@ describe('browser render subject identity', () => {
     const { promisify } = await import('node:util');
     const log = await promisify(execFile)('git', ['-C', ws.root, 'log', '--format=%H']);
     expect(log.stdout.split('\n')).toContain(subject.sourceCommit);
+
+    // The evaluation hands back the exact screenshot-set it wrote — no lookup — and that set names the same subject, honestly empty.
+    const outcome = await vi.mocked(evaluateModule.evaluateSite).mock.results[0]!.value;
+    expect(outcome.kind).toBe('evaluated');
+    const ref = outcome.screenshotSet;
+    expect(ref).toMatchObject({ name: 'screenshot-set', version: 1 });
+    const set = await new ArtifactRegistry(store).resolve<{ subject: typeof subject & { exportDigest: string }; complete: boolean; capturedCount: number; expectedCaptures: number; captures: { reason: string; image: unknown }[] }>(projectId, ref);
+    expect(set.subject).toMatchObject({ projectId, sitePlan: subject.sitePlan, sourceCommit: subject.sourceCommit, authority: { mode: 'legacy_direct' } });
+    expect(set.subject.authority).not.toHaveProperty('buildBindingId');
+    expect(set.complete).toBe(false);
+    expect(set.capturedCount).toBe(0);
+    expect(set.captures.every((c) => c.image === null && c.reason === 'not_run')).toBe(true);
+    expect(set.expectedCaptures).toBe(set.captures.length);
   });
 
   it('job_lifecycle: renders against the exact canonical build binding, its promotion and its plan version', async () => {
     const projectId = 'proj_render_subject_job';
     await runJobMode(projectId);
 
-    const calls = vi.mocked(workspaceModule.renderInBrowser).mock.calls;
+    const calls = vi.mocked(workspaceModule.captureInBrowser).mock.calls;
     expect(calls).toHaveLength(1);
     const { subject } = calls[0]![0];
     const binding = await store.frontendBackendBuildBindings.findOne({ projectId });
@@ -732,5 +745,10 @@ describe('browser render subject identity', () => {
     });
     expect(subject.sitePlan).toEqual(binding!.sitePlan);
     expect(subject.sourceCommit).toMatch(/^[0-9a-f]{40}$/);
+
+    const outcome = await vi.mocked(evaluateModule.evaluateSite).mock.results[0]!.value;
+    const set = await new ArtifactRegistry(store).resolve<{ subject: { authority: unknown; sitePlan: unknown } }>(projectId, outcome.screenshotSet);
+    expect(set.subject.authority).toEqual(subject.authority);
+    expect(set.subject.sitePlan).toEqual(binding!.sitePlan);
   });
 });

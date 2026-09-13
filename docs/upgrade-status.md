@@ -5910,6 +5910,144 @@ cleared after each.
 **Not in this slice:** screenshot artifacts, multimodal review, visual
 refinement and any browser tool.
 
+## Durable screenshots bound to the exact build — **DONE**
+
+**Why.** Multimodal visual review needs images, and the images must be of the
+exact revision under review — never "the latest homepage.png".
+
+**Gate findings.**
+
+- **Storage:** `ArtifactRegistry` stores JSON only (canonical-JSON sha256,
+  immutable versions), and there was no binary store. Base64 inside artifact JSON
+  would bloat documents that listings read whole.
+- **Capture:** it fits inside the existing browser run, after the same readiness,
+  with no weaker isolation. Images return over the runner's existing bounded
+  output rather than a new writable mount.
+- **Size and determinism (real Chromium):**
+
+  | Page | Viewport | Size | Height |
+  |---|---|---|---|
+  | Scaffold homepage | Desktop | 10 KB | 900 px |
+  | Scaffold homepage | Mobile | 7 KB | 844 px |
+  | 40-section page | Desktop | 711 KB | 17,280 px |
+  | 40-section page | Mobile | 584 KB | 25,120 px |
+
+  Repeat captures of an unchanged page were byte-identical.
+
+**Blob storage** (`workspace/src/blob-store.ts`, `state` `blobs` collection).
+
+- **Keying:** content-addressed, `_id` `sha256:<hex>`, BSON Binary, one atomic
+  insert, 12 MB per blob.
+- **Deduplication:** identical bytes are one document, and a second write is a
+  verified no-op.
+- **Integrity:** a read re-hashes the bytes, and corruption raises `BlobCorrupt`.
+- **Lifecycle:** immutable — no update, delete or garbage collection yet.
+
+**Policy `statxai-screenshot@1`** (`SCREENSHOT_POLICY`).
+
+- **Format and targets:** PNG only, one per route × viewport (desktop 1440×900,
+  tablet 768×1024, mobile 390×844), scale 1.
+- **Settings:** CSS scale, `reducedMotion: 'reduce'`, animations disabled, caret
+  hidden.
+- **Crop:** full page from the top, cropped to the viewport width and at most
+  16,000 CSS px tall. The page's own size is recorded, and `truncated` marks a
+  taller page.
+- **Limits:** 8 MB per capture and 64 MB per set. A run may tighten them, and
+  the set records the effective values.
+
+**Capture** (inside `captureInBrowser`, the same runner and container).
+
+- **When:** only when the page answered (HTTP < 400) and reached readiness. A
+  page that loaded then threw is captured as diagnostic evidence; a 404 or
+  never-ready page is `render_not_ready`, with no image.
+- **Checks:** the runner enforces height, byte and set bounds. The harness
+  re-validates every image: PNG signature, IHDR dimensions matching the claim,
+  viewport width, and the height, byte and set bounds. Anything else is
+  `invalid_image`.
+- **Other outcomes:** a failing screenshot is `capture_failed`. A target with no
+  line, including after a run timeout, is `not_run`.
+- **Unchanged:** `renderInBrowser` still returns the report alone.
+
+**Evidence** (`screenshot-evidence.ts`, `persistScreenshotSet`,
+`contracts/browser.ts` `ScreenshotSet`).
+
+- **Order:** blobs are written first, each checked against its captured sha256
+  (a mismatch is `storage_failed`, never captured), then one `screenshot-set`
+  artifact is written as an ordinary new version.
+- **Contents:**
+  - the exact subject: project, site-plan ref, source commit, export digest, and
+    authority (`legacy_direct` carries no binding fields);
+  - the effective policy and a browser summary;
+  - `expectedCaptures`, `capturedCount`, `missingCount`, `totalBytes` and
+    `omittedRoutes`;
+  - `complete`, only when every target has a durable image from a completed run;
+  - per capture: route, full viewport, reason, render status, finding
+    categories, page size, `truncated`, image (blob, sha256, bytes, width,
+    height) and detail.
+- **Failures:** if the artifact write fails, no set claims anything, and any
+  unreferenced blobs remain inert.
+- **Repeats:** a repeated evaluation adds a new version, and the old version is
+  untouched.
+
+**Integration.** `evaluateSite` does capture → persist → review, and returns
+`screenshotSet`, the exact ref it wrote (plus `browserRender` as before).
+
+- **Advisory:** no defect, and no model call.
+- **Abort:** a cancelled capture rejects before anything is persisted.
+
+**Tests.**
+
+- **`screenshot-evidence.integration.test.ts` (Mongo):**
+  - blob round trip, deduplication, corruption, size bound and missing blob;
+  - exact subject, policy, target and image metadata, with hash and bytes
+    matching stored blobs;
+  - legacy authority has no binding fields; missing targets make the set
+    incomplete, as does an incomplete run;
+  - blobs are written before the set;
+  - failure modes: storage failure, hash mismatch and artifact write failure;
+  - repeated evaluation is additive, with a deduplicated blob.
+- **`screenshot-capture.integration.test.ts` (real Chromium plus Mongo):**
+  - a real Next export's 6 captures, durable after the container is gone, with
+    valid PNGs and policy dimensions, bound to the subject;
+  - long page truncated at 16,000 px; runtime-error page captured with its
+    finding; external image blocked and captured;
+  - animation byte-identical across runs; responsive mobile layout;
+  - 404 and never-ready pages get no image;
+  - byte cap, set cap, height cap and `capture_failed` enforced;
+  - the live container inspected (no secrets, read-only mounts, no network,
+    non-root);
+  - abort persists nothing.
+- **`runProject` subject tests:** the exact `screenshot-set` ref is returned, and
+  its subject matches for legacy_direct and job_lifecycle.
+- **Structural:**
+  - a screenshot is taken only in the isolated runner, and no PDF or video;
+  - evidence code holds no model, job, promotion or release authority;
+  - the set is written with `registry.put`, and never read by name anywhere;
+  - `store.blobs` is touched only by the blob store;
+  - blobs are written before the set;
+  - evaluation returns the exact ref, and no tool or skill reaches screenshots.
+
+**Mutations: 22 of 22 killed.** Each ran against the browser, sandbox and
+tool-gateway structural and unit suites, plus the matching persistence,
+real-capture or `runProject` test. Sources were restored byte-identical and
+container debris cleared after each.
+
+- **Persistence suite:** the subject losing its plan ref, source commit, export
+  digest or binding authority; route, viewport or policy-version metadata
+  dropped; hash verification removed; blobs written after the set; an incomplete
+  set marked complete; repeated evaluation overwriting old sets.
+- **Real Chromium suite:** the pixel bound, byte cap or aggregate cap removed; a
+  failed route fabricating a capture; a cancelled run completing.
+- **Structural suite only:** host Chromium, a model import, the browser tool
+  registered, and a latest-version lookup (a single evaluation's latest equals
+  its own version, so the `runProject` test cannot see it).
+- **`runProject` subject tests only:** evaluation skipping persistence.
+- **Both structural and `runProject` tests:** images written only to a temp
+  directory.
+
+**Not in this slice:** multimodal review, visual scoring, refinement,
+customer or editor UI, and any browser tool.
+
 ## Phases 6–17
 
 Not started.

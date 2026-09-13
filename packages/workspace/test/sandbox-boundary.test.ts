@@ -114,7 +114,7 @@ describe('no privileged build path exists outside the sandbox', () => {
 describe('both generated-code build sites use the sandboxed build', () => {
   it('runDeterministicGates compiles through @statxai/workspace buildSite', async () => {
     const code = await src('packages/orchestrator/src/phases/evaluate.ts');
-    expect(code).toMatch(/import \{\s*buildSite as compileSite,[\s\S]*?\} from '@statxai\/workspace';/);
+    expect(code).toMatch(/import \{[^}]*\bbuildSite as compileSite,[\s\S]*?\} from '@statxai\/workspace';/);
     const gates = body(code, 'export async function runDeterministicGates(', '\nexport type SourceFile');
     expect(gates).toMatch(/const compiled = await compileSite\(siteRoot, /);
     expect(gates.indexOf('signal?.throwIfAborted()')).toBeGreaterThan(gates.indexOf('compileSite('));

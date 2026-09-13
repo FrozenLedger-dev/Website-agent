@@ -21,9 +21,11 @@ import {
 import { reviewSite } from '@statxai/agents';
 import { isFrameworkPage, runGates } from '@statxai/gates';
 import {
+  BlobStore,
   buildSite as compileSite,
+  captureInBrowser,
+  persistScreenshotSet,
   readBuiltFiles,
-  renderInBrowser,
   readExportFiles,
   readSourceFiles,
   type BuildResult,
@@ -88,6 +90,12 @@ export interface Evaluation {
    * it adds no defect and blocks nothing yet.
    */
   browserRender: BrowserRenderReport | null;
+  /**
+   * The exact `screenshot-set` artifact this evaluation wrote — every capture of
+   * the rendered build, bound to its subject — or null when nothing was
+   * rendered. Handed on by reference: nothing looks it up again.
+   */
+  screenshotSet: ArtifactRef | null;
   /** Source files a repair may edit. Read even when the build failed. */
   sources: SourceFiles;
   /** Export path → the source file that produced it, for scoping a repair. */
@@ -168,8 +176,8 @@ export async function evaluateSite(ctx: RunContext, subject: EvaluationSubject):
    * rendered, and advisory: it changes no defect, gate or release decision in
    * this slice.
    */
-  const browserRender = compiled.ok
-    ? await renderInBrowser({
+  const captured = compiled.ok
+    ? await captureInBrowser({
         exportDir: compiled.outDir,
         plan: progress.plan,
         subject: {
@@ -180,6 +188,8 @@ export async function evaluateSite(ctx: RunContext, subject: EvaluationSubject):
         },
       })
     : null;
+  const browserRender = captured?.report ?? null;
+
   if (browserRender) {
     const blocked = browserRender.renders.filter((r) => r.status !== 'rendered').length;
     deps.say({
@@ -233,6 +243,19 @@ export async function evaluateSite(ctx: RunContext, subject: EvaluationSubject):
     gatesRun: compiled.ok ? ['build', ...gateRun.gatesRun] : ['build'],
     buildOutput: compiled.ok ? null : compiled.output,
   });
+
+  // The screenshots of this exact build, recorded after its gate results and before any review of it.
+  // Images first, then the one set that names them: never a set pointing at a missing image.
+  const screenshots = captured
+    ? await persistScreenshotSet({ registry: deps.registry, blobs: new BlobStore(deps.store), projectId: facts.projectId, outcome: captured })
+    : null;
+  if (screenshots) {
+    deps.say({
+      phase: 'evaluate',
+      detail: `Screenshots: ${screenshots.set.capturedCount}/${screenshots.set.expectedCaptures} captured (${screenshots.ref.name}@${screenshots.ref.version})`,
+      level: screenshots.set.complete ? 'ok' : 'warn',
+    });
+  }
 
   let defects: Defect[] = gateDefects;
 
@@ -288,6 +311,7 @@ export async function evaluateSite(ctx: RunContext, subject: EvaluationSubject):
     compiled,
     gateRun,
     browserRender,
+    screenshotSet: screenshots?.ref ?? null,
     sources,
     sourceOf,
     reviewSummary,
