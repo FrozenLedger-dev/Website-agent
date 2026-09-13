@@ -5454,6 +5454,164 @@ under the allowlist, since neither path can start with `app/` or
 with harness privileges; that isolation is the next prerequisite before a
 `test_runner`.
 
+## Sandboxed candidate builds — **DONE**
+
+**Why.** `next build` executes the model's code: server components run during
+prerender, and config and PostCSS modules run at load. `buildSite` ran
+`pnpm install` and `pnpm build` on the host with a copy of `process.env`, the
+whole host filesystem and an open network. A timeout killed only `pnpm`, and its
+descendants kept running. Both the 5g-1 validator and canonical evaluation reach
+that build through `runDeterministicGates`.
+
+**Platform.** Production runs on a Linux host/VM with Docker, so the sandbox is a
+container. The image is pinned by digest (`node:20.18.0-bookworm-slim`) and
+pulled as a trusted step; a run never pulls.
+
+**One executor.** `buildSite(siteRoot, { signal?, limits?, sandboxRoot? })` keeps
+its result shape and delegates to `executeCandidateBuild`, which:
+
+1. materialises a fresh workspace from the platform template, then copies in only
+   the regular, model-writable files of `siteRoot` (no symlinks);
+2. runs `node node_modules/next/dist/bin/next build` via `runSandboxed` — a
+   harness-chosen argv, so no manifest script is ever consulted;
+3. after the container is gone, copies back only regular files of `out/`, within
+   a 512 MB budget;
+4. removes the workspace however the run ended.
+
+`siteRoot` gains `out/` and nothing else — no `.next`, `node_modules` or
+`next-env.d.ts`.
+
+**Isolation** (`packages/workspace/src/sandbox.ts`, arguments built in one pure
+`sandboxCreateArgs`):
+
+- **Environment:** built, not filtered — `HOME=/tmp`, `CI`,
+  `NEXT_TELEMETRY_DISABLED`, `NODE_ENV=production`, `HTTPS_PROXY`. The `docker`
+  client itself gets only `PATH`, `HOME` and `DOCKER_*`.
+- **Filesystem:** read-only root; a `noexec` tmpfs `/tmp`; the disposable
+  workspace read-write at `/site`; trusted `node_modules` read-only over it.
+  Nothing else is mounted — no repository, home or socket.
+- **Network:** a per-run `--internal` Docker network with no route out. Its only
+  peer is `statxai-sandbox-egress`, a harness-owned CONNECT proxy that forwards
+  only to `fonts.googleapis.com:443` and `fonts.gstatic.com:443`. `next/font/google`
+  self-hosts brand faces at build time through it; every other host, port, IP
+  literal, plain HTTP and the metadata endpoint get `403`. The proxy container is
+  long-lived, unprivileged, read-only and capped at 128 MB and 64 PIDs.
+- **Privileges:** harness uid/gid, or `nobody` if the harness is root — never
+  root. `--cap-drop ALL`, `no-new-privileges`.
+- **Limits:** memory 4 GiB with no swap, 2 CPUs, 1024 PIDs, 10 min wall clock,
+  1 GiB tmpfs, 256 KiB captured output.
+
+**Dependencies.** `prepareTrustedDependencies` installs from the template's
+`package.json`, `pnpm-lock.yaml` and `pnpm-workspace.yaml` only, with
+`--frozen-lockfile`, an explicit environment and no candidate present. Entries are
+cached by content hash and published by atomic rename. A candidate manifest is
+never read, let alone installed from.
+
+**Cancellation.** The container is created, then started, so there is always one
+to kill. Timeout and abort send SIGKILL to the container, which ends its whole
+PID namespace, then force-remove it and verify it is gone; a survivor raises
+`SandboxCleanupFailed`. Abort rejects with the signal's reason, and
+`runDeterministicGates(…, signal)` runs no gates after a cancelled build.
+
+**Outcomes.**
+
+- **Build verdicts (resolve `ok: false`, reported as `BUILD-001` as before):** a
+  compile failure, a timeout (`Build terminated: it exceeded the Ns time limit.`)
+  and an OOM kill.
+- **Rejections (never a verdict):** an abort, and `SandboxUnavailable` — Docker,
+  the image or the trusted install missing. Neither is repairable by editing the
+  site.
+
+**Diagnostics.**
+
+- **Bounds:** captured through a tail buffer, then cut to the existing 4,000
+  characters.
+- **Sanitisation:** workspace paths become `/site`, and other home, repository
+  and temp paths become `<host-path>`. Secret-shaped harness values,
+  `SECRET_NAME=value` lines and credentialed URL userinfo are redacted.
+
+**Authority unchanged.** The sandbox modules import only Node built-ins and each
+other, and know nothing of jobs, acceptance, promotion, release or project state.
+5g-1 still verifies identity, writes through the write boundary, builds via
+`runDeterministicGates` and registers authentic success only on a pass. Sandbox
+execution is not exposed through ToolGateway.
+
+**Tests.**
+
+- **`sandbox.test.ts`:** exact env, mounts, network, user, capabilities, limits,
+  image and sanitizer rules.
+- **`sandbox-boundary.test.ts` (structural):**
+  - only `sandbox.ts` and the git-only `ProjectWorkspace` spawn processes;
+  - no other production file names a package-manager or Next argv;
+  - `buildSite` → `executeCandidateBuild` → `runSandboxed`, and the materialiser
+    filters through `isModelWritable`;
+  - both `runDeterministicGates` callers stay sandboxed, and the validator order
+    is boundary → workspace → build → authentic success;
+  - no authority imports and no wholesale `process.env`.
+- **`sandbox.integration.test.ts` (Docker):** probes from inside real containers:
+  - fake OpenAI, Vercel and Mongo secrets are absent in the process and its
+    children;
+  - host sentinel reads fail and outside writes land nowhere;
+  - the dependency mount is read-only, with no sockets and zero capabilities;
+  - direct egress, DNS and the metadata endpoint are blocked, and the proxy
+    allowlist holds;
+  - non-root uid; OOM kill at the memory limit; fork refusal at the PID limit;
+  - timeout, and abort with no surviving `sleep` descendants on the host;
+  - bounded output, and no leftover containers or networks.
+- **`candidate-build.integration.test.ts` (real `next build`):**
+  - a hostile page probes the sandbox during prerender;
+  - it builds from a canonical workspace tampered on disk (malicious
+    `package.json`, `next.config.ts` and fake `next` binary);
+  - it builds with fonts, sees no secrets, sentinel, network or socket, and runs
+    non-root;
+  - it uses the template manifest and config hashes; the tampered ones never run;
+  - canonical files, Git HEAD and status are unchanged;
+  - compile failure, timeout and abort all clean up.
+- **`sandboxed-validation.integration.test.ts`:**
+  - the real 5g-1 validator with a real sandboxed build: authentic success with
+    job, project and artifacts unchanged, then normal acceptance;
+  - a type error stays a failure, with a sanitized, bounded `BUILD-001` that
+    acceptance refuses;
+  - a fabricated passing result is refused;
+  - a `package.json` candidate is refused before any run exists.
+
+**Mutations: 19 of 20 killed, plus one extra variant (13b), also killed.** Each
+ran against the sandbox unit and structural suites and the matching Docker suite,
+on a daemon cleared of sandbox containers and networks after every mutation.
+
+- **Container environment:** inheriting `process.env`, or exposing the OpenAI,
+  Mongo or Vercel secret — unit and in-container probes.
+- **Network and host exposure:**
+  - enabling the bridge network — in-container probes;
+  - mounting the repository root or home — unit arguments only (the probe reads
+    host paths, not the new mount targets);
+  - mounting the Docker socket — unit and probe.
+- **Privileges and limits:** running as root, and removing the memory or PID
+  limit — unit and enforcement.
+- **Cancellation:** removing the wall timeout — enforcement.
+- **Build path:**
+  - skipping workspace cleanup — structural and real build;
+  - overlaying the candidate `package.json` — the real build's manifest-hash
+    probe;
+  - calling a privileged legacy build, or bypassing the sandbox from the validator
+    or canonical evaluation — structural.
+- **Diagnostics:** unbounded output — enforcement; leaking host paths — unit
+  sanitizer.
+
+**The survivor, mutation 13**, is equivalent in outcome. Abort kills only the
+`docker` client instead of the container, but `runSandboxed`'s `finally` still
+force-removes the container, ending its whole PID namespace, before the call
+rejects. The descendant check therefore holds.
+
+**Variant 13b** removes that second layer too: client-only kill plus a non-forced
+cleanup. It is killed. That variant also exposed a leak, now fixed: when
+container removal throws, the per-run network is still closed.
+
+Sources were restored byte-identical after each mutation.
+
+**Not in this slice:** `test_runner` and browser rendering. The future
+`test_runner` should be a thin adapter over `runSandboxed`.
+
 ## Phases 6–17
 
 Not started.

@@ -5,14 +5,20 @@
  * With hand-written HTML that check was vacuous — there was nothing to build.
  * Here it is the real thing: a project that does not compile fails before any
  * model is asked to review it.
+ *
+ * That build executes the model's code, so it runs in the sandbox (`./sandbox.ts`).
  */
-import { execFile } from 'node:child_process';
-import { cp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname, join, resolve, sep } from 'node:path';
+import { copyFile, cp, lchown, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
-
-const exec = promisify(execFile);
+import {
+  DEFAULT_SANDBOX_LIMITS,
+  prepareTrustedDependencies,
+  runSandboxed,
+  sandboxUser,
+  type SandboxLimits,
+} from './sandbox.js';
 
 /** Locate templates/site from this package, wherever the process was started. */
 export function defaultTemplateRoot(): string {
@@ -193,78 +199,204 @@ export async function ensureStylesheetPrelude(
   return true;
 }
 
+export interface BuildSiteOptions {
+  /** Aborting kills the sandboxed build and rejects with the abort reason. */
+  readonly signal?: AbortSignal;
+  readonly limits?: Partial<SandboxLimits>;
+  /** Where the trusted dependency cache and disposable build workspaces live. */
+  readonly sandboxRoot?: string;
+  readonly templateRoot?: string;
+}
+
+/** Everything in a build that is not the candidate's: dependency cache and per-run workspaces. */
+export function defaultSandboxRoot(): string {
+  return join(tmpdir(), 'statxai-sandbox');
+}
+
 /**
- * Install dependencies and produce the static export.
+ * Produce the static export of the site at `siteRoot`.
  *
- * Dependencies are installed rather than vendored because the scaffold pins
- * them; the install is reproducible and its content is not model-influenced.
+ * The build runs in the sandbox ({@link executeCandidateBuild}), never on the
+ * host: the model's code executes there with no harness credentials, no host
+ * filesystem and no network beyond Google Fonts. The only thing it hands back
+ * is the export, copied into `siteRoot/out`, and bounded, sanitized output.
+ *
+ * Resolves `ok: false` for a candidate that does not build, times out or runs
+ * out of memory — a verdict on the candidate, reported as `BUILD-001` as
+ * before. Rejects when aborted, and with `SandboxUnavailable` when the sandbox
+ * cannot be provided: neither is something a repair of the site could fix.
  */
-export async function buildSite(siteRoot: string, timeoutMs = 10 * 60 * 1000): Promise<BuildResult> {
+export async function buildSite(siteRoot: string, options: BuildSiteOptions = {}): Promise<BuildResult> {
   const started = Date.now();
   const outDir = join(siteRoot, 'out');
-  const transcript: string[] = [];
 
-  const run = async (command: string, args: string[]) => {
-    const { stdout, stderr } = await exec(command, args, {
-      cwd: siteRoot,
-      timeout: timeoutMs,
-      maxBuffer: 32 * 1024 * 1024,
-      env: {
-        ...process.env,
-        CI: '1',
-        NEXT_TELEMETRY_DISABLED: '1',
-        // The platform runs with NODE_ENV=development, and inheriting it puts a
-        // development React inside a production prerender — which fails with a
-        // null `useContext` in a page that names neither the cause nor the file.
-        // A production build must say so explicitly.
-        NODE_ENV: 'production',
-      },
-    });
-    transcript.push(stdout, stderr);
+  // A stale export would otherwise be gated and deployed if the build failed
+  // partway, which is the one outcome worse than failing outright.
+  await rm(outDir, { recursive: true, force: true });
+
+  // Every build goes through here — the first one and every rebuild after a
+  // repair — so a stylesheet cannot lose its Tailwind import by any route.
+  await ensureStylesheetPrelude(siteRoot, options.templateRoot);
+
+  const run = await executeCandidateBuild(siteRoot, options);
+  const verdict = run.timedOut
+    ? `Build terminated: it exceeded the ${Math.round(run.limits.timeoutMs / 1000)}s time limit.`
+    : run.oomKilled
+      ? `Build terminated: it exceeded the ${Math.round(run.limits.memoryBytes / 1024 ** 2)} MB memory limit.`
+      : '';
+
+  return {
+    ok: run.ok,
+    durationMs: Date.now() - started,
+    output: tail([run.output, verdict].filter(Boolean).join('\n')),
+    outDir,
   };
+}
 
+/** The build command. Harness-chosen: no manifest script, so nothing the candidate wrote picks it. */
+export const NEXT_BUILD_COMMAND = ['node', 'node_modules/next/dist/bin/next', 'build'] as const;
+
+/** An export larger than this is not a website this platform builds. */
+const MAX_EXPORT_BYTES = 512 * 1024 ** 2;
+
+export interface CandidateBuildResult {
+  readonly ok: boolean;
+  readonly exitCode: number | null;
+  readonly timedOut: boolean;
+  readonly oomKilled: boolean;
+  readonly output: string;
+  readonly limits: SandboxLimits;
+}
+
+/**
+ * The sandboxed candidate executor: materialise the trusted scaffold plus the
+ * candidate, run the harness's build command in the sandbox, return what happened.
+ *
+ * The build workspace is assembled fresh for every run — the platform
+ * template first, then only the model-writable files of `siteRoot` — so a
+ * `package.json`, config file or primitive sitting in `siteRoot` is never
+ * what builds: dependency authority stays with the scaffold. `siteRoot` is
+ * read, and its `out/` written, but nothing the build does can reach it; the
+ * workspace is removed however the run ends.
+ *
+ * Owns no authority: it knows nothing of jobs, validation, acceptance,
+ * promotion or release, and a successful build here accepts nothing.
+ */
+export async function executeCandidateBuild(siteRoot: string, options: BuildSiteOptions = {}): Promise<CandidateBuildResult> {
+  const templateRoot = options.templateRoot ?? defaultTemplateRoot();
+  const sandboxRoot = options.sandboxRoot ?? defaultSandboxRoot();
+  const limits: SandboxLimits = { ...DEFAULT_SANDBOX_LIMITS, ...options.limits };
+  options.signal?.throwIfAborted();
+
+  const dependencies = await prepareTrustedDependencies(templateRoot, sandboxRoot);
+  const runs = join(sandboxRoot, 'runs');
+  await mkdir(runs, { recursive: true });
+  const runRoot = await mkdtemp(join(runs, 'build-'));
   try {
-    // A stale export would otherwise be gated and deployed if the build failed
-    // partway, which is the one outcome worse than failing outright.
-    await rm(outDir, { recursive: true, force: true });
+    const workspace = join(runRoot, 'site');
+    await materializeCandidateWorkspace(siteRoot, templateRoot, workspace);
 
-    // Every build goes through here — the first one and every rebuild after a
-    // repair — so a stylesheet cannot lose its Tailwind import by any route.
-    await ensureStylesheetPrelude(siteRoot);
+    const run = await runSandboxed({
+      workspace,
+      dependencies,
+      command: NEXT_BUILD_COMMAND,
+      network: 'font-egress',
+      limits,
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
+    });
 
-    // --frozen-lockfile is the point of shipping a lockfile: the scaffold's
-    // dependency graph is the one that was proven to build. Without it, `^`
-    // ranges resolve forward and a project fails on a transitive change that
-    // has nothing to do with the site — which is how the prerender of
-    // /_global-error started throwing on a scaffold that had built minutes
-    // earlier.
-    await run('pnpm', ['install', '--frozen-lockfile', '--prefer-offline']);
-    await run('pnpm', ['build']);
-
-    const produced = await readdir(outDir).catch(() => []);
-    if (produced.length === 0) {
-      return { ok: false, durationMs: Date.now() - started, output: tail(transcript.join('\n')), outDir };
-    }
-
-    return { ok: true, durationMs: Date.now() - started, output: tail(transcript.join('\n')), outDir };
-  } catch (error) {
-    const detail =
-      error && typeof error === 'object' && 'stdout' in error
-        ? `${String((error as { stdout?: string }).stdout ?? '')}\n${String((error as { stderr?: string }).stderr ?? '')}`
-        : error instanceof Error
-          ? error.message
-          : String(error);
-
-    return {
-      ok: false,
-      durationMs: Date.now() - started,
-      output: tail([...transcript, detail].join('\n')),
-      outDir,
-    };
+    const built = run.exitCode === 0 && (await collectExport(join(workspace, 'out'), join(siteRoot, 'out'))) > 0;
+    return { ok: built, exitCode: run.exitCode, timedOut: run.timedOut, oomKilled: run.oomKilled, output: run.output, limits };
+  } finally {
+    await rm(runRoot, { recursive: true, force: true });
   }
 }
 
-/** Build failures are legible at the end; the head is install noise. */
+/**
+ * The trusted scaffold, overlaid with the model-writable regular files of
+ * `siteRoot`. Symlinks are never followed or copied, so a link planted in a
+ * site cannot pull a host file into the build.
+ */
+async function materializeCandidateWorkspace(siteRoot: string, templateRoot: string, workspace: string): Promise<void> {
+  await cp(templateRoot, workspace, {
+    recursive: true,
+    filter: (source) => !SCAFFOLD_EXCLUDE.test(relative(templateRoot, source)),
+  });
+
+  const walk = async (dir: string): Promise<void> => {
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const path = relative(siteRoot, full).split(sep).join('/');
+      if (!isModelWritable(path)) continue;
+      const target = join(workspace, path);
+      await mkdir(dirname(target), { recursive: true });
+      await rm(target, { force: true });
+      await copyFile(full, target);
+    }
+  };
+  for (const prefix of WRITABLE_PREFIXES) await walk(join(siteRoot, prefix.replace(/\/$/, '')));
+
+  // The mount point for the read-only trusted dependency tree.
+  await mkdir(join(workspace, 'node_modules'));
+
+  // A root harness runs the sandbox as `nobody`, which must own what it builds in.
+  const { uid, gid } = sandboxUser();
+  if (process.getuid?.() === 0) await chownTree(workspace, uid, gid);
+}
+
+async function chownTree(dir: string, uid: number, gid: number): Promise<void> {
+  await lchown(dir, uid, gid);
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) await chownTree(full, uid, gid);
+    else await lchown(full, uid, gid);
+  }
+}
+
+/**
+ * Copy the export out of the sandbox workspace — after the container is gone,
+ * regular files only, within a size budget. Returns the number of files copied.
+ */
+async function collectExport(from: string, to: string): Promise<number> {
+  let files = 0;
+  let bytes = 0;
+  const walk = async (dir: string): Promise<void> => {
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      bytes += (await lstat(full)).size;
+      if (bytes > MAX_EXPORT_BYTES) throw new ExportTooLarge();
+      const target = join(to, relative(from, full));
+      await mkdir(dirname(target), { recursive: true });
+      await copyFile(full, target);
+      files += 1;
+    }
+  };
+  try {
+    await walk(from);
+  } catch (error) {
+    // Not a site this platform builds: no partial export is left to be gated.
+    if (!(error instanceof ExportTooLarge)) throw error;
+    await rm(to, { recursive: true, force: true });
+    return 0;
+  }
+  return files;
+}
+
+class ExportTooLarge extends Error {}
+
+/** Build failures are legible at the end; the head is progress noise. */
 function tail(text: string, limit = 4_000): string {
   const trimmed = text.trim();
   return trimmed.length <= limit ? trimmed : `…\n${trimmed.slice(trimmed.length - limit)}`;

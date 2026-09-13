@@ -31,8 +31,11 @@ import type { RunContext } from '../run-context.js';
  * shape a failed build produces or drifting from it over time. One
  * implementation, two callers — this function knows nothing about which.
  */
-export async function runDeterministicGates(siteRoot: string, profile: BusinessProfile, plan: SitePlan) {
-  const compiled = await compileSite(siteRoot);
+export async function runDeterministicGates(siteRoot: string, profile: BusinessProfile, plan: SitePlan, signal?: AbortSignal) {
+  // Sandboxed: the build executes model-authored code, never with the harness's privileges.
+  const compiled = await compileSite(siteRoot, signal !== undefined ? { signal } : {});
+  // A cancelled measurement stops here — no gate runs on a build nobody is waiting for.
+  signal?.throwIfAborted();
 
   // Gates read the static export — the markup a visitor and a crawler
   // actually receive — rather than the TSX that produced it.
