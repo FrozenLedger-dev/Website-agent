@@ -24,11 +24,12 @@ const OBJECTIVE = 'Build the site from the approved plan.';
 const ACCEPTANCE_CRITERIA = Object.freeze(['site files written from the approved plan']);
 
 /**
- * No tool gateway reads `allowedTools` yet, and every existing
- * `frontend_backend` fixture already uses the empty set — granting more
- * here would be broadening it on spec, not on need.
+ * The durable tool grant for every `frontend_backend` job: read-only
+ * inspection of the platform scaffold its build is added to, through the tool
+ * gateway. Nothing else — the handler supports nothing else either, and the
+ * gateway allows only what both agree on.
  */
-const ALLOWED_TOOLS = Object.freeze([]);
+const ALLOWED_TOOLS = Object.freeze(['filesystem'] as const);
 
 /**
  * The one logical output identity every `frontend_backend` job for a given

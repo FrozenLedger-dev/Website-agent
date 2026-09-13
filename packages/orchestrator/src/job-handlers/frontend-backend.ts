@@ -31,15 +31,23 @@
  * A validating job's staged candidate is not accepted, promoted or deployed
  * by anything in this phase — that is the next slice's work.
  */
-import type { ArtifactRef, WorkerRole } from '@statxai/contracts';
+import type { ArtifactRef, FilesystemReadResult, ToolId, WorkerRole } from '@statxai/contracts';
 import type { JobDocument } from '@statxai/state';
-import type { ArtifactRegistry } from '@statxai/workspace';
+import { defaultTemplateRoot, type ArtifactRegistry } from '@statxai/workspace';
 import type { ModelRuntime } from '@statxai/agents';
 import { jobOutputNamespace, type JobHandler, type JobHandlerResult } from '@statxai/job-engine';
 import { prepareBuildFromPlan, type BuildCandidate, type PrepareContext } from '../phases/build.js';
 import type { Progress, RunFacts } from '../run-context.js';
+import { effectiveTools, ToolGateway } from '../tool-gateway/gateway.js';
+import { createScaffoldFilesystemAdapter } from '../tool-gateway/filesystem.js';
 
 const ROLE: WorkerRole = 'frontend_backend';
+
+/**
+ * The tools this handler implements. A job's grant is intersected with this,
+ * so a spec naming more cannot make the handler capable of more.
+ */
+export const FRONTEND_BACKEND_SUPPORTED_TOOLS: readonly ToolId[] = Object.freeze(['filesystem']);
 
 /**
  * Defense in depth at the adapter boundary. `JobRunner`'s `claimableRoles`
@@ -86,6 +94,11 @@ export interface FrontendBackendHandlerDeps {
   model: ModelRuntime;
   /** Defaults to a no-op: a job execution is not part of a `RunRecorder` run. */
   say?: Progress;
+  /**
+   * The gateway every tool call from this handler crosses. Defaults to one
+   * registering only the read-only scaffold filesystem.
+   */
+  tools?: ToolGateway;
 }
 
 function requiredRef(job: JobDocument, key: string): ArtifactRef {
@@ -109,6 +122,8 @@ function requiredRef(job: JobDocument, key: string): ArtifactRef {
  */
 export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDeps): JobHandler {
   const say: Progress = deps.say ?? (() => {});
+  const gateway =
+    deps.tools ?? new ToolGateway({ adapters: [createScaffoldFilesystemAdapter({ root: defaultTemplateRoot() })] });
 
   return async (job, ctx): Promise<JobHandlerResult> => {
     if (job.role !== ROLE) {
@@ -138,7 +153,30 @@ export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDe
     // so there is nothing here that could materialise into it before this
     // execution's authority is proven.
     const prepareContext: PrepareContext = {
-      deps: { model: deps.model, say },
+      deps: {
+        model: deps.model,
+        say,
+        // Bound to this claimed job. Permission is re-checked by the gateway on
+        // every call, against this job's own spec — never against anything the
+        // model says.
+        tools: {
+          grantedTools: effectiveTools(job.spec.allowedTools, FRONTEND_BACKEND_SUPPORTED_TOOLS),
+          execute: (request, signal) =>
+            gateway.execute<FilesystemReadResult>({
+              tool: request.tool,
+              input: request.input,
+              context: {
+                projectId: job.projectId,
+                jobId: job._id,
+                skill: 'terra-build',
+                role: job.role,
+                allowedTools: job.spec.allowedTools,
+                supportedTools: FRONTEND_BACKEND_SUPPORTED_TOOLS,
+              },
+              ...(signal !== undefined ? { signal } : {}),
+            }),
+        },
+      },
       facts: { profile: profile as RunFacts['profile'] },
     };
     const candidate: BuildCandidate = await prepareBuildFromPlan(

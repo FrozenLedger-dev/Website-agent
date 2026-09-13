@@ -60,7 +60,7 @@
  * proven.
  */
 import { HOME_ROUTE, routeToSourcePath, type GeneratedFile, type SitePlan } from '@statxai/contracts';
-import { buildAnchor, buildPage, buildSite, routeBuild } from '@statxai/agents';
+import { buildAnchor, buildPage, buildSite, routeBuild, type ToolAccess } from '@statxai/agents';
 import { scaffoldSite } from '@statxai/workspace';
 import { permittedStrategies, authorizeRoute, type RoutingAuthorization } from '@statxai/policy-engine';
 import { developerOverride, executeRoute, type RouteDecisionRecord } from '../routing.js';
@@ -89,8 +89,23 @@ export interface BuildCandidate {
  * without ever opening the canonical project workspace at all.
  */
 export interface PrepareContext {
-  readonly deps: Pick<FixedContext['deps'], 'model' | 'say'>;
+  readonly deps: Pick<FixedContext['deps'], 'model' | 'say'> & {
+    /**
+     * Tool access for Terra's build calls, bound by a job handler to the
+     * claimed job's own grant. Absent on the direct delivery path, which has
+     * no job and therefore no tool authority.
+     */
+    readonly tools?: ToolAccess;
+  };
   readonly facts: Pick<RunFacts, 'profile'>;
+}
+
+/** Every Terra build call gets the same cancellation and the same tool access — none left out. */
+function terraOptions(ctx: PrepareContext, signal?: AbortSignal) {
+  return {
+    ...(signal !== undefined ? { signal } : {}),
+    ...(ctx.deps.tools !== undefined ? { tools: ctx.deps.tools } : {}),
+  };
 }
 
 /** Persist one route-decision record as a versioned artifact. */
@@ -199,7 +214,7 @@ async function executeOneShot(ctx: PrepareContext, current: SitePlan, signal?: A
   deps.say({ phase: 'build', detail: 'Terra is attempting the complete site in one pass' });
 
   signal?.throwIfAborted();
-  const built = await buildSite(deps.model, facts.profile, current, signal !== undefined ? { signal } : {});
+  const built = await buildSite(deps.model, facts.profile, current, terraOptions(ctx, signal));
 
   // Authority may have been lost while the call was in flight. The runtime has
   // already reported its usage — it did happen — and the caller checks the
@@ -223,7 +238,7 @@ async function executeOneShot(ctx: PrepareContext, current: SitePlan, signal?: A
 async function executeDecomposed(ctx: PrepareContext, current: SitePlan, signal?: AbortSignal): Promise<GeneratedFile[]> {
   const { deps, facts } = ctx;
   signal?.throwIfAborted();
-  const anchor = await buildAnchor(deps.model, facts.profile, current, signal !== undefined ? { signal } : {});
+  const anchor = await buildAnchor(deps.model, facts.profile, current, terraOptions(ctx, signal));
   signal?.throwIfAborted();
 
   // The homepage anchors the design system. Selecting by array order once put
@@ -240,7 +255,7 @@ async function executeDecomposed(ctx: PrepareContext, current: SitePlan, signal?
   signal?.throwIfAborted();
   const pages = await Promise.all(
     rest.map((page) =>
-      buildPage(deps.model, facts.profile, current, page, anchorSource, layoutSource, signal !== undefined ? { signal } : {}),
+      buildPage(deps.model, facts.profile, current, page, anchorSource, layoutSource, terraOptions(ctx, signal)),
     ),
   );
   signal?.throwIfAborted();

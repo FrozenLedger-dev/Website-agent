@@ -14,7 +14,16 @@ import {
   type PageSpec,
   type SitePlan,
 } from '@statxai/contracts';
-import type { ModelCallOptions, ModelRuntime } from '../runtime.js';
+import type * as z from 'zod/v4';
+import type { ModelCallOptions, ModelInvocationResult, ModelRuntime } from '../runtime.js';
+import {
+  TERRA_MAX_MODEL_TURNS,
+  TERRA_MAX_RETURNED_BYTES,
+  TERRA_MAX_TOOL_CALLS,
+  TerraBuildAction,
+  ToolLoopBudgetExhausted,
+  type ToolAccess,
+} from '../tool-access.js';
 
 /**
  * lucide-react exports that are known to exist.
@@ -315,17 +324,118 @@ const SYSTEM = `You are Terra, a senior frontend engineer building a complete sm
 
 ${STACK}`;
 
-export async function buildSite(runtime: ModelRuntime, profile: BusinessProfile, plan: SitePlan, options: ModelCallOptions = {}) {
-  return runtime.invoke({
-    skill: 'terra-build',
-    ...(options.signal !== undefined ? { signal: options.signal } : {}),
-    tier: 'terra',
-    label: 'terra:build',
-    system: SYSTEM,
-    schema: BuildOutput,
-    maxTokens: 128_000,
-    effort: 'xhigh',
-    prompt: `Build this website completely. Return every file you write.
+/** Per-call options for a Terra build: cancellation, and any tools the harness granted. */
+export interface TerraBuildOptions extends ModelCallOptions {
+  readonly tools?: ToolAccess;
+}
+
+interface TerraBuildRequest {
+  readonly label: string;
+  readonly prompt: string;
+  readonly maxTokens: number;
+  readonly effort: 'high' | 'xhigh';
+}
+
+function inspectionSection(transcript: readonly string[], remaining: number): string {
+  return `
+
+INSPECTING THE SCAFFOLD
+Your files are added to a fixed platform scaffold you have not been shown: the
+shadcn components in components/ui/, the theme in app/globals.css, the template
+app/layout.tsx, lib/utils.ts, package.json and its configuration. Before
+answering you may read up to ${remaining} more of those files, one per response —
+to check a component's exact props and variants, or the theme you are extending.
+Paths are relative to the site root. Reading never changes anything.
+
+Respond with exactly one JSON action:
+  {"action":"tool","tool":"filesystem","input":{"path":"components/ui/card.tsx"},"output":null}
+  {"action":"final","tool":null,"input":null,"output":<the complete build output>}
+
+FILES READ SO FAR
+${transcript.length === 0 ? '(none)' : transcript.join('\n\n')}`;
+}
+
+/**
+ * Every Terra build invocation, bounded.
+ *
+ * Without granted tools this is exactly one invocation with exactly the prompt
+ * and schema a build always had. With them, each turn is still one ordinary
+ * runtime invocation — its own usage, the same skill and tier — whose answer is
+ * either one tool request, carried out by the harness's gateway and fed back,
+ * or the final build. Bounded by turns, tool calls and returned bytes, and
+ * stopped by the signal between every step. Callers only ever see the final
+ * `BuildOutput`.
+ */
+async function invokeTerraBuild(
+  runtime: ModelRuntime,
+  request: TerraBuildRequest,
+  options: TerraBuildOptions,
+): Promise<ModelInvocationResult<BuildOutput>> {
+  const tools = options.tools?.grantedTools.includes('filesystem') ? options.tools : undefined;
+  const transcript: string[] = [];
+  const answered = new Map<string, string>();
+  let toolCalls = 0;
+  let returnedBytes = 0;
+
+  for (let turn = 0; turn < (tools ? TERRA_MAX_MODEL_TURNS : 1); turn += 1) {
+    options.signal?.throwIfAborted();
+
+    const result = await runtime.invoke({
+      skill: 'terra-build',
+      tier: 'terra',
+      label: request.label,
+      system: SYSTEM,
+      schema: (tools ? TerraBuildAction : BuildOutput) as z.ZodType<unknown>,
+      maxTokens: request.maxTokens,
+      effort: request.effort,
+      prompt: tools ? request.prompt + inspectionSection(transcript, TERRA_MAX_TOOL_CALLS - toolCalls) : request.prompt,
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
+    });
+
+    if (!tools) return result as ModelInvocationResult<BuildOutput>;
+
+    const action = result.value as TerraBuildAction;
+    if (action.action === 'final') return { ...result, value: action.output! };
+
+    // A repeat of a read already answered is served from this build's own
+    // record: it executes nothing and spends no tool call, but it still spends
+    // a turn — which is what keeps the turn limit meaningful on its own.
+    const key = JSON.stringify([action.tool, action.input]);
+    let fed = answered.get(key);
+    if (fed === undefined && toolCalls >= TERRA_MAX_TOOL_CALLS) {
+      throw new ToolLoopBudgetExhausted('tool_calls', TERRA_MAX_TOOL_CALLS);
+    }
+    // A read requested on the last turn could never be used: refused before it runs.
+    if (turn + 1 >= TERRA_MAX_MODEL_TURNS) throw new ToolLoopBudgetExhausted('model_turns', TERRA_MAX_MODEL_TURNS);
+    options.signal?.throwIfAborted();
+
+    if (fed === undefined) {
+      toolCalls += 1;
+      const outcome = await tools.execute({ tool: action.tool!, input: action.input }, options.signal);
+      if (outcome.ok) {
+        returnedBytes += Buffer.byteLength(outcome.content, 'utf8');
+        if (returnedBytes > TERRA_MAX_RETURNED_BYTES) {
+          throw new ToolLoopBudgetExhausted('returned_bytes', TERRA_MAX_RETURNED_BYTES);
+        }
+      }
+      options.signal?.throwIfAborted();
+      fed = JSON.stringify(outcome);
+      answered.set(key, fed);
+    }
+    transcript.push(fed);
+  }
+
+  throw new ToolLoopBudgetExhausted('model_turns', TERRA_MAX_MODEL_TURNS);
+}
+
+export async function buildSite(runtime: ModelRuntime, profile: BusinessProfile, plan: SitePlan, options: TerraBuildOptions = {}) {
+  return invokeTerraBuild(
+    runtime,
+    {
+      label: 'terra:build',
+      maxTokens: 128_000,
+      effort: 'xhigh',
+      prompt: `Build this website completely. Return every file you write.
 
 Routes to create:
 ${plan.sitemap.pages.map((p) => `  ${p.route}  →  ${routeToSourcePath(p.route)}`).join('\n')}
@@ -335,7 +445,9 @@ ${JSON.stringify(profile, null, 2)}
 
 APPROVED PLAN
 ${JSON.stringify(plan, null, 2)}`,
-  });
+    },
+    options,
+  );
 }
 
 /**
@@ -346,19 +458,16 @@ ${JSON.stringify(plan, null, 2)}`,
  * Every later page is built to match this, which is what keeps separately
  * generated pages looking like one site.
  */
-export async function buildAnchor(runtime: ModelRuntime, profile: BusinessProfile, plan: SitePlan, options: ModelCallOptions = {}) {
+export async function buildAnchor(runtime: ModelRuntime, profile: BusinessProfile, plan: SitePlan, options: TerraBuildOptions = {}) {
   const home = plan.sitemap.pages.find((p) => p.route === HOME_ROUTE) ?? plan.sitemap.pages[0]!;
 
-  return runtime.invoke({
-    skill: 'terra-build',
-    ...(options.signal !== undefined ? { signal: options.signal } : {}),
-    tier: 'terra',
-    label: 'terra:build:anchor',
-    system: SYSTEM,
-    schema: BuildOutput,
-    maxTokens: 48_000,
-    effort: 'xhigh',
-    prompt: `Build exactly these files and no others:
+  return invokeTerraBuild(
+    runtime,
+    {
+      label: 'terra:build:anchor',
+      maxTokens: 48_000,
+      effort: 'xhigh',
+      prompt: `Build exactly these files and no others:
 
   app/layout.tsx      the shared shell — header, navigation, footer, metadata
   app/globals.css     brand tokens appended to the existing shadcn theme
@@ -380,7 +489,9 @@ ${plan.sitemap.pages.map((p) => `  ${p.route}  ${p.title}`).join('\n')}
 
 HOMEPAGE SPECIFICATION
 ${JSON.stringify(home, null, 2)}`,
-  });
+    },
+    options,
+  );
 }
 
 /**
@@ -397,18 +508,15 @@ export async function buildPage(
   page: PageSpec,
   anchorSource: string,
   layoutSource: string,
-  options: ModelCallOptions = {},
+  options: TerraBuildOptions = {},
 ) {
-  return runtime.invoke({
-    skill: 'terra-build',
-    ...(options.signal !== undefined ? { signal: options.signal } : {}),
-    tier: 'terra',
-    label: `terra:build:${page.route}`,
-    system: SYSTEM,
-    schema: BuildOutput,
-    maxTokens: 32_000,
-    effort: 'high',
-    prompt: `Build exactly one file: ${routeToSourcePath(page.route)}
+  return invokeTerraBuild(
+    runtime,
+    {
+      label: `terra:build:${page.route}`,
+      maxTokens: 32_000,
+      effort: 'high',
+      prompt: `Build exactly one file: ${routeToSourcePath(page.route)}
 
 Match the existing site. The layout already provides the header, navigation and
 footer, so this file contains only the page's own content. Use the same
@@ -429,5 +537,7 @@ ${layoutSource}
 
 REFERENCE PAGE (the homepage — for reference, do not return it)
 ${anchorSource}`,
-  });
+    },
+    options,
+  );
 }

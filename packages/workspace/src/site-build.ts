@@ -61,6 +61,11 @@ export function assertModelWritable(path: string): void {
 
 const SCAFFOLD_EXCLUDE = /(^|[/\\])(node_modules|\.next|out)([/\\]|$)/;
 
+/** Whether a scaffold-relative path is outside what `scaffoldSite` ever copies into a candidate. */
+export function isScaffoldExcludedPath(path: string): boolean {
+  return SCAFFOLD_EXCLUDE.test(path);
+}
+
 /** Copy the scaffold into a project, leaving any already-generated files alone. */
 export async function scaffoldSite(siteRoot: string, templateRoot = defaultTemplateRoot()): Promise<void> {
   const exists = await stat(templateRoot).catch(() => null);

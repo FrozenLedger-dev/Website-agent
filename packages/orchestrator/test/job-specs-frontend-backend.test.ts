@@ -29,7 +29,8 @@ describe('createFrontendBackendJobSpec — shape', () => {
     expect(spec.role).toBe('frontend_backend');
     expect(spec.objective).toBe('Build the site from the approved plan.');
     expect(spec.acceptanceCriteria).toEqual(['site files written from the approved plan']);
-    expect(spec.allowedTools).toEqual([]);
+    // Exactly the one executable tool, and nothing else declared in `ToolId`.
+    expect(spec.allowedTools).toEqual(['filesystem']);
     expect(spec.output).toEqual(['app/']);
     expect(spec.projectId).toBe(INPUT.projectId);
   });

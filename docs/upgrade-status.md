@@ -5333,6 +5333,73 @@ globals-only, context-only, primary-only, invalid target, source ordering,
 freezing, unsafe spellings), phase-level escalation and refused output never
 reaching a real commit, and a structural guard against hidden grants.
 
+## Bounded Terra scaffold inspection — the first real tool — **DONE**
+
+**Why this tool.** Terra builds into a platform scaffold it had never been shown:
+the shadcn `components/ui` sources whose props it must use, the `globals.css`
+theme it is told to extend, the template layout, `lib/utils`. Before a Terra
+call no project workspace exists. The pre-candidate is exactly `templates/site`,
+which `scaffoldSite` copies into every candidate. Reading it on demand gives Terra
+information it genuinely lacked.
+
+**One tool, one operation.** `ToolId` `filesystem` now has a real contract
+(`contracts/tools.ts`): read one file by site-relative path. The result is the
+content, the full byte count and a `truncated` flag, or a typed `not_found`,
+`not_a_file` or `not_text`. There is no write, list, glob or exec operation.
+The adapter:
+
+- validates paths strictly instead of normalising them — absolute paths, drive
+  letters, empty/`.`/`..` segments, backslashes, hidden files (so any `.env`)
+  and the scaffold's excluded trees are all refused;
+- refuses any path whose resolved location, symlinks followed, is outside the
+  scaffold root;
+- opens files read-only and caps each read at 12 KB.
+
+**A minimal gateway.** `ToolGateway` (`orchestrator/tool-gateway`) is the only
+path to an adapter:
+
+- the effective grant is the claimed job's `JobSpec.allowedTools` intersected
+  with the handler's supported tools, and the handler supports only
+  `filesystem`;
+- a refusal happens before any adapter runs — permission denied, a permitted
+  tool with no adapter (unavailable), or invalid input — and execution failure
+  and cancellation stay distinct errors;
+- evidence records ids, tool, outcome, duration and the path — never content or
+  credentials;
+- it registers exactly one adapter. Control-plane operations are not tools.
+
+**Durable authority.** The production `frontend_backend` spec now declares
+`allowedTools: ['filesystem']`. Its deterministic `jobId` changes accordingly;
+in-flight bindings still resume from their own stored spec. A job with `[]`
+is offered no tools and builds exactly as before.
+
+**A bounded loop, inside Terra's build skill.** All three Terra build call shapes
+(whole site, anchor, page) share one loop with one `ModelRuntime.invoke` site.
+
+- *Without tools* the request is byte-identical to before.
+- *With tools* each turn is an ordinary invocation — same skill and tier, its own
+  usage event — returning one strict action: a tool request, or the final
+  `BuildOutput`. The prompt gains one appended section describing reads; the
+  system prompt and base prompt are unchanged.
+- *Bounds:* 4 model turns, 3 distinct reads, 24 KB returned in total. A repeated
+  identical read is served from the build's own record without re-executing,
+  and still spends a turn.
+- *Cancellation:* the lease signal is checked before and after every step, and
+  also reaches the provider and the read.
+- *Callers* only ever receive `BuildOutput`.
+
+**Separation.** `ModelRuntime` executes no tools, and the gateway invokes no
+model. Sol and Luna get no tool access. The agents package touches no file
+system. Validation, acceptance, promotion and release are unchanged.
+
+**Tests: +60 unit.** They cover the loop, the gateway and the adapter against the
+real scaffold, the real handler end to end (grant, narrowing, denial, evidence,
+isolation, cancellation), and structural boundaries. Focused mutations: 24/24
+killed. Two survived at first because overlapping path rules masked them; tests
+for empty-segment and drive-letter paths now kill them.
+
+**Not implemented:** `test_runner`, browser, Git, shell and filesystem writes.
+
 ## Phases 6–17
 
 Not started.
