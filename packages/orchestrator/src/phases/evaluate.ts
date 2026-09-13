@@ -9,12 +9,21 @@
  * The phase measures and records. It decides nothing about what to do next:
  * that is the caller's loop, reading the outcome below.
  */
-import { routeToOutputPath, routeToSourcePath, type BusinessProfile, type SitePlan } from '@statxai/contracts';
+import {
+  routeToOutputPath,
+  routeToSourcePath,
+  type ArtifactRef,
+  type BrowserRenderAuthority,
+  type BrowserRenderReport,
+  type BusinessProfile,
+  type SitePlan,
+} from '@statxai/contracts';
 import { reviewSite } from '@statxai/agents';
 import { isFrameworkPage, runGates } from '@statxai/gates';
 import {
   buildSite as compileSite,
   readBuiltFiles,
+  renderInBrowser,
   readExportFiles,
   readSourceFiles,
   type BuildResult,
@@ -73,6 +82,12 @@ export interface GateRun {
 export interface Evaluation {
   compiled: BuildResult;
   gateRun: GateRun;
+  /**
+   * What real Chromium found rendering the exact export at every planned route
+   * and viewport — null when there was no export to render. Evidence only:
+   * it adds no defect and blocks nothing yet.
+   */
+  browserRender: BrowserRenderReport | null;
   /** Source files a repair may edit. Read even when the build failed. */
   sources: SourceFiles;
   /** Export path → the source file that produced it, for scoping a repair. */
@@ -99,7 +114,13 @@ export type EvaluationOutcome =
   | ({ kind: 'evaluated' } & Evaluation)
   | { kind: 'review_unavailable'; reason: string };
 
-export async function evaluateSite(ctx: RunContext): Promise<EvaluationOutcome> {
+/** Exactly what an evaluation measures: the plan version, and what made the tree canonical. */
+export interface EvaluationSubject {
+  readonly sitePlan: ArtifactRef;
+  readonly authority: BrowserRenderAuthority;
+}
+
+export async function evaluateSite(ctx: RunContext, subject: EvaluationSubject): Promise<EvaluationOutcome> {
   const { deps, facts, progress } = ctx;
   let qualityScore = progress.qualityScore;
   let reviewRan = false;
@@ -137,6 +158,37 @@ export async function evaluateSite(ctx: RunContext): Promise<EvaluationOutcome> 
       phase: 'evaluate',
       detail: `Build succeeded in ${(compiled.durationMs / 1000).toFixed(1)}s`,
       level: 'ok',
+    });
+  }
+
+  /**
+   * The exact export, rendered in a real browser at every planned route and
+   * viewport — after the deterministic gates, before review. Isolated in its
+   * own container, bound to the exact plan version, revision and export it
+   * rendered, and advisory: it changes no defect, gate or release decision in
+   * this slice.
+   */
+  const browserRender = compiled.ok
+    ? await renderInBrowser({
+        exportDir: compiled.outDir,
+        plan: progress.plan,
+        subject: {
+          projectId: facts.projectId,
+          sitePlan: subject.sitePlan,
+          sourceCommit: await deps.workspace.currentCommit(),
+          authority: subject.authority,
+        },
+      })
+    : null;
+  if (browserRender) {
+    const blocked = browserRender.renders.filter((r) => r.status !== 'rendered').length;
+    deps.say({
+      phase: 'evaluate',
+      detail:
+        browserRender.status === 'completed'
+          ? `Browser render: ${browserRender.renders.length} route×viewport renders, ${blocked} not clean`
+          : `Browser render ${browserRender.status}: ${browserRender.reason ?? ''}`,
+      level: browserRender.passed ? 'ok' : 'warn',
     });
   }
 
@@ -235,6 +287,7 @@ export async function evaluateSite(ctx: RunContext): Promise<EvaluationOutcome> 
     kind: 'evaluated',
     compiled,
     gateRun,
+    browserRender,
     sources,
     sourceOf,
     reviewSummary,

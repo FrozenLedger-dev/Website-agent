@@ -5757,6 +5757,159 @@ applies; sources were restored byte-identical after each.
 
 **Not in this slice:** browser rendering, screenshots and visual review.
 
+## Isolated browser rendering — **DONE**
+
+**Why.** Gates read the exported HTML, and the reviewer reads text. Nothing ever
+ran the site in a browser, so a page that throws while hydrating, loses a local
+asset or redirects away looked fine. Screenshots and visual review need a real,
+isolated, deterministic render of the exact build first.
+
+**Gate findings.**
+
+- **Export:** the exact export is `siteRoot/out`, rewritten by the sandboxed
+  `buildSite` on every evaluation. Only gates, deployment and the preview read it.
+- **Routes:** plan routes are schema-restricted, and map deterministically to
+  export files (`/services` → `services.html`).
+- **Runtime network:** fonts are self-hosted at build time, and the links gate
+  already blocks remote assets, so no current site needs internet at runtime.
+- **Identity:** `runProject` holds the exact `sitePlanRef`, and in job_lifecycle
+  mode the canonical build binding. Both are now handed to `evaluateSite`.
+- **Chromium's own sandbox:** it cannot start under `--cap-drop ALL` plus
+  `no-new-privileges`, so it is off. The hardened container is the boundary.
+
+**Runtime.**
+
+- **Image:** `mcr.microsoft.com/playwright:v1.63.0-noble`, pinned by digest.
+- **Client:** `playwright-core@1.63.0`, installed through the existing trusted
+  install (`prepareTrustedDependencies`) from `templates/browser-runtime`'s own
+  lockfile, with integrity pinned. No workspace package depends on a browser
+  driver.
+
+**BrowserRenderer** (`workspace/src/browser-renderer.ts`, `renderInBrowser`).
+
+- **Per run:** one disposable container holds a trusted loopback static server
+  and Chromium. It reuses the sandbox's container primitives, which are now
+  exported unchanged.
+- **Filesystem:**
+  - a regular-file snapshot of the export, read-only at `/site`, digested;
+  - the trusted client and this run's trusted runner, both read-only;
+  - a read-only root, plus capped `/tmp` and `/dev/shm`. Nothing else.
+- **Network:** `--network none`. Every other-origin request is also aborted in
+  the browser and recorded.
+- **Environment:** `HOME=/tmp` only.
+- **Privileges:** non-root, capabilities dropped, `no-new-privileges`.
+- **Limits:** 2 GiB memory with no swap, 2 CPUs, 512 PIDs, and a wall clock of
+  startup plus a per-target budget, capped at 15 minutes.
+- **Cancellation:** timeout and abort kill the container, then force-remove and
+  verify it. The run directory is always removed.
+- **Server:** GET and HEAD only; clean URLs; no traversal, runner files or host
+  files.
+
+**Policy** (one location each).
+
+- **Viewports:** desktop 1440×900, tablet 768×1024 (touch), mobile 390×844
+  (touch), all at scale 1.
+- **Readiness:** `load` within 20 s, fonts settled within 5 s, 2 animation
+  frames, a 250 ms settle, all within 10 s; `reducedMotion: 'reduce'` and
+  service workers blocked.
+- **Matrix:** every planned route at every viewport. Routes are rendered in plan
+  order with the homepage first, capped at 24, and any `omittedRoutes` are
+  reported.
+- **Routes:** planned routes only, re-checked against the route grammar. An
+  external URL, `//host`, `javascript:`, `file:`, a port, a query or a traversal
+  is refused before anything runs.
+
+**Report** (`contracts/browser.ts`, `BrowserRenderReport`).
+
+- **Subject:** `projectId`, the exact `sitePlan` ArtifactRef, `sourceCommit`, and
+  `exportDigest` over the bytes actually rendered.
+- **Authority:** `legacy_direct` (no binding, stated honestly) or `job_lifecycle`
+  with `buildBindingId`, `promotionId` and `promotionCommitSha`.
+- **Also carries:** runtime and viewports, a run `status`, per-(route, viewport)
+  renders (`status`, `httpStatus`, timings, findings), `omittedRoutes`,
+  `passed`, `truncated` and `reason`.
+- **Finding categories:**
+  - blocking: `navigation_failed`, `http_error`, `runtime_exception`,
+    `local_resource_failed`, `unexpected_navigation`, `readiness_timeout`;
+  - recorded only: `console_error` and `external_request_blocked`.
+- **Status:** the harness, not the runner, derives a render's status from its
+  findings.
+- **Bounds:** 10 findings per category per render, 500 characters each, 256 KB
+  overall, dropping non-blocking findings first. All page text passes the sandbox
+  sanitizer.
+- **Runner robustness:** every page event handler is guarded, so hostile page
+  behaviour becomes a finding rather than a crashed render. A `window.open` popup
+  previously crashed the runner during testing.
+
+**Integration.** `evaluateSite(ctx, { sitePlan, authority })` renders the exact
+export after the deterministic gates and before Terra review, only when the build
+compiled.
+
+- **Advisory:** the report is returned on the evaluation (`browserRender`) and
+  summarised in progress. It adds no defect, and changes no gate, adjudication or
+  release decision.
+- **Not durable yet:** the screenshot slice will define the durable artifact
+  bound to this subject, rather than reusing project-scoped `visual-review`.
+- **Unavailable:** a missing browser runtime gives `status: 'unavailable'`, not a
+  crash.
+
+**Tests.**
+
+- **`browser-renderer.test.ts`:** pins, viewports, readiness, route authority
+  and refusals, exact container arguments, the runner contract, and report bounds
+  and sanitisation.
+- **`browser-renderer.integration.test.ts` (real Chromium):**
+  - home and second route at all viewports, with the exact subject and digest;
+  - 404, missing CSS and JS, runtime exception, and `console.error` (not warn);
+  - the live container inspected for no secrets, only three read-only mounts, no
+    repo, home, `/tmp` or socket, `none` network, non-root and a read-only root;
+  - blocked: external fetch, metadata, another local port, image, WebSocket
+    (outer boundary), server traversal and runner and host files, `file:`,
+    external redirect, meta refresh, iframe and popup;
+  - host export byte-identical; giant console bounded and sanitized;
+  - never-loading and blocked-after-load pages time out deterministically;
+  - wall clock, abort and pre-aborted signal leave no container or Chromium;
+  - malformed route and empty export start nothing;
+  - a real sandboxed Next export renders cleanly.
+- **`frontend-backend-build-boundary.integration.test.ts`:** `runProject`
+  subject identity for legacy_direct (exact plan version and history commit) and
+  job_lifecycle (exact binding, promotion and plan).
+- **`browser-render-boundary.test.ts` (structural):**
+  - only the renderer drives a browser, and only in its runner;
+  - no package depends on a driver;
+  - the renderer holds no job, promotion, release or model imports;
+  - no `browser_preview` tool, and no screenshot, PDF or video;
+  - evaluation order gates → render → review, and `evaluateSite` is the sole
+    caller, with the exact plan ref and authority threaded.
+
+**Mutations: 24 of 24 killed.** Each ran against the renderer unit, structural,
+sandbox and tool-gateway suites, plus the matching real-browser or `runProject`
+test where one applies. Sources were restored byte-identical and container debris
+cleared after each.
+
+- **Unit arguments plus the live-container inspection:** mounting the
+  repository, home or Docker socket; a writable export; enabling network; and
+  running as root.
+- **Unit arguments only:** removing the memory or PID limit.
+- **Unit and structural only:** inheriting `process.env`. Its integration run did
+  not execute (all tests skipped), so it is not counted as an integration kill.
+- **Structural only:** running Chromium on the host, writing job state, and
+  registering `browser_preview`.
+- **Unit route tests:** accepting an arbitrary route.
+- **Real Chromium suite only:**
+  - the metadata endpoint allowed;
+  - the render timeout removed;
+  - `pageerror`, `console.error` or failed local resources ignored;
+  - an external redirect allowed;
+  - the readiness bound removed.
+- **Real abort test plus structural:** abort not destroying the container.
+- **Unit bounds tests:** removing the diagnostic bounds (harness and runner).
+- **`runProject` subject tests plus structural:** the subject losing its exact
+  plan identity, and evaluation bypassing the renderer.
+
+**Not in this slice:** screenshot artifacts, multimodal review, visual
+refinement and any browser tool.
+
 ## Phases 6–17
 
 Not started.

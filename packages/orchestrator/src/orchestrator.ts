@@ -16,6 +16,8 @@ import {
   BusinessProfile,
   SitePlan,
   type AgentTier,
+  type ArtifactRef,
+  type BrowserRenderAuthority,
   type JobSpec,
 } from '@statxai/contracts';
 import {
@@ -240,6 +242,8 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
    * a project has more than one generation.
    */
   let canonicalBuild: FrontendBackendBuildBindingDocument | null = null;
+  // The promotion that made `canonicalBuild` canonical, as finalised — the in-memory binding predates that write.
+  let canonicalPromotion: { promotionId: string | null; promotionCommitSha: string | null } | null = null;
   /**
    * The one `frontend_backend` lifecycle rig for this invocation, assigned at
    * the build boundary below and reused by a replan rebuild in the evaluate
@@ -439,6 +443,8 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       ? { plan: recovered.plan, sitePlanRef: recovered.tip.sitePlan }
       : await producePlan({ deps, facts }, 0);
   progress.plan = initialPlan;
+  // The exact plan version every evaluation of this run renders against — updated only when a replan replaces the plan.
+  let currentSitePlanRef: ArtifactRef = initialSitePlanRef;
 
   // Defined here, not after the build boundary: Phase 5j's job-mode exit
   // needs a `RunContext` to report through `concluded` the same way every
@@ -486,6 +492,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       // here is built, validated, accepted or promoted again. The coordinator
       // above still exists, for any replan evaluation leads to.
       canonicalBuild = recovered.tip;
+      canonicalPromotion = { promotionId: recovered.tip.promotionId, promotionCommitSha: recovered.tip.promotionCommitSha };
       say({ phase: 'build', detail: `Continuing promoted frontend_backend build ${recovered.tip._id}`, level: 'ok' });
     } else {
       // Phase 5k: on resume, the stored spec is authority — the factory is
@@ -584,6 +591,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       // merely prepared, built, validated or accepted — until then the
       // predecessor is still what the canonical tree implements.
       canonicalBuild = binding;
+      canonicalPromotion = { promotionId: result.promotionId, promotionCommitSha: result.commitSha };
 
       say({ phase: 'build', detail: `frontend_backend promoted: commit ${result.commitSha}`, level: 'ok' });
     }
@@ -613,8 +621,27 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
   // -- Phases 4/5: Evaluate, repair, escalate -------------------------------
 
+  /**
+   * What made the tree being evaluated canonical, exactly. In job_lifecycle mode
+   * every route here promoted a canonical build; legacy_direct has no binding and
+   * says so rather than inventing one.
+   */
+  const renderAuthority = (): BrowserRenderAuthority => {
+    if (frontendBackendExecutionMode !== 'job_lifecycle') return { mode: 'legacy_direct' };
+    if (!canonicalBuild) {
+      throw new FrontendBackendBuildNotPublishable('(none)', 'this job_lifecycle run holds no canonical build to evaluate');
+    }
+    return {
+      mode: 'job_lifecycle',
+      buildBindingId: canonicalBuild._id,
+      promotionId: canonicalPromotion?.promotionId ?? canonicalBuild.promotionId,
+      promotionCommitSha: canonicalPromotion?.promotionCommitSha ?? canonicalBuild.promotionCommitSha,
+    };
+  };
+
+
   while (true) {
-    const evaluation = await evaluateSite(ctx());
+    const evaluation = await evaluateSite(ctx(), { sitePlan: currentSitePlanRef, authority: renderAuthority() });
 
     if (evaluation.kind === 'review_unavailable') {
       // An unobtainable review never counts as approval, so the run stops here
@@ -779,6 +806,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
       progress.replansUsed += 1;
       progress.plan = revised.plan;
+      currentSitePlanRef = revised.sitePlanRef;
 
       if (frontendBackendExecutionMode === 'job_lifecycle' && canonicalBuild && lifecycleCoordinator) {
         /**
@@ -854,6 +882,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
           promotionCommitSha: rebuilt.commitSha,
         });
         canonicalBuild = successor;
+        canonicalPromotion = { promotionId: rebuilt.promotionId, promotionCommitSha: rebuilt.commitSha };
 
         say({ phase: 'build', detail: `frontend_backend replan promoted: commit ${rebuilt.commitSha}`, level: 'ok' });
         progress.repairedSinceReview = [];

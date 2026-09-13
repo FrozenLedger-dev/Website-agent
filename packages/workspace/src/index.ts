@@ -4,3 +4,4 @@ export * from './site-build.js';
 export * from './sandbox.js';
 export * from './deploy.js';
 export * from './preview.js';
+export * from './browser-renderer.js';

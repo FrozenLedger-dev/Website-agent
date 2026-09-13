@@ -204,13 +204,14 @@ function pickEnv(keys: readonly string[], extra: Record<string, string> = {}): N
   return { ...env, ...extra } as NodeJS.ProcessEnv;
 }
 
-interface DockerResult {
+export interface DockerResult {
   code: number | null;
   stdout: string;
   stderr: string;
 }
 
-function docker(args: readonly string[], timeoutMs = 60_000): Promise<DockerResult> {
+/** One `docker` client command with the minimal client environment. Shared with the browser renderer. */
+export function docker(args: readonly string[], timeoutMs = 60_000): Promise<DockerResult> {
   return new Promise((resolve) => {
     execFile(
       'docker',
@@ -333,7 +334,8 @@ function killContainer(name: string): Promise<DockerResult> {
   return docker(['kill', '--signal', 'KILL', name]);
 }
 
-async function removeContainer(name: string): Promise<void> {
+/** Force-remove a container and verify it is gone; a survivor raises {@link SandboxCleanupFailed}. */
+export async function removeContainer(name: string): Promise<void> {
   await docker(['rm', '--force', name]);
   const remaining = await docker(['ps', '--all', '--quiet', '--filter', `name=^${name}$`]);
   if (remaining.code !== 0 || remaining.stdout.trim() !== '') throw new SandboxCleanupFailed(name);
@@ -437,7 +439,11 @@ export async function runSandboxed(request: SandboxRunRequest): Promise<SandboxR
   }
 }
 
-function attach(
+/**
+ * Start a created container attached, capturing bounded output; timeout and abort
+ * kill the container itself. Shared with the browser renderer.
+ */
+export function attach(
   name: string,
   limits: SandboxLimits,
   signal: AbortSignal | undefined,

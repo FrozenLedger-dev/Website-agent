@@ -24,6 +24,7 @@ import type * as Gates from '@statxai/gates';
 import type * as Workspace from '@statxai/workspace';
 import { StateStore } from '@statxai/state';
 import { ArtifactRegistry, ProjectWorkspace } from '@statxai/workspace';
+import * as workspaceModule from '@statxai/workspace';
 import { createFrontendBackendJobSpec } from '../src/job-specs/frontend-backend.js';
 import * as lifecycleModule from '../src/job-lifecycle/frontend-backend.js';
 import * as buildModule from '../src/phases/build.js';
@@ -167,6 +168,8 @@ vi.mock('@statxai/workspace', async (importOriginal) => {
     readExportFiles: vi.fn(async () => []),
     readSourceFiles: vi.fn(async () => [{ path: 'app/page.tsx', contents: 'x' }]),
     deploymentConfigured: vi.fn(() => false),
+    // Real: it renders nothing here (the compiler is faked, so there is no export), but what it is asked to render is the subject under test.
+    renderInBrowser: vi.fn(actual.renderInBrowser),
   };
 });
 
@@ -687,5 +690,47 @@ describe('structural boundaries', () => {
     for (const forbidden of ['Luna', 'sol-route', 'sol-replan', 'sol-adjudicate', 'deploySite', 'DeployResult']) {
       expect(jobModeBlock).not.toContain(forbidden);
     }
+  });
+});
+
+describe('browser render subject identity', () => {
+  it('legacy_direct: renders against the exact accepted plan version and canonical commit, and says it has no build binding', async () => {
+    const projectId = 'proj_render_subject_legacy';
+    await run(projectId, { frontendBackendExecutionMode: 'legacy_direct' });
+
+    const calls = vi.mocked(workspaceModule.renderInBrowser).mock.calls;
+    expect(calls).toHaveLength(1);
+    const { subject, plan } = calls[0]![0];
+    const planDoc = await store.artifacts.findOne({ projectId, name: 'site-plan' }, { sort: { version: -1 } });
+    expect(subject.projectId).toBe(projectId);
+    expect(subject.sitePlan).toMatchObject({ name: 'site-plan', version: planDoc!.version });
+    expect(plan.sitemap).toEqual((planDoc!.data as { sitemap: unknown }).sitemap);
+    expect(subject.sitePlan.contentHash ?? planDoc!.contentHash).toBe(planDoc!.contentHash);
+    expect(subject.authority).toEqual({ mode: 'legacy_direct' });
+    expect(subject.sourceCommit).toMatch(/^[0-9a-f]{40}$/);
+    const ws = await canonicalWorkspace(projectId);
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const log = await promisify(execFile)('git', ['-C', ws.root, 'log', '--format=%H']);
+    expect(log.stdout.split('\n')).toContain(subject.sourceCommit);
+  });
+
+  it('job_lifecycle: renders against the exact canonical build binding, its promotion and its plan version', async () => {
+    const projectId = 'proj_render_subject_job';
+    await runJobMode(projectId);
+
+    const calls = vi.mocked(workspaceModule.renderInBrowser).mock.calls;
+    expect(calls).toHaveLength(1);
+    const { subject } = calls[0]![0];
+    const binding = await store.frontendBackendBuildBindings.findOne({ projectId });
+    expect(binding?.promotionId).toBeTruthy();
+    expect(subject.authority).toEqual({
+      mode: 'job_lifecycle',
+      buildBindingId: binding!._id,
+      promotionId: binding!.promotionId,
+      promotionCommitSha: binding!.promotionCommitSha,
+    });
+    expect(subject.sitePlan).toEqual(binding!.sitePlan);
+    expect(subject.sourceCommit).toMatch(/^[0-9a-f]{40}$/);
   });
 });
