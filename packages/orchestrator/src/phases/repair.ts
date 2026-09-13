@@ -17,7 +17,7 @@
  */
 import { BudgetExhausted, spendRepairAttempt } from '@statxai/state';
 import { repairDefect } from '@statxai/agents';
-import { filesForDefect, REPAIR_COMPANIONS, type Defect } from '../defects.js';
+import { filesForDefect, partitionRepairOutput, repairTargetsFor, repairWriteScopeFor, type Defect } from '../defects.js';
 import type { RunContext } from '../run-context.js';
 import type { SourceFiles } from './evaluate.js';
 
@@ -72,7 +72,6 @@ export async function executeRepairs(
       defect.reason,
       input.sourceOf,
     );
-    const companions = input.sources.filter((f) => (REPAIR_COMPANIONS as readonly string[]).includes(f.path));
 
     /**
      * One call per file rather than one call for the whole scope.
@@ -84,26 +83,26 @@ export async function executeRepairs(
      * scope" anyway. The budget is still spent once for the defect, because
      * it is one defect however many files it touches.
      */
-    const editable = scope.filter((p) => !(REPAIR_COMPANIONS as readonly string[]).includes(p));
-    const units = editable.length > 0 ? editable : scope;
+    const units = repairTargetsFor(scope);
+    const available = input.sources.map((f) => f.path);
 
     let written = 0;
     let refused = 0;
     let failed = 0;
 
     for (const target of units) {
-      const context = [
-        ...input.sources.filter((f) => f.path === target),
-        ...companions.filter((f) => f.path !== target),
-      ];
+      // Decided before Luna is asked: exactly what it is shown, and exactly
+      // what it may rewrite. Its output is measured against this, never the
+      // other way round.
+      const writeScope = repairWriteScopeFor(target, available);
+      const context = writeScope.contextPaths.map((path) => input.sources.find((f) => f.path === path)!);
       try {
         const repaired = await repairDefect(deps.model, facts.profile, defect, context);
 
-        // Luna may only rewrite files it was given. Enforced here rather than
-        // trusted to the prompt.
-        const allowed = new Set(context.map((f) => f.path));
-        const permitted = repaired.value.files.filter((f) => allowed.has(f.path));
-        refused += repaired.value.files.length - permitted.length;
+        // Only the scope's writable paths may land. Enforced here rather than
+        // trusted to the prompt, and nothing Luna returns can extend it.
+        const { permitted, refused: outOfScope } = partitionRepairOutput(writeScope, repaired.value.files);
+        refused += outOfScope.length;
         await deps.workspace.writeSiteFiles(permitted);
         written += permitted.length;
       } catch (error) {

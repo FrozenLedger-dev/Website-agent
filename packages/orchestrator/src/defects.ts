@@ -158,11 +158,108 @@ export function filesForDefect(
 }
 
 /**
- * Files a repair always gets to see, and may fix in place.
+ * How a repair may reach beyond the one file it targets.
  *
  * The shell and the brand tokens are where cross-page defects actually live: a
  * fabricated claim in the footer is visible on every page and fixable in
- * exactly one. Handing them over as context is what lets a repair scoped to one
- * page fix the thing the page was only displaying.
+ * exactly one. So a repair targeting a page is shown them, and — by this
+ * policy, not by accident — may fix them in place.
+ *
+ * Reading and writing are stated separately on purpose. Being shown a file is
+ * not permission to rewrite it; each entry says which it grants. The defect
+ * contract cannot yet tell which defects need the shell, so both stay writable
+ * for every repair, exactly as before this was made explicit.
  */
-export const REPAIR_COMPANIONS = ['app/layout.tsx', 'app/globals.css'] as const;
+export type RepairScopeAccess = 'read' | 'write';
+
+export interface RepairScopePolicyEntry {
+  readonly path: string;
+  readonly access: RepairScopeAccess;
+}
+
+export const REPAIR_SCOPE_POLICY: readonly RepairScopePolicyEntry[] = Object.freeze([
+  Object.freeze({ path: 'app/layout.tsx', access: 'write' as const }),
+  Object.freeze({ path: 'app/globals.css', access: 'write' as const }),
+]);
+
+/**
+ * Exactly what one repair invocation may see and may rewrite, decided by the
+ * harness before Luna is asked. Frozen: nothing downstream — least of all the
+ * model's output — can add a path to it.
+ */
+export interface RepairWriteScope {
+  /** The file this invocation repairs. Always writable. */
+  readonly primaryPath: string;
+  /** Policy files present in this project, other than the primary. */
+  readonly companionPaths: readonly string[];
+  /** Everything Luna is shown, primary first. */
+  readonly contextPaths: readonly string[];
+  /** The only paths this invocation's output may land on, primary first. */
+  readonly writablePaths: readonly string[];
+}
+
+/** A repair was asked to target a file the project does not have. */
+export class RepairScopeInvalid extends Error {
+  constructor(readonly primaryPath: string) {
+    super(`repair target "${primaryPath}" is not a source file of this project`);
+    this.name = 'RepairScopeInvalid';
+  }
+}
+
+/**
+ * Build one repair invocation's scope.
+ *
+ * Paths are taken only from `available` — the source files the harness itself
+ * read — and matched exactly, so a scope can never name a path the project
+ * does not have. Companion order follows `available`, which keeps what Luna is
+ * shown byte-for-byte what it was before.
+ */
+export function repairWriteScopeFor(
+  primaryPath: string,
+  available: readonly string[],
+  policy: readonly RepairScopePolicyEntry[] = REPAIR_SCOPE_POLICY,
+): RepairWriteScope {
+  if (!available.includes(primaryPath)) throw new RepairScopeInvalid(primaryPath);
+
+  const accessOf = new Map(policy.map((entry) => [entry.path, entry.access]));
+  const companionPaths = available.filter((path) => path !== primaryPath && accessOf.has(path));
+  const writableCompanions = companionPaths.filter((path) => accessOf.get(path) === 'write');
+
+  return Object.freeze({
+    primaryPath,
+    companionPaths: Object.freeze([...companionPaths]),
+    contextPaths: Object.freeze([primaryPath, ...companionPaths]),
+    writablePaths: Object.freeze([primaryPath, ...writableCompanions]),
+  });
+}
+
+/**
+ * Which files in a defect's scope get their own repair invocation.
+ *
+ * Policy files are reached through every page's scope, so they are not repaired
+ * on their own — unless they are all the defect names.
+ */
+export function repairTargetsFor(
+  scope: readonly string[],
+  policy: readonly RepairScopePolicyEntry[] = REPAIR_SCOPE_POLICY,
+): string[] {
+  const policyPaths = new Set(policy.map((entry) => entry.path));
+  const pages = scope.filter((path) => !policyPaths.has(path));
+  return pages.length > 0 ? pages : [...scope];
+}
+
+/**
+ * Split a repair's output by its scope: what may land, and what is refused.
+ * Exact path equality against `writablePaths` only — never against what Luna
+ * was shown, and never against what it chose to return.
+ */
+export function partitionRepairOutput<F extends { readonly path: string }>(
+  scope: RepairWriteScope,
+  files: readonly F[],
+): { permitted: F[]; refused: F[] } {
+  const writable = new Set(scope.writablePaths);
+  return {
+    permitted: files.filter((file) => writable.has(file.path)),
+    refused: files.filter((file) => !writable.has(file.path)),
+  };
+}

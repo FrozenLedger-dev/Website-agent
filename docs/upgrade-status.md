@@ -5298,6 +5298,41 @@ and no new authority for models. The runtime returns typed results and never
 touches project state, artifacts, jobs, Git, promotion, release or recovery.
 Phase 5q is unchanged.
 
+## Explicit Luna repair write scope — **DONE**
+
+**Why this and not a tool gateway.** A tool-gateway pass stopped with no changes:
+`ToolId` is declarative only, `JobSpec.allowedTools` is never read, and nothing
+executes a tool. The real authority debt it surfaced was `REPAIR_COMPANIONS` —
+not a tool permission, but a hidden widening of Luna's write set. Every repair
+invocation built its allowed output set from the files it had been shown, which
+always included `app/layout.tsx` and `app/globals.css`.
+
+**The write set is now one explicit value, decided before Luna is asked.**
+`repairWriteScopeFor(primaryPath, availablePaths)` in `defects.ts` returns a
+frozen `RepairWriteScope`: the primary path, the companion paths, what Luna is
+shown (`contextPaths`) and what it may rewrite (`writablePaths`). The policy
+behind it, `REPAIR_SCOPE_POLICY`, names each shell file with a `read` or `write`
+access, so being shown a file and being allowed to rewrite it are separate
+facts. Both shell files stay writable, because the defect contract cannot yet
+tell which defects need them, so behaviour is unchanged. What Luna is shown is
+byte-for-byte the same.
+
+**Luna cannot widen it.** Output is split by `partitionRepairOutput` against
+`writablePaths` alone, by exact path — never against context, and never
+normalised, so traversal, absolute and alternate spellings are refused.
+Paths come only from the project's own source list, a target outside it is
+refused, and every write still goes through `safeSitePath`. The repair phase no
+longer names any file path itself.
+
+**Unchanged:** prompts and `BuildOutput`, per-file repair calls, refusal counting,
+repair budgets, harness-owned writes and the one per-cycle commit. `ToolId`,
+`JobSpec.allowedTools`, `ModelRuntime` and Phase 5q are untouched.
+
+**Tests: +16 unit.** They cover the scope policy (primary, layout-only,
+globals-only, context-only, primary-only, invalid target, source ordering,
+freezing, unsafe spellings), phase-level escalation and refused output never
+reaching a real commit, and a structural guard against hidden grants.
+
 ## Phases 6–17
 
 Not started.

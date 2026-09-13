@@ -358,3 +358,90 @@ describe('what the phase does not do', () => {
     expect(code).not.toContain('legalAdjudicationActions');
   });
 });
+
+describe('explicit write scope at the phase', () => {
+  it('shows Luna exactly the scope, and lands only its writable paths whatever Luna returns', async () => {
+    lunaReplies = [
+      {
+        files: [
+          { path: 'app/page.tsx', contents: 'repaired' },
+          { path: 'app/layout.tsx', contents: 'shell fix' },
+          { path: 'unexpected/file.ts', contents: 'escalation' },
+        ],
+      },
+    ];
+    const outcome = await run([defect()]);
+
+    const { repairWriteScopeFor } = await import('../src/defects.js');
+    const scope = repairWriteScopeFor('app/page.tsx', SOURCES.map((f) => f.path));
+    expect(lunaCalls[0]?.contextPaths).toEqual([...scope.contextPaths]);
+    expect(written.map((f) => f.path)).toEqual(['app/page.tsx', 'app/layout.tsx']);
+    expect(outcome.repairHistoryEntries[0]?.outcome).toBe('2 file(s) rewritten, 1 refused');
+  });
+
+  it('refused output never reaches a real canonical commit', async () => {
+    const { mkdtemp, rm, stat } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { ProjectWorkspace } = await import('@statxai/workspace');
+    const { executeRepairs } = await import('../src/phases/repair.js');
+
+    const root = await mkdtemp(join(tmpdir(), 'statxai-repair-scope-'));
+    try {
+      const workspace = await ProjectWorkspace.open('proj_repair_scope', root);
+      await workspace.writeSiteFiles(SOURCES);
+      await workspace.commit('seed');
+      const head = await workspace.currentCommit();
+
+      lunaReplies = [
+        {
+          files: [
+            { path: 'unexpected/file.ts', contents: 'escalation' },
+            { path: 'app/about/page.tsx', contents: 'not this repair' },
+          ],
+        },
+      ];
+      const ctx = context();
+      (ctx.deps as { workspace: unknown }).workspace = workspace;
+
+      const outcome = await executeRepairs(ctx, {
+        targets: [defect()],
+        sources: SOURCES,
+        sourceOf: { 'index.html': 'app/page.tsx', 'about.html': 'app/about/page.tsx' },
+      });
+
+      expect(outcome.repairsAppliedDelta).toBe(0);
+      expect(await workspace.currentCommit()).toBe(head);
+      expect(await workspace.dirtyPaths()).toEqual([]);
+      await expect(stat(join(workspace.siteRoot, 'unexpected/file.ts'))).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('no hidden write grants', () => {
+  it('the phase takes writable paths only from the explicit scope', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const src = dirname(fileURLToPath(import.meta.url)).replace(/test$/, 'src');
+    const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+    const repair = strip(await readFile(join(src, 'phases/repair.ts'), 'utf8'));
+    const defects = strip(await readFile(join(src, 'defects.ts'), 'utf8'));
+
+    // No path names or policy lists in the phase: it cannot union anything in.
+    expect(repair).not.toMatch(/app\/layout\.tsx|app\/globals\.css|COMPANIONS|REPAIR_SCOPE_POLICY/);
+    expect(repair).toMatch(/const writeScope = repairWriteScopeFor\(target, available\);/);
+    expect(repair).toMatch(/partitionRepairOutput\(writeScope, repaired\.value\.files\)/);
+    // Context is built from the scope, and never used as the write set.
+    expect(repair).not.toMatch(/new Set\(context/);
+    expect(repair).toMatch(/writeScope\.contextPaths\.map\(/);
+
+    // The old implicit list is gone, and this authority is not tool authority.
+    expect(defects).not.toMatch(/REPAIR_COMPANIONS/);
+    for (const code of [repair, defects]) {
+      expect(code).not.toMatch(/\bToolId\b|allowedTools/);
+    }
+  });
+});
