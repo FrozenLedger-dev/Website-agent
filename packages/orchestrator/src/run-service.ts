@@ -11,7 +11,7 @@ import { resolve } from 'node:path';
 import { RunRecorder, type RunStatus, type StateStore } from '@statxai/state';
 import { runProject, type FrontendBackendExecutionMode, type RunOptions } from './orchestrator.js';
 import type { RunResult } from './phases/conclude.js';
-import { findActivePreparedBinding } from './run-binding/frontend-backend.js';
+import { findActiveLineageRoot, findActivePreparedBinding } from './run-binding/frontend-backend.js';
 
 /**
  * `raw` named a real mode (`legacy_direct`/`job_lifecycle`) — never trusted
@@ -196,6 +196,16 @@ export async function launchRun(options: LaunchOptions): Promise<LaunchHandle> {
     const activeBinding = await findActivePreparedBinding(options.store, projectId);
     if (activeBinding) {
       throw new ActiveJobLifecycleRollbackConflict(projectId, activeBinding._id);
+    }
+    // Nothing is mid-build, but an unfinished *lineage* can still own the
+    // project: its build promoted and its run never reached a durable terminal
+    // state. A `legacy_direct` run would write that same canonical workspace,
+    // so it fails closed on that too — the identical property, asked one
+    // question later. A widening of this existing guard by one indexed read;
+    // this slice adds no recovery of its own.
+    const owningLineage = await findActiveLineageRoot(options.store, projectId);
+    if (owningLineage) {
+      throw new ActiveJobLifecycleRollbackConflict(projectId, owningLineage._id);
     }
   }
 

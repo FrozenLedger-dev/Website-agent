@@ -248,7 +248,11 @@ export type FrontendBackendBuildBindingStatus = 'prepared' | 'promoted' | 'aband
  * one-active-binding slot (see the partial unique index on `{ projectId }`
  * in `StateStore.ensureIndexes`, filtered to `status: 'prepared'`), so a
  * later, genuinely new build generation — or, after `abandoned`, a
- * `legacy_direct` rollback — is free to proceed for the same project.
+ * `legacy_direct` rollback — is free to proceed for the same project as far
+ * as *that* slot is concerned. Whether one may actually start is a separate
+ * question, answered by {@link FrontendBackendBuildBindingDocument.activeLineage}:
+ * a promoted build whose outer run has not reached a durable terminal state
+ * still owns the project's continuation authority.
  */
 export interface FrontendBackendBuildBindingDocument {
   _id: string;
@@ -290,6 +294,44 @@ export interface FrontendBackendBuildBindingDocument {
    */
   predecessorBindingId?: string;
   replanDecision?: ArtifactRef;
+  /**
+   * The exact root of the build lineage this binding belongs to.
+   *
+   * An initial build is its own root (`lineageRootBindingId === _id`), and
+   * every replan successor carries the exact same value its predecessor
+   * carries — so a whole chain (`B0 -> B1 -> B2`) names one root that no
+   * reader has to walk backwards, sort, or infer to find.
+   *
+   * Immutable once written: which lineage a build belongs to is not a fact
+   * that can later change.
+   *
+   * Optional for the same reason the two lineage fields above are: a binding
+   * written before this existed simply has no key, which is readable history
+   * rather than a document awaiting migration. Absent means "legacy, root
+   * unproven" — never "root lost", and never an invitation to guess one from
+   * creation order.
+   */
+  lineageRootBindingId?: string;
+  /**
+   * Present only on the ROOT binding of the lineage that currently owns this
+   * project's unfinished continuation authority, and absent everywhere else —
+   * including on every successor in that same lineage.
+   *
+   * This is the project's one-active-lineage slot: the partial unique index on
+   * `{ projectId }` in `StateStore.ensureIndexes` is filtered on it, exactly
+   * as `ReleasePublicationDocument.active` is. A separate field rather than a
+   * filter on `status`, because a lineage stays active *across* statuses: it
+   * is acquired when the root is prepared, survives the root's promotion and
+   * every successor's, and continues through evaluation, repair, replan,
+   * approval and publication.
+   *
+   * Scoped to unfinished work, never to project history. Released only when
+   * the outer project reaches a durable semantic terminal state — never
+   * because a process died or a build failed to promote — after which the
+   * whole lineage remains durable, readable history and a later legitimate
+   * fresh generation may acquire the slot.
+   */
+  activeLineage?: true;
   /**
    * Operator evidence, set only once `status` becomes `abandoned` (Phase
    * 5m) — all three together, never individually. Optional, not

@@ -27,6 +27,7 @@
  * to redo that part from scratch on its next invocation (a later capability
  * this phase does not implement — see `docs/upgrade-status.md`).
  */
+import type { ClientSession } from 'mongodb';
 import { JobSpec, type ArtifactRef, type BusinessProfile, type SitePlan } from '@statxai/contracts';
 import type { FrontendBackendBuildBindingDocument, JobDocument, StateStore } from '@statxai/state';
 import { contentHash, type ProjectWorkspace } from '@statxai/workspace';
@@ -104,6 +105,72 @@ export class FrontendBackendBuildLineageConflict extends Error {
         `"${incomingSuccessorId}" — canonical build lineage does not branch`,
     );
     this.name = 'FrontendBackendBuildLineageConflict';
+  }
+}
+
+/**
+ * An unfinished build lineage already owns this project.
+ *
+ * Distinct from both siblings above, and the distinction is the whole point.
+ * {@link FrontendBackendBuildBindingConflict} is about a different request
+ * being mid-build — something is `prepared` right now.
+ * {@link FrontendBackendBuildLineageConflict} is about one predecessor being
+ * replaced twice. This one is about project ownership across that gap: a
+ * previous lineage promoted its build and its outer run never reached a
+ * durable terminal state, so nothing is `prepared` yet the project is still
+ * owned. Starting a fresh lineage there would strand the continuation
+ * authority of work that is still live, so it is refused.
+ */
+export class FrontendBackendActiveLineageConflict extends Error {
+  constructor(
+    readonly projectId: string,
+    readonly activeLineageRootBindingId: string,
+    readonly incomingBindingId: string,
+  ) {
+    super(
+      `project "${projectId}" is still owned by unfinished build lineage "${activeLineageRootBindingId}"; ` +
+        `refusing to found a second lineage ("${incomingBindingId}") — the owning lineage releases the ` +
+        `project only when its run reaches a durable terminal state`,
+    );
+    this.name = 'FrontendBackendActiveLineageConflict';
+  }
+}
+
+/**
+ * A replan successor's predecessor predates lineage-root identity and records
+ * none, so which lineage the successor would join cannot be proven.
+ *
+ * Never guessed — not by walking back to whatever happens to have no
+ * predecessor, and not by adopting the newest root. An unproven lineage is
+ * precisely the ambiguity this capability exists to remove, so it fails closed
+ * rather than manufacturing an answer a later reader would trust.
+ */
+export class FrontendBackendBuildLineageRootUnproven extends Error {
+  constructor(
+    readonly projectId: string,
+    readonly predecessorBindingId: string,
+  ) {
+    super(
+      `frontend_backend build "${predecessorBindingId}" (project "${projectId}") predates lineage-root ` +
+        `identity and records none; refusing to derive a successor's lineage root from it`,
+    );
+    this.name = 'FrontendBackendBuildLineageRootUnproven';
+  }
+}
+
+/**
+ * The chain hanging off an exact lineage root is not a single well-formed
+ * path. Reported rather than resolved: this answers "which build is current",
+ * and silently choosing one branch of a corrupt chain is worse than refusing.
+ */
+export class FrontendBackendBuildLineageCorrupt extends Error {
+  constructor(
+    readonly projectId: string,
+    readonly lineageRootBindingId: string,
+    detail: string,
+  ) {
+    super(`frontend_backend build lineage "${lineageRootBindingId}" (project "${projectId}") is corrupt — ${detail}`);
+    this.name = 'FrontendBackendBuildLineageCorrupt';
   }
 }
 
@@ -236,6 +303,164 @@ export async function findActivePreparedBinding(
   return store.frontendBackendBuildBindings.findOne({ projectId, status: 'prepared' });
 }
 
+/**
+ * The exact root binding of the lineage that currently owns this project's
+ * unfinished continuation authority, or `null` when nothing owns it.
+ *
+ * One indexed equality lookup against the project's active-lineage slot. Never
+ * a scan of the project's bindings, never a sort, and above all never "the
+ * newest promoted binding" — that answer is wrong the moment a project has had
+ * more than one generation, which is exactly when the question gets asked.
+ *
+ * `null` means two different things that must not be conflated by the caller:
+ * no unfinished work, or a legacy project whose bindings predate this slot. It
+ * is deliberately not this function's job to tell them apart by guessing.
+ */
+export async function findActiveLineageRoot(
+  store: StateStore,
+  projectId: string,
+): Promise<FrontendBackendBuildBindingDocument | null> {
+  return store.frontendBackendBuildBindings.findOne({ projectId, activeLineage: true });
+}
+
+/**
+ * Walk an exact lineage root forward to its current tip, structurally.
+ *
+ * Each step asks for the binding whose `predecessorBindingId` is the one in
+ * hand; the `(projectId, predecessorBindingId)` unique index (Phase 5q0) is
+ * what makes "the" well defined. So the answer comes from durable links alone
+ * — no `createdAt`, no `sort`, no "newest promoted". `B0 -> B1 -> B2` returns
+ * exactly `B2`.
+ *
+ * Abandoned and prepared members are part of the chain just as promoted ones
+ * are: this reports where the lineage currently stands, not where it last
+ * succeeded.
+ *
+ * Every way the chain could fail to be one well-formed path fails closed: a
+ * root that records a predecessor or a foreign root, a branch, a successor in
+ * another project or claiming another root, a cycle, or members that claim
+ * this root without being reachable from it (an orphan, or a successor whose
+ * predecessor is missing).
+ */
+export async function deriveActiveLineageTip(
+  store: StateStore,
+  root: FrontendBackendBuildBindingDocument,
+): Promise<FrontendBackendBuildBindingDocument> {
+  const rootId = root.lineageRootBindingId ?? root._id;
+
+  if (root.predecessorBindingId !== undefined) {
+    throw new FrontendBackendBuildLineageCorrupt(
+      root.projectId,
+      rootId,
+      `root "${root._id}" records predecessor "${root.predecessorBindingId}" and so is not a root`,
+    );
+  }
+  if (root.lineageRootBindingId !== undefined && root.lineageRootBindingId !== root._id) {
+    throw new FrontendBackendBuildLineageCorrupt(
+      root.projectId,
+      rootId,
+      `root "${root._id}" claims a different lineage root "${root.lineageRootBindingId}"`,
+    );
+  }
+
+  const seen = new Set<string>([root._id]);
+  let tip = root;
+
+  for (;;) {
+    const successors = await store.frontendBackendBuildBindings
+      .find({ projectId: root.projectId, predecessorBindingId: tip._id })
+      .toArray();
+
+    if (successors.length > 1) {
+      throw new FrontendBackendBuildLineageCorrupt(
+        root.projectId,
+        rootId,
+        `build "${tip._id}" has ${successors.length} successors (${successors.map((s) => s._id).join(', ')}); lineage does not branch`,
+      );
+    }
+    if (successors.length === 0) break;
+
+    const next = successors[0]!;
+    if (next.lineageRootBindingId !== rootId) {
+      throw new FrontendBackendBuildLineageCorrupt(
+        root.projectId,
+        rootId,
+        `successor "${next._id}" claims lineage root ${next.lineageRootBindingId ?? '(absent)'}`,
+      );
+    }
+    if (seen.has(next._id)) {
+      throw new FrontendBackendBuildLineageCorrupt(root.projectId, rootId, `chain cycles back through "${next._id}"`);
+    }
+    seen.add(next._id);
+    tip = next;
+  }
+
+  // Reachability, asked the other way round: anything claiming this root that
+  // the walk never reached is a detached member — an orphan, or a successor
+  // whose own predecessor no longer exists. Counted rather than ordered.
+  const claimed = await store.frontendBackendBuildBindings.countDocuments({
+    projectId: root.projectId,
+    lineageRootBindingId: rootId,
+  });
+  if (claimed !== seen.size) {
+    throw new FrontendBackendBuildLineageCorrupt(
+      root.projectId,
+      rootId,
+      `${claimed} bindings claim this lineage root but only ${seen.size} are reachable from it`,
+    );
+  }
+
+  return tip;
+}
+
+/**
+ * Release the project's active-lineage slot, guarded and idempotent.
+ *
+ * Called only when the outer project reaches a durable semantic terminal
+ * state, and — wherever the caller already owns a transaction — inside the very
+ * one that writes that state, so the terminal fact and the release are a single
+ * atomic fact rather than two writes a crash can separate. Where a crash does
+ * separate them, replay converges: `$unset` against a document that no longer
+ * carries the marker matches nothing and changes nothing, so retrying either
+ * side is safe and order does not matter.
+ *
+ * Never called because a process died, an invocation threw, or a build failed
+ * to promote. None of those is terminal, and freeing the slot for them would
+ * let a fresh lineage strand work that is still live — the precise failure
+ * this slot exists to prevent.
+ */
+export async function releaseActiveLineage(
+  store: StateStore,
+  projectId: string,
+  options: {
+    readonly session?: ClientSession;
+    /**
+     * Release only if the project's slot is held by this exact root.
+     *
+     * Used by callers that are ending one particular lineage rather than
+     * concluding the project — abandonment — so a binding can never release
+     * authority it does not hold. Notably, a binding that predates lineage
+     * identity records no root at all, and must not clear someone else's slot
+     * on its way out. Omitted by the terminal-state callers, which are
+     * concluding the project itself and release whatever holds it.
+     */
+    readonly lineageRootBindingId?: string;
+  } = {},
+): Promise<void> {
+  const filter = {
+    projectId,
+    activeLineage: true as const,
+    ...(options.lineageRootBindingId !== undefined ? { _id: options.lineageRootBindingId } : {}),
+  };
+  const update = { $unset: { activeLineage: '' }, $set: { updatedAt: new Date() } } as const;
+
+  if (options.session) {
+    await store.frontendBackendBuildBindings.updateOne(filter, update, { session: options.session });
+    return;
+  }
+  await store.frontendBackendBuildBindings.updateOne(filter, update);
+}
+
 // ---------------------------------------------------------------------------
 // Stored-spec integrity
 // ---------------------------------------------------------------------------
@@ -270,7 +495,29 @@ export function verifyBindingConsistency(
   binding: FrontendBackendBuildBindingDocument,
   spec: JobSpec,
   lineage?: PrepareBindingInput['lineage'],
+  expectedLineageRootBindingId?: string,
 ): void {
+  /**
+   * Which lineage a build belongs to is immutable. Exact replay converges on
+   * the same root; anything else is a stored record being asked to change
+   * lineage, which is never repaired in place.
+   *
+   * Compared only when the stored record actually carries a root: a binding
+   * written before this capability has none, and that is readable history
+   * rather than a mismatch — treating absent as wrong would fail every legacy
+   * resume, and backfilling it would invent authority nobody proved.
+   */
+  if (
+    expectedLineageRootBindingId !== undefined &&
+    binding.lineageRootBindingId !== undefined &&
+    binding.lineageRootBindingId !== expectedLineageRootBindingId
+  ) {
+    throw new FrontendBackendBuildBindingCorrupt(
+      binding._id,
+      `binding.lineageRootBindingId is "${binding.lineageRootBindingId}", not "${expectedLineageRootBindingId}"`,
+    );
+  }
+
   // Checked before the spec fields below, because lineage is what makes two
   // otherwise-identical successors different builds. The stored record is
   // never edited to match the caller: exact replay converges, anything else
@@ -358,9 +605,21 @@ export async function prepareFrontendBackendBuildBinding(
   const jobSpecHash = computeJobSpecHash(input.jobSpec);
   const bindingId = computeBindingId({ projectId: input.projectId, runIntentHash: input.runIntentHash, jobSpecHash });
 
+  /**
+   * Which lineage this binding joins, settled before anything is written.
+   *
+   * An initial build founds its own lineage and is its own root. A replan
+   * successor inherits its predecessor's exact recorded root rather than
+   * deriving one, which is what lets `B2` name `B0` without any reader
+   * walking the chain backwards or ordering it by time.
+   */
+  const lineageRootBindingId = input.lineage
+    ? await inheritLineageRoot(store, input.projectId, input.lineage.predecessorBindingId)
+    : bindingId;
+
   const existing = await store.frontendBackendBuildBindings.findOne({ _id: bindingId });
   if (existing) {
-    verifyBindingConsistency(existing, input.jobSpec, input.lineage);
+    verifyBindingConsistency(existing, input.jobSpec, input.lineage, lineageRootBindingId);
     return existing;
   }
 
@@ -379,12 +638,23 @@ export async function prepareFrontendBackendBuildBinding(
     specificationCommitSha: null,
     promotionId: null,
     promotionCommitSha: null,
+    lineageRootBindingId,
+    /**
+     * A root founds a lineage and therefore acquires the project's
+     * active-lineage slot here, at preparation — not at promotion. Owning the
+     * project from the moment work begins is what keeps a `prepared` build's
+     * claim on it coherent with Phase 5k's own restart resume.
+     *
+     * A successor joins a lineage that is already active, so it takes no
+     * second slot: exactly one binding per project ever carries this marker,
+     * and it is always the root.
+     */
     ...(input.lineage
       ? {
           predecessorBindingId: input.lineage.predecessorBindingId,
           replanDecision: input.lineage.replanDecisionRef,
         }
-      : {}),
+      : { activeLineage: true as const }),
     createdAt: now,
     updatedAt: now,
   };
@@ -400,14 +670,14 @@ export async function prepareFrontendBackendBuildBinding(
     // exists now, not by parsing the driver's error shape.
     const raced = await store.frontendBackendBuildBindings.findOne({ _id: bindingId });
     if (raced) {
-      verifyBindingConsistency(raced, input.jobSpec, input.lineage);
+      verifyBindingConsistency(raced, input.jobSpec, input.lineage, lineageRootBindingId);
       return raced;
     }
 
-    // Two partial unique indexes can now refuse this insert, and they mean
+    // Three partial unique indexes can now refuse this insert, and they mean
     // different things — so ask which constraint actually holds rather than
-    // assuming the older one, which would report a branched lineage as "a
-    // different request is mid-build".
+    // assuming one, which would report a branched lineage, or a project still
+    // owned by unfinished work, as "a different request is mid-build".
     if (input.lineage) {
       const rival = await store.frontendBackendBuildBindings.findOne({
         projectId: input.projectId,
@@ -423,9 +693,51 @@ export async function prepareFrontendBackendBuildBinding(
       }
     }
 
+    // Asked before the active-lineage slot below, so the long-standing answer
+    // keeps its exact meaning and Phase 5k's behaviour is unchanged: when
+    // something really is `prepared`, that is both the more precise fact and
+    // the more actionable one. Two racing fresh roots land here, since the
+    // winner is `prepared` and active at once.
     const other = await store.frontendBackendBuildBindings.findOne({ projectId: input.projectId, status: 'prepared' });
-    throw new FrontendBackendBuildBindingConflict(input.projectId, other?.runIntentHash ?? '(unknown)', input.runIntentHash);
+    if (other) {
+      throw new FrontendBackendBuildBindingConflict(input.projectId, other.runIntentHash, input.runIntentHash);
+    }
+
+    // Nothing is `prepared`, so this is the case that slot exists for: an
+    // earlier lineage promoted its build and its run never reached a durable
+    // terminal state, so it still owns the project.
+    const owner = await findActiveLineageRoot(store, input.projectId);
+    if (owner) {
+      throw new FrontendBackendActiveLineageConflict(input.projectId, owner._id, bindingId);
+    }
+
+    throw new FrontendBackendBuildBindingConflict(input.projectId, '(unknown)', input.runIntentHash);
   }
+}
+
+/**
+ * A successor's lineage root, read from the exact predecessor it names.
+ *
+ * Inherited, never derived: the predecessor already recorded which lineage it
+ * belongs to, so this is a read, and a predecessor that never recorded one
+ * fails closed rather than being reconstructed by walking or by time.
+ */
+async function inheritLineageRoot(
+  store: StateStore,
+  projectId: string,
+  predecessorBindingId: string,
+): Promise<string> {
+  const predecessor = await store.frontendBackendBuildBindings.findOne({ _id: predecessorBindingId });
+  if (!predecessor) {
+    throw new FrontendBackendBuildBindingNotFound(predecessorBindingId);
+  }
+  if (predecessor.projectId !== projectId) {
+    throw new FrontendBackendBuildBindingProjectMismatch(projectId, predecessorBindingId, predecessor.projectId);
+  }
+  if (predecessor.lineageRootBindingId === undefined) {
+    throw new FrontendBackendBuildLineageRootUnproven(projectId, predecessorBindingId);
+  }
+  return predecessor.lineageRootBindingId;
 }
 
 // ---------------------------------------------------------------------------
@@ -954,6 +1266,26 @@ export async function abandonFrontendBackendBuild(
         'binding is still "prepared" but its own guarded abandonment update did not match',
       );
     }
+
+    /**
+     * The unfinished work of this lineage is over, so the project is released
+     * — in this same transaction, so revocation and release are one atomic
+     * fact rather than two a crash could separate.
+     *
+     * This is the one ending that is durably terminal without the outer run
+     * concluding: an explicit, recorded operator decision, never a timeout, a
+     * lease expiry, or a process that died. Releasing here is what keeps Phase
+     * 5m's own contract intact — once a build is abandoned, a fresh generation
+     * or a `legacy_direct` rollback may proceed against the project.
+     *
+     * Scoped to this binding's own lineage root rather than clearing whatever
+     * the project's slot happens to hold, so a pre-lineage binding — which
+     * records no root and never held the slot — cannot release it.
+     */
+    await releaseActiveLineage(deps.store, binding.projectId, {
+      session,
+      lineageRootBindingId: updated.lineageRootBindingId ?? updated._id,
+    });
 
     return { outcome: 'abandoned' as const, binding: updated, supersededJobId };
   });

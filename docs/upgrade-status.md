@@ -4997,6 +4997,101 @@ budgets. Outer `runProject` recovery is still not implemented — that is Phase
 5q, and it should now read the explicit `B0 -> B1 -> B2` lineage rather than
 adding a workflow cursor of its own.
 
+## Phase 5q prerequisite — durable active frontend/backend lineage authority — **DONE**
+
+**Phase 5q could not start, and this is why.** Outer `runProject` recovery has
+to begin by asking which build a project is actually continuing. That question
+had no durable answer. The one-active-binding slot is filtered on
+`status: 'prepared'`, so it frees the project the moment a build promotes —
+correct for "may another generation start?", and exactly wrong for "is an
+unfinished lineage still running?". A probe against the real replica set
+confirmed it rather than arguing it: promote `B0`, and a second, unrelated
+no-lineage root can be founded for the same project immediately. Structural tip
+selection then returns two roots and two tips, separable only by `createdAt`.
+Phase 5q stopped with zero changes on that ambiguity; this removes it.
+
+**The invariant is scoped to unfinished work, not to history.** At most one
+unfinished lineage owns a project at a time. It is deliberately *not* one
+lineage root per project forever: that would lock a durably finished project out
+of legitimate later work, and would silently mis-handle historical documents,
+which carry no marker and therefore sit outside a partial index anyway.
+
+**Two fields carry it.** `lineageRootBindingId` names the exact root of the
+lineage a binding belongs to — an initial build is its own root, and a successor
+inherits its predecessor's exact recorded value, so `B0 -> B1 -> B2` all name
+`B0` without anyone walking or sorting. A successor never derives a root; it
+reads one, and a predecessor that records none fails closed
+(`FrontendBackendBuildLineageRootUnproven`) rather than guessing. `activeLineage`
+marks the one root that currently owns the project, enforced by a partial unique
+index on `{ projectId }` filtered to `activeLineage: true` — the same shape
+`release_publications.active` uses, and named explicitly because the Phase 5k
+active-slot index already occupies the default name Mongo derives from that key
+pattern.
+
+**The slot is acquired at preparation, not at promotion,** so even a `prepared`
+build owns its project and Phase 5k's restart resume stays coherent. Successors
+join a lineage that is already active and take no second slot: exactly one
+binding per project ever carries the marker, and it is always the root.
+
+**Promotion does not release it.** That was the whole gap. The lineage stays
+owned through promotion, evaluation, adjudication, repair, replan, a successor's
+own promotion, approval and publication.
+
+**Only durable semantic terminal completion releases it,** and the release is
+written in the same transaction as the terminal state, so a crash cannot leave a
+project released while an unfinished lineage still claims it. Three sites,
+matching the real contract rather than state names that merely sound final:
+`released` (`publish.ts`) and the two `blocked` exits (`orchestrator.ts`).
+`awaiting_human_review` deliberately keeps ownership — it is a run parked for a
+person, not a finished one — and a build that never reaches `promoted` writes no
+project state at all, so a dead invocation never frees a project whose work is
+still live. Abandonment (Phase 5m) also releases, inside the transaction it
+already owns: an explicit, recorded operator decision is the one ending that is
+terminal without the outer run concluding, and releasing there is what keeps
+Phase 5m's own contract intact — once abandoned, a fresh generation or a
+`legacy_direct` rollback may proceed. Release is a guarded `$unset`, so replay
+converges from either side and order does not matter.
+
+**Two narrow reads, both structural.** `findActiveLineageRoot` is one indexed
+equality lookup, never a scan-and-sort. `deriveActiveLineageTip` walks
+`predecessorBindingId` links forward — Phase 5q0's one-successor index is what
+makes each step well defined — and fails closed on every way the chain could
+stop being a single path: a root that records a predecessor or a foreign root, a
+branch, a successor claiming another root, a cycle, or members that claim the
+root without being reachable from it. No `createdAt` anywhere in either.
+
+**Historical bindings are left exactly as they are.** No backfill, no invented
+roots. A legacy project with two unmarked roots reports *no* owner rather than
+adopting the newer one, which is the honest answer and the one Phase 5q needs in
+order to fail closed instead of guessing.
+
+**One existing guard widened by one read.** `legacy_direct` already refused to
+start while a binding was `prepared`; it now also refuses while an unfinished
+lineage owns the project. Same property, asked one question later.
+
+**Tests: +22 integration, one new file** — root identity and slot acquisition,
+an initial build with no lineage fields, `B0 -> B1 -> B2` inheritance, exact
+replay convergence, a real race in which exactly one of two fresh roots wins,
+promotion (of root and of successor) not releasing, a real run whose build never
+promotes keeping the project owned, real released and blocked runs releasing it,
+idempotent replay across the crash window, a later generation acquiring the slot
+afterwards, structural tip derivation, five distinct corrupt-chain refusals, a
+source-level check that neither lookup mentions time, and legacy behaviour
+including index migration with no backfill.
+
+**Unchanged:** Phase 5h canonical promotion and exact replacement, Phase 5n
+fencing, the Phase 5p release-publication state machine, the JobEngine state
+machine, Phase 5k prepared-binding resume, and Phase 5q0's
+one-successor-per-predecessor rule. `runs`/`run_events` remain telemetry and are
+never consulted for authority. No workflow cursor was added: the only new
+control-plane fact is which lineage currently owns unfinished continuation.
+
+**This does not implement Phase 5q recovery.** No lookup happens before
+`discoverProject`, nothing is rehydrated, and no recovery run is created. Phase
+5q can now resolve `projectId -> exact active lineage root -> exact structurally
+derived tip` with no newest/latest inference, and its mandatory gate should be
+repeated against that.
+
 ## Phases 6–17
 
 Not started.

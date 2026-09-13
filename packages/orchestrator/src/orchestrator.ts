@@ -53,6 +53,7 @@ import {
   ensureSpecificationCommitted,
   finalizeBindingPromoted,
   findActivePreparedBinding,
+  releaseActiveLineage,
   parseStoredJobSpec,
   prepareFrontendBackendBuildBinding,
   rehydrateSpecificationFiles,
@@ -809,7 +810,17 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   const stillBlocked = isReleaseBlocked(progress.openDefects) || progress.reviewUnavailable !== null;
 
   if (stillBlocked) {
-    await store.projects.updateOne({ _id: projectId }, { $set: { state: 'blocked', updatedAt: new Date() } });
+    // Durably terminal, so the build lineage that owned this project releases
+    // it in the very transaction that records the terminal state — one atomic
+    // fact rather than two writes a crash could separate.
+    await store.withTransaction(async (session) => {
+      await store.projects.updateOne(
+        { _id: projectId },
+        { $set: { state: 'blocked', updatedAt: new Date() } },
+        { session },
+      );
+      await releaseActiveLineage(store, projectId, { session });
+    });
     // The same exit every other post-delivery return uses, rather than a second
     // hand-built result: the telemetry bugs this file has already had all came
     // from one exit path reporting a different run from the one that happened.
@@ -841,10 +852,17 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         level: 'warn',
       });
     } else {
-      await store.projects.updateOne(
-        { _id: projectId },
-        { $set: { state: 'blocked', updatedAt: new Date() } },
-      );
+      // Terminal, and released atomically with it — unlike the
+      // `awaiting_human_review` branch above, which is a run parked for a
+      // person rather than a finished one, and deliberately keeps ownership.
+      await store.withTransaction(async (session) => {
+        await store.projects.updateOne(
+          { _id: projectId },
+          { $set: { state: 'blocked', updatedAt: new Date() } },
+          { session },
+        );
+        await releaseActiveLineage(store, projectId, { session });
+      });
     }
 
     // Mapped from the authorisation, not from the defect list. A refusal here

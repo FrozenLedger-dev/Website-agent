@@ -20,6 +20,7 @@ import type { ArtifactRef, DeploymentManifest } from '@statxai/contracts';
 import type { ReleaseAuthorization } from '@statxai/policy-engine';
 import type { ReleasePublicationDocument } from '@statxai/state';
 import type { RunContext } from '../run-context.js';
+import { releaseActiveLineage } from '../run-binding/frontend-backend.js';
 import {
   RELEASE_COMMIT_METADATA_KEY,
   RELEASE_METADATA_KEY,
@@ -327,10 +328,18 @@ async function writeManifest(
   await deps.workspace.materialiseArtifact('deployment/deployment-manifest.json', manifest);
   const finalCommit = (await deps.workspace.commit('Harness: release manifest')) ?? published.releaseCommit;
 
-  await deps.store.projects.updateOne(
-    { _id: facts.projectId },
-    { $set: { state: 'released', updatedAt: new Date() } },
-  );
+  // The one genuinely successful terminal state. The lineage that built this
+  // release releases the project in the same transaction that records it, so a
+  // crash can never leave the project released while an unfinished lineage
+  // still claims to own it.
+  await deps.store.withTransaction(async (session) => {
+    await deps.store.projects.updateOne(
+      { _id: facts.projectId },
+      { $set: { state: 'released', updatedAt: new Date() } },
+      { session },
+    );
+    await releaseActiveLineage(deps.store, facts.projectId, { session });
+  });
   deps.say({ phase: 'publish', detail: `Released at ${finalCommit?.slice(0, 8) ?? 'HEAD'}`, level: 'ok' });
 
   return { manifest, finalCommit };

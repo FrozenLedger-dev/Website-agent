@@ -212,6 +212,26 @@ export class StateStore {
         unique: true,
         partialFilterExpression: { predecessorBindingId: { $exists: true } },
       },
+      // At most one unfinished build *lineage* owns a project at a time.
+      //
+      // Filtered on `activeLineage` rather than on `status`, because that and
+      // the active-slot index above answer different questions. That one frees
+      // the project the moment a build promotes — right for "may another build
+      // generation start?", and wrong for "does an unfinished lineage still
+      // own this project?", where a promoted root is precisely when the answer
+      // must stay yes. Filtered on the literal value the way
+      // `release_publications.active` is, and partial so every binding written
+      // before this existed stays outside the index with no backfill.
+      //
+      // Explicitly named: the active-slot index above already occupies the
+      // default name Mongo derives from this same `{ projectId: 1 }` key
+      // pattern, and two indexes may not share a name.
+      {
+        key: { projectId: 1 },
+        unique: true,
+        partialFilterExpression: { activeLineage: true },
+        name: 'projectId_1_activeLineage',
+      },
     ]);
 
     // At most one unfinished release publication per project (Phase 5p) — the
