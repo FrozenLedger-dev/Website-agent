@@ -40,6 +40,7 @@ import type { ArtifactRef } from '@statxai/contracts';
 import type { ProjectWorkspace } from '@statxai/workspace';
 import { contentHash, toProjectName } from '@statxai/workspace';
 import type {
+  ReleaseBuildAuthority,
   ReleaseDeploymentTarget,
   ReleasePublicationAttempt,
   ReleasePublicationDocument,
@@ -82,6 +83,42 @@ export class ReleasePublicationConflict extends Error {
         `${requestedReleaseId} cannot publish alongside it`,
     );
     this.name = 'ReleasePublicationConflict';
+  }
+}
+
+/**
+ * This exact build lineage already owns a different release publication.
+ *
+ * Distinct from {@link ReleasePublicationConflict}, and not interchangeable
+ * with it. That one is temporary — another release is *unfinished* and holds
+ * the project's slot until it resolves. This one is permanent: a lineage
+ * publishes once, and a committed receipt still counts, so waiting will never
+ * clear it.
+ */
+export class ReleasePublicationLineageConflict extends Error {
+  constructor(
+    readonly projectId: string,
+    readonly lineageRootBindingId: string,
+    readonly existingReleaseId: string,
+    readonly requestedReleaseId: string,
+  ) {
+    super(
+      `Build lineage ${lineageRootBindingId} (project ${projectId}) already has release publication ` +
+        `${existingReleaseId}; ${requestedReleaseId} would be a second release for the same lineage`,
+    );
+    this.name = 'ReleasePublicationLineageConflict';
+  }
+}
+
+/**
+ * A lineage-linked receipt does not describe the exact canonical build a
+ * caller derived independently — same root, but a different binding or
+ * promotion. Never accepted on the root alone.
+ */
+export class ReleasePublicationCanonicalBuildMismatch extends Error {
+  constructor(readonly releaseId: string, detail: string) {
+    super(`Release ${releaseId} does not publish the expected canonical build: ${detail}`);
+    this.name = 'ReleasePublicationCanonicalBuildMismatch';
   }
 }
 
@@ -245,6 +282,13 @@ export interface PrepareReleasePublicationInput {
   readonly releaseAuthorization: ArtifactRef;
   readonly baseCommit: string | null;
   readonly deploymentTarget: ReleaseDeploymentTarget;
+  /**
+   * The exact canonical build being published. Supplied by every
+   * `job_lifecycle` release, omitted by `legacy_direct`, never invented.
+   * Deliberately not an input to `releaseId`: this is an association with a
+   * release, not part of what the release is.
+   */
+  readonly buildAuthority?: ReleaseBuildAuthority;
   readonly now?: Date;
 }
 
@@ -262,6 +306,7 @@ export async function ensureReleasePublicationPrepared(
   input: PrepareReleasePublicationInput,
 ): Promise<ReleasePublicationDocument> {
   const now = input.now ?? new Date();
+  if (input.buildAuthority) assertCompleteBuildAuthority(input.releaseId, input.buildAuthority);
 
   const existing = await store.releasePublications.findOne({ _id: input.releaseId });
   if (existing) return assertMatchesRequest(existing, input);
@@ -272,6 +317,15 @@ export async function ensureReleasePublicationPrepared(
     releaseAuthorization: input.releaseAuthorization,
     baseCommit: input.baseCommit,
     deploymentTarget: input.deploymentTarget,
+    ...(input.buildAuthority
+      ? {
+          buildAuthority: {
+            lineageRootBindingId: input.buildAuthority.lineageRootBindingId,
+            canonicalBindingId: input.buildAuthority.canonicalBindingId,
+            promotionId: input.buildAuthority.promotionId,
+          },
+        }
+      : {}),
     status: 'prepared',
     active: true,
     releaseCommitSha: null,
@@ -296,8 +350,114 @@ export async function ensureReleasePublicationPrepared(
     const raced = await store.releasePublications.findOne({ _id: input.releaseId });
     if (raced) return assertMatchesRequest(raced, input);
 
+    // Asked before the active slot: when this lineage already has a release,
+    // that is the permanent fact, and reporting the temporary one instead
+    // would tell a caller to wait for something that will never clear.
+    if (input.buildAuthority) {
+      const rival = await findReleasePublicationForLineage(
+        store,
+        input.projectId,
+        input.buildAuthority.lineageRootBindingId,
+      );
+      if (rival) {
+        throw new ReleasePublicationLineageConflict(
+          input.projectId,
+          input.buildAuthority.lineageRootBindingId,
+          rival._id,
+          input.releaseId,
+        );
+      }
+    }
+
     const holder = await store.releasePublications.findOne({ projectId: input.projectId, active: true });
     throw new ReleasePublicationConflict(input.projectId, holder?._id ?? '(unknown)', input.releaseId);
+  }
+}
+
+/**
+ * The one release publication a build lineage owns, in whatever status it is
+ * in — or `null`.
+ *
+ * One exact indexed read by lineage identity. Deliberately not filtered on
+ * `active`: a receipt that committed and then lost its process before the
+ * project finished is precisely the one a later reader must still find. Never
+ * sorted, never "the newest release": the lineage index allows at most one.
+ * Receipts without build authority are unreachable from here by construction,
+ * so a historical or `legacy_direct` release can never be mistaken for it.
+ */
+export async function findReleasePublicationForLineage(
+  store: StateStore,
+  projectId: string,
+  lineageRootBindingId: string,
+): Promise<ReleasePublicationDocument | null> {
+  return store.releasePublications.findOne({
+    projectId,
+    'buildAuthority.lineageRootBindingId': lineageRootBindingId,
+  });
+}
+
+/**
+ * Prove a lineage-linked receipt publishes exactly the canonical build a caller
+ * derived for itself — root, binding and promotion all three.
+ *
+ * Matching the root alone is not enough: a lineage that moved on to a later
+ * promoted build after this receipt was written shares the root and nothing
+ * else, and this receipt is not publication authority for that later build.
+ */
+export function assertReceiptMatchesCanonicalBuild(
+  receipt: ReleasePublicationDocument,
+  expected: ReleaseBuildAuthority,
+): void {
+  const stored = receipt.buildAuthority;
+  if (!stored) {
+    throw new ReleasePublicationCanonicalBuildMismatch(receipt._id, 'the receipt records no build authority');
+  }
+  if (stored.lineageRootBindingId !== expected.lineageRootBindingId) {
+    throw new ReleasePublicationCanonicalBuildMismatch(receipt._id, `lineage root is ${stored.lineageRootBindingId}, not ${expected.lineageRootBindingId}`);
+  }
+  if (stored.canonicalBindingId !== expected.canonicalBindingId) {
+    throw new ReleasePublicationCanonicalBuildMismatch(receipt._id, `canonical binding is ${stored.canonicalBindingId}, not ${expected.canonicalBindingId}`);
+  }
+  if (stored.promotionId !== expected.promotionId) {
+    throw new ReleasePublicationCanonicalBuildMismatch(receipt._id, `promotion is ${stored.promotionId}, not ${expected.promotionId}`);
+  }
+}
+
+function assertCompleteBuildAuthority(releaseId: string, authority: ReleaseBuildAuthority): void {
+  for (const key of ['lineageRootBindingId', 'canonicalBindingId', 'promotionId'] as const) {
+    const value: unknown = authority[key];
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new ReleasePublicationBindingConflict(releaseId, `build authority is incomplete: ${key} is missing`);
+    }
+  }
+}
+
+/**
+ * Build authority is part of what a receipt is, including whether it has any.
+ *
+ * Checked in both directions: a linked receipt is never replayed by a caller
+ * that forgot its build, and an unlinked historical receipt is never quietly
+ * upgraded by a caller that now supplies one. Exported for the committed-replay
+ * path, which reuses a receipt without re-preparing it.
+ */
+export function assertMatchingBuildAuthority(
+  receipt: ReleasePublicationDocument,
+  requested: ReleaseBuildAuthority | undefined,
+): void {
+  const stored = receipt.buildAuthority;
+  if (!stored && !requested) return;
+  if (!stored) {
+    throw new ReleasePublicationBindingConflict(receipt._id, 'the receipt has no build authority, and one was presented');
+  }
+  if (!requested) {
+    throw new ReleasePublicationBindingConflict(receipt._id, 'the receipt is bound to a build, and none was presented');
+  }
+  if (
+    stored.lineageRootBindingId !== requested.lineageRootBindingId ||
+    stored.canonicalBindingId !== requested.canonicalBindingId ||
+    stored.promotionId !== requested.promotionId
+  ) {
+    throw new ReleasePublicationBindingConflict(receipt._id, 'a different canonical build (lineage, binding or promotion)');
   }
 }
 
@@ -320,6 +480,7 @@ function assertMatchesRequest(
   if (!sameDeploymentTarget(receipt.deploymentTarget, input.deploymentTarget)) {
     throw new ReleasePublicationTargetConflict(receipt._id, receipt.deploymentTarget, input.deploymentTarget);
   }
+  assertMatchingBuildAuthority(receipt, input.buildAuthority);
   return receipt;
 }
 

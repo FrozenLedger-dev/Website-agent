@@ -29,7 +29,12 @@
  */
 import type { ClientSession } from 'mongodb';
 import { JobSpec, type ArtifactRef, type BusinessProfile, type SitePlan } from '@statxai/contracts';
-import type { FrontendBackendBuildBindingDocument, JobDocument, StateStore } from '@statxai/state';
+import type {
+  FrontendBackendBuildBindingDocument,
+  JobDocument,
+  ReleaseBuildAuthority,
+  StateStore,
+} from '@statxai/state';
 import { contentHash, type ProjectWorkspace } from '@statxai/workspace';
 import type { JobEngine } from '@statxai/job-engine';
 import { FRONTEND_BACKEND_INPUT } from '../job-handlers/frontend-backend.js';
@@ -411,6 +416,61 @@ export async function deriveActiveLineageTip(
   }
 
   return tip;
+}
+
+/**
+ * An exact binding cannot be named as the build a release publishes: it is
+ * not promoted, belongs elsewhere, or predates lineage identity. Publication
+ * authority is never manufactured from a build that has not earned it.
+ */
+export class FrontendBackendBuildNotPublishable extends Error {
+  constructor(
+    readonly bindingId: string,
+    detail: string,
+  ) {
+    super(`frontend_backend build "${bindingId}" cannot be published as canonical build authority — ${detail}`);
+    this.name = 'FrontendBackendBuildNotPublishable';
+  }
+}
+
+/**
+ * The exact build authority a release publishes, read from the one binding
+ * the caller already holds by id.
+ *
+ * Re-read rather than taken from the caller's in-memory document on purpose:
+ * `runProject` keeps the document `prepare` returned, and promotion is
+ * recorded afterwards in Mongo, so that copy still says `prepared` with no
+ * promotion id. An exact-id read of durable state is the authority; nothing
+ * here looks for "the latest" or "the promoted" binding.
+ *
+ * Fails closed unless the binding is this project's, `promoted`, carries its
+ * promotion id, and carries a lineage root — a binding that predates lineage
+ * identity cannot prove which lineage its release would belong to.
+ */
+export async function loadReleaseBuildAuthority(
+  store: StateStore,
+  projectId: string,
+  bindingId: string,
+): Promise<ReleaseBuildAuthority> {
+  const binding = await store.frontendBackendBuildBindings.findOne({ _id: bindingId });
+  if (!binding) throw new FrontendBackendBuildBindingNotFound(bindingId);
+  if (binding.projectId !== projectId) {
+    throw new FrontendBackendBuildNotPublishable(bindingId, `it belongs to project "${binding.projectId}", not "${projectId}"`);
+  }
+  if (binding.status !== 'promoted') {
+    throw new FrontendBackendBuildNotPublishable(bindingId, `its status is "${binding.status}", not "promoted"`);
+  }
+  if (!binding.promotionId) {
+    throw new FrontendBackendBuildNotPublishable(bindingId, 'it records no promotion id');
+  }
+  if (binding.lineageRootBindingId === undefined) {
+    throw new FrontendBackendBuildNotPublishable(bindingId, 'it predates lineage-root identity');
+  }
+  return {
+    lineageRootBindingId: binding.lineageRootBindingId,
+    canonicalBindingId: binding._id,
+    promotionId: binding.promotionId,
+  };
 }
 
 /**

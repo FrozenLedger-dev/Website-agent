@@ -53,6 +53,7 @@ import {
   ensureSpecificationCommitted,
   finalizeBindingPromoted,
   findActivePreparedBinding,
+  FrontendBackendBuildNotPublishable,
   releaseActiveLineage,
   parseStoredJobSpec,
   prepareFrontendBackendBuildBinding,
@@ -872,11 +873,19 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     return concluded(ctx(), 'blocked', terminalForRefusal(progress.authorization?.action ?? null));
   }
 
+  // A `job_lifecycle` release always names the exact canonical build it
+  // publishes; every route to this point in that mode promoted one. Refused
+  // rather than published unlinked if that ever stops being true.
+  if (frontendBackendExecutionMode === 'job_lifecycle' && !canonicalBuild) {
+    throw new FrontendBackendBuildNotPublishable('(none)', 'this job_lifecycle run holds no canonical build to publish');
+  }
+
   const { manifest, finalCommit } = await publishRelease(ctx(), progress.authorization, {
     // Non-null on every path that reaches publication: the guard above proves
     // an authorisation exists, and `seekRelease` writes the artifact the
     // authorisation came from before returning it.
     releaseAuthorizationRef: progress.releaseAuthorizationRef!,
+    ...(canonicalBuild ? { canonicalBuildBindingId: canonicalBuild._id } : {}),
   });
 
   return { ...(await concluded(ctx(), 'released', undefined)), commit: finalCommit, manifest };

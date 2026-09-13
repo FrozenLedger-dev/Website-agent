@@ -5092,6 +5092,65 @@ control-plane fact is which lineage currently owns unfinished continuation.
 derived tip` with no newest/latest inference, and its mandatory gate should be
 repeated against that.
 
+## Phase 5q prerequisite — release publication bound to build lineage — **DONE**
+
+**Why Phase 5q stopped a second time.** The active lineage names the current
+build, but a release receipt named only a project and an authorisation version.
+Once a receipt commits it leaves the project's active slot, so a historical
+committed release and the current lineage's committed release were
+indistinguishable without ordering by time.
+
+**The receipt now carries exact build authority** — an optional, all-or-nothing
+`buildAuthority { lineageRootBindingId, canonicalBindingId, promotionId }`.
+Mandatory for every `job_lifecycle` release; absent on historical receipts and
+on `legacy_direct` releases, which have no lineage and are never given a fake
+one. Absent means "no proven association", never "probably current".
+
+**Threaded from the run's own build, by exact id.** `runProject` passes the
+canonical binding's `_id`; `publishRelease` re-reads that exact binding (the
+in-memory copy is the pre-promotion snapshot) and refuses unless it is this
+project's, `promoted`, and carries a promotion id and lineage root. Resolved
+only when a receipt is actually needed, so local-preview releases are untouched.
+
+**`releaseId` is unchanged,** pinned byte-for-byte in a test against values
+captured from the unmodified code. This is an association, not a new identity.
+
+**Immutable, both directions.** Replay must present the same root, binding and
+promotion; a linked receipt replayed without authority, or an unlinked one
+presented with authority, fails closed and is never rewritten. The
+committed-replay short-circuit checks it too.
+
+**One release per build lineage, ever.** A unique partial index on
+`{ projectId, buildAuthority.lineageRootBindingId }`, deliberately not filtered
+on `active` or status: a committed receipt still means that lineage has
+published. A duplicate reports the permanent `ReleasePublicationLineageConflict`
+before the temporary `ReleasePublicationConflict`; the project's active slot is
+unchanged and orthogonal. A later lineage has its own receipt.
+
+**Exact lookup.** `findReleasePublicationForLineage` is one indexed read by
+lineage identity, in every status including `committed`, never sorted.
+`assertReceiptMatchesCanonicalBuild` refuses a receipt whose root matches but
+whose binding or promotion does not — a receipt for `B1` is not authority for
+`B2`.
+
+**Operators unaffected.** Adoption and retry update fields in place, so the
+linkage survives both without anyone retyping ids.
+
+**Tests: +24 integration, one new file** — two real `runProject` runs (linked
+`job_lifecycle`, unlinked `legacy_direct`), refusal of unpublishable builds,
+pinned `releaseId`, replay and every mismatch direction (including the
+committed-replay path through `publishRelease`), lineage uniqueness
+under a race and after commit, a later lineage, the unchanged active slot,
+lookup across prepared/publishing/retry_authorized/committed/adopted,
+historical receipts ignored and indexed with no backfill, and the moved-tip
+refusal.
+
+**Unchanged:** the Phase 5p state machine and provider metadata, the
+`release-authorization` artifact, Phases 5h/5n, and active-lineage semantics.
+Runs and run events remain telemetry. **Phase 5q is still not implemented**;
+its gate should be re-run, including the window where an authorisation exists
+but its receipt was never prepared.
+
 ## Phases 6–17
 
 Not started.

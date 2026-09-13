@@ -20,11 +20,12 @@ import type { ArtifactRef, DeploymentManifest } from '@statxai/contracts';
 import type { ReleaseAuthorization } from '@statxai/policy-engine';
 import type { ReleasePublicationDocument } from '@statxai/state';
 import type { RunContext } from '../run-context.js';
-import { releaseActiveLineage } from '../run-binding/frontend-backend.js';
+import { loadReleaseBuildAuthority, releaseActiveLineage } from '../run-binding/frontend-backend.js';
 import {
   RELEASE_COMMIT_METADATA_KEY,
   RELEASE_METADATA_KEY,
   ReleasePublicationReconciliationRequired,
+  assertMatchingBuildAuthority,
   beginPublicationAttempt,
   computeReleaseId,
   ensureReleasePublicationPrepared,
@@ -71,6 +72,13 @@ export interface PublishOptions {
    */
   releaseAuthorizationRef: ArtifactRef;
   gateway?: ReleaseDeploymentGateway;
+  /**
+   * The exact canonical `frontend_backend` binding this release publishes, by
+   * id — supplied by every `job_lifecycle` run, omitted by `legacy_direct`,
+   * which has no build lineage. Resolved to full build authority only when a
+   * receipt is actually needed, so a local-preview release is unaffected.
+   */
+  canonicalBuildBindingId?: string;
 }
 
 export async function publishRelease(
@@ -111,12 +119,20 @@ export async function publishRelease(
     releaseAuthorization: options.releaseAuthorizationRef,
   });
 
+  // The exact build this release publishes, from the one binding id the run
+  // holds. Absent for `legacy_direct`, which has no lineage to name.
+  const buildAuthority =
+    options.canonicalBuildBindingId === undefined
+      ? undefined
+      : await loadReleaseBuildAuthority(deps.store, facts.projectId, options.canonicalBuildBindingId);
+
   /**
    * A release whose deployment is already durably known replays without
    * touching Vercel or Git publication at all — whatever crashed afterwards
    * (the manifest, the project state) is simply redone from the receipt.
    */
   const known = await deps.store.releasePublications.findOne({ _id: releaseId });
+  if (known) assertMatchingBuildAuthority(known, buildAuthority);
   if (known?.status === 'committed') {
     deps.say({
       phase: 'publish',
@@ -141,6 +157,7 @@ export async function publishRelease(
     releaseAuthorization: options.releaseAuthorizationRef,
     baseCommit,
     deploymentTarget,
+    ...(buildAuthority ? { buildAuthority } : {}),
   });
 
   if (receipt.status === 'publishing') {

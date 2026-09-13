@@ -244,6 +244,20 @@ export class StateStore {
     await this.releasePublications.createIndexes([
       { key: { projectId: 1 }, unique: true, partialFilterExpression: { active: true } },
       { key: { projectId: 1, preparedAt: -1 } },
+      // At most one logical release per build lineage — ever, not only while
+      // unfinished. Deliberately *not* filtered on `active` like the slot
+      // above: a committed receipt still means this lineage has published, and
+      // a second, different release for it must stay impossible, which is also
+      // what keeps a committed receipt exactly findable by lineage afterwards.
+      // Partial on the field's existence, so historical and `legacy_direct`
+      // receipts — which carry no build authority — sit outside it with no
+      // backfill.
+      {
+        key: { projectId: 1, 'buildAuthority.lineageRootBindingId': 1 },
+        unique: true,
+        partialFilterExpression: { 'buildAuthority.lineageRootBindingId': { $exists: true } },
+        name: 'projectId_1_buildAuthority_lineageRoot',
+      },
     ]);
   }
 

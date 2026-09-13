@@ -405,6 +405,23 @@ export interface ReleasePublicationAttempt {
 }
 
 /**
+ * The exact canonical build a release publication publishes.
+ *
+ * One value object rather than three loose optional fields, so it is present
+ * whole or absent whole — a receipt naming a lineage without the exact build
+ * and promotion inside it would be exactly the half-proven association this
+ * exists to rule out.
+ */
+export interface ReleaseBuildAuthority {
+  /** The root of the build lineage that owns this release. */
+  lineageRootBindingId: string;
+  /** The exact promoted `frontend_backend` binding whose tree is published. */
+  canonicalBindingId: string;
+  /** That binding's own promotion identity. */
+  promotionId: string;
+}
+
+/**
  * The durable authority for one logical production release (Phase 5p).
  *
  * `_id` is the deterministic `releaseId` (see `computeReleaseId`), so this
@@ -434,6 +451,19 @@ export interface ReleasePublicationDocument {
    */
   baseCommit: string | null;
   deploymentTarget: ReleaseDeploymentTarget;
+  /**
+   * The exact canonical build this release publishes — immutable once written.
+   *
+   * Always present on a receipt created by a `job_lifecycle` run, which is
+   * what lets a later reader go from a project's active build lineage straight
+   * to its one publication, in any status, without ordering receipts by time.
+   *
+   * Absent on receipts written before this existed and on `legacy_direct`
+   * releases, which have no build lineage to name. Absent means "no proven
+   * association" — never "probably the current lineage", and never something
+   * to fill in afterwards.
+   */
+  buildAuthority?: ReleaseBuildAuthority;
   status: ReleasePublicationStatus;
   /**
    * Present only while this release is unfinished, and absent once
