@@ -5235,6 +5235,69 @@ receipt, missing run history with a new run id, and terminal-then-fresh.
 **Unchanged:** Phases 5h, 5n and 5p semantics, the JobEngine, release
 authorisation, and the Phase 5k resume.
 
+## Central model invocation / model runtime authority — **DONE**
+
+**Every production model invocation now crosses one harness-owned boundary.**
+`ModelRuntime` (`packages/agents/src/runtime.ts`) sits above the existing
+`ModelClient`, which remains the provider adapter, and the one `OpenAiProvider`.
+All ten production call sites across the eight skills — Sol plan, route,
+adjudicate, replan and approve; Terra build (whole site, anchor, page) and
+review; Luna repair — call `runtime.invoke`. None of them holds a client.
+
+**Skill and tier identity are explicit.** Each invocation names its skill by the
+skill's existing name and its tier. `MODEL_SKILL_TIERS` is the one authority for
+which tier a skill runs at, and a mismatch or an unknown skill is refused before
+any provider call. Each invocation also gets a unique id, used for evidence and
+tracing only.
+
+**Model selection is unchanged.** Tier-to-model resolution (`modelFor`, the
+`MODEL_*` overrides), schema projection, strict Zod parsing, the
+`ModelRefusal` / `MalformedModelOutput` distinction and the single truncation
+retry all stay exactly where they were. The provider keeps its 20-minute timeout
+and transport retries. Prompts are byte-identical, and there is no new retry
+policy and no provider fallback.
+
+**Usage is reported by the runtime, not the caller.** The run constructs one
+runtime with its usage sink. The runtime reports each successful invocation
+exactly once, with the final attempt's usage — the same accounting as before.
+The ten caller-side `track` calls are gone, so a skill cannot skip reporting and
+a fabricated result cannot add to it. Failed invocations still report nothing.
+Durable budgets are untouched: they never counted tokens.
+
+**Cancellation now reaches the provider.** The Terra job handler's lease signal
+is forwarded through the build phase and the runtime to the provider request. An
+aborted call rejects with the caller's own abort reason — what its existing
+`throwIfAborted()` checks already raise — and is never retried or reported as
+usage.
+
+**Structurally enforced.** A test scans `packages`, `apps` and `scripts`, and
+nothing outside a named allowlist may reference `ModelClient`, a provider or the
+vendor SDK. The allowlist is the runtime, the adapter, the provider files, the
+re-export index, and the `model-check` operator diagnostic. The same test proves:
+
+- every skill invokes under its own name and tier;
+- no orchestrator module reports usage itself;
+- only `runProject` constructs the runtime;
+- the runtime imports no state, workspace, job-engine or filesystem authority.
+
+The acceptance, promotion, validation and policy boundary tests now forbid
+`ModelRuntime` as well as `ModelClient`.
+
+**Tests:**
+
+- **+31 unit tests:** runtime authority, mapping, usage, retry, refusal, malformed
+  output, provider failure, cancellation and the provider's timeout; every skill
+  call site; the structural boundary; phase-level signal forwarding.
+- **Two existing end-to-end suites** had asserted usage invented by faked skills.
+  Their review and approval fakes now go through the real runtime via a scripted
+  provider, and the parity suite asserts exactly two usage events for its one
+  review and one approval.
+
+**Not in this slice:** no tool gateway, no tool permissions, no model↔tool loop,
+and no new authority for models. The runtime returns typed results and never
+touches project state, artifacts, jobs, Git, promotion, release or recovery.
+Phase 5q is unchanged.
+
 ## Phases 6–17
 
 Not started.

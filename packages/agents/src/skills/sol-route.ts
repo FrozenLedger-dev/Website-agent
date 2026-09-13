@@ -13,7 +13,7 @@
  * documented default rather than failing the run.
  */
 import { SolRouteDecision, type BusinessProfile, type SitePlan } from '@statxai/contracts';
-import type { ModelClient } from '../client.js';
+import type { ModelCallOptions, ModelRuntime } from '../runtime.js';
 
 const SYSTEM = `You are Sol, the orchestrator for an autonomous website delivery platform.
 
@@ -79,12 +79,15 @@ export interface RouteContext {
 }
 
 export async function routeBuild(
-  client: ModelClient,
+  runtime: ModelRuntime,
   profile: BusinessProfile,
   plan: SitePlan,
   context: RouteContext,
+  options: ModelCallOptions = {},
 ) {
-  return client.call({
+  return runtime.invoke({
+    skill: 'sol-route',
+    ...(options.signal !== undefined ? { signal: options.signal } : {}),
     tier: 'sol',
     label: 'sol:route',
     system: SYSTEM,

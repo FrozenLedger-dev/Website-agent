@@ -18,6 +18,8 @@ export interface ProviderRequest {
   schemaName: string;
   maxTokens: number;
   effort: Effort;
+  /** Cancels the request. Transport detail, never part of the request body. */
+  signal?: AbortSignal;
 }
 
 export type StopReason = 'complete' | 'truncated' | 'refusal';

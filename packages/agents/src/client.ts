@@ -82,8 +82,10 @@ export interface CallOptions<T> {
   schema: z.ZodType<T>;
   maxTokens?: number;
   effort?: Effort;
-  /** Label used in usage reporting and as the provider-side schema name. */
+  /** Label used as the provider-side schema name. */
   label: string;
+  /** Forwarded to the provider. An aborted call rejects with the signal's own reason and is never retried. */
+  signal?: AbortSignal;
 }
 
 export interface CallResult<T> {
@@ -115,6 +117,7 @@ export class ModelClient {
       return await this.attempt(options);
     } catch (error) {
       if (!(error instanceof MalformedModelOutput) || !/truncated/.test(error.message)) throw error;
+      options.signal?.throwIfAborted();
 
       return this.attempt({
         ...options,
@@ -127,16 +130,28 @@ export class ModelClient {
   private async attempt<T>(options: CallOptions<T>): Promise<CallResult<T>> {
     const started = Date.now();
     const strict = this.provider.schemaDialect === 'strict';
+    options.signal?.throwIfAborted();
 
-    const response = await this.provider.complete({
-      model: modelFor(options.tier),
-      system: options.system,
-      prompt: options.prompt,
-      schema: strict ? toStrictModelSchema(options.schema) : toModelSchema(options.schema),
-      schemaName: options.label.replace(/[^a-zA-Z0-9_-]/g, '_'),
-      maxTokens: options.maxTokens ?? 32_000,
-      effort: options.effort ?? 'high',
-    });
+    let response;
+    try {
+      response = await this.provider.complete({
+        model: modelFor(options.tier),
+        system: options.system,
+        prompt: options.prompt,
+        schema: strict ? toStrictModelSchema(options.schema) : toModelSchema(options.schema),
+        schemaName: options.label.replace(/[^a-zA-Z0-9_-]/g, '_'),
+        maxTokens: options.maxTokens ?? 32_000,
+        effort: options.effort ?? 'high',
+        ...(options.signal !== undefined ? { signal: options.signal } : {}),
+      });
+    } catch (error) {
+      // Cancelled: surface the caller's own reason — exactly what the caller's
+      // `throwIfAborted()` would raise — rather than a provider-specific error.
+      if (options.signal?.aborted) throw options.signal.reason;
+      throw error;
+    }
+    // A provider that ignored the signal still never turns a cancelled call into a result.
+    options.signal?.throwIfAborted();
 
     if (response.stopReason === 'refusal') throw new ModelRefusal(response.refusalCategory);
     if (response.stopReason === 'truncated') {

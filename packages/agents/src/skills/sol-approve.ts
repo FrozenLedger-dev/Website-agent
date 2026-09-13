@@ -14,7 +14,7 @@
  * honest.
  */
 import { SolApprovalRecommendation, type BusinessProfile, type SitePlan } from '@statxai/contracts';
-import type { ModelClient } from '../client.js';
+import type { ModelRuntime } from '../runtime.js';
 
 const SYSTEM = `You are Sol, the orchestrator for an autonomous website delivery platform.
 
@@ -76,8 +76,9 @@ export interface ApprovalEvidence {
   releasePolicy: Readonly<Record<string, string>>;
 }
 
-export async function recommendApproval(client: ModelClient, evidence: ApprovalEvidence) {
-  return client.call({
+export async function recommendApproval(runtime: ModelRuntime, evidence: ApprovalEvidence) {
+  return runtime.invoke({
+    skill: 'sol-approve',
     tier: 'sol',
     label: 'sol:approve',
     system: SYSTEM,

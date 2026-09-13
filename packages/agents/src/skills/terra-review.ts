@@ -13,7 +13,7 @@ import {
   type GeneratedFile,
   type SitePlan,
 } from '@statxai/contracts';
-import type { ModelClient } from '../client.js';
+import type { ModelRuntime } from '../runtime.js';
 
 const SYSTEM = `You are Terra acting as an independent reviewer. You did not build this site.
 
@@ -58,7 +58,7 @@ export interface RepairedDefect {
 }
 
 export async function reviewSite(
-  client: ModelClient,
+  runtime: ModelRuntime,
   profile: BusinessProfile,
   plan: SitePlan,
   files: readonly GeneratedFile[],
@@ -93,7 +93,8 @@ ${repaired
   .join('\n\n')}
 `;
 
-  return client.call({
+  return runtime.invoke({
+    skill: 'terra-review',
     tier: 'terra',
     label: 'terra:review',
     system: SYSTEM,

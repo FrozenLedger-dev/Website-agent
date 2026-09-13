@@ -27,7 +27,7 @@
  */
 import type { AgentTier, ArtifactRef, BusinessProfile, SitePlan, TerminalOutcome } from '@statxai/contracts';
 import type { ArtifactRegistry, ProjectWorkspace } from '@statxai/workspace';
-import type { ModelClient } from '@statxai/agents';
+import type { ModelRuntime } from '@statxai/agents';
 import type { BudgetLimits, StateStore } from '@statxai/state';
 import type { ReleaseAuthorization } from '@statxai/policy-engine';
 import type { Defect } from './defects.js';
@@ -50,11 +50,13 @@ export interface RunDeps {
   store: StateStore;
   registry: ArtifactRegistry;
   workspace: ProjectWorkspace;
-  model: ModelClient;
+  /**
+   * The run's one model runtime. Every model call a phase makes goes through
+   * it, and it — not the phase — reports that call's usage to the run.
+   */
+  model: ModelRuntime;
   /** Emits a progress event and charges wall-clock to the phase it names. */
   say: Progress;
-  /** Records a model call against the run and its tier. */
-  track: (tier: AgentTier, r: { inputTokens: number; outputTokens: number; ms: number }) => void;
 }
 
 /** The canonical inputs. Nothing in a run may revise these. */

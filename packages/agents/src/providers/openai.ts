@@ -46,7 +46,7 @@ export class OpenAiProvider implements Provider {
           schema: request.schema,
         },
       },
-    });
+    }, request.signal ? { signal: request.signal } : undefined);
 
     const choice = completion.choices[0];
     const message = choice?.message;

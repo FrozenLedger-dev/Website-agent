@@ -19,7 +19,8 @@ import {
   type JobSpec,
 } from '@statxai/contracts';
 import {
-  ModelClient,
+  ModelRuntime,
+  type Provider,
 } from '@statxai/agents';
 import { BudgetExhausted, spend, type StateStore } from '@statxai/state';
 import type { FrontendBackendBuildBindingDocument } from '@statxai/state';
@@ -108,6 +109,12 @@ export interface RunOptions {
   autonomyMode?: 'full_autonomous' | 'supervised_autonomous' | 'human_in_the_loop';
   onProgress?: Progress;
   /**
+   * The provider beneath the run's model runtime. Production never sets it —
+   * the default provider is used — so this is the seam a test uses to drive
+   * real skills through the real runtime without a network call.
+   */
+  modelProvider?: Provider;
+  /**
    * Which implementation runs the `frontend_backend` build boundary.
    * Defaults to `'legacy_direct'` — Phase 5j establishes the cutover seam
    * without making `job_lifecycle` the production default. No caller in
@@ -140,7 +147,16 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     report(event);
   };
 
-  const model = new ModelClient();
+  /**
+   * The run's one model runtime. It reports every successful invocation's usage
+   * to `track` below exactly once — phases never report usage themselves, so a
+   * model call cannot go unaccounted because a caller forgot, and a result
+   * handed back from anywhere else cannot add to it.
+   */
+  const model = new ModelRuntime({
+    onUsage: (event) => track(event.tier, event),
+    ...(options.modelProvider !== undefined ? { provider: options.modelProvider } : {}),
+  });
   const registry = new ArtifactRegistry(store);
 
   /**
@@ -408,7 +424,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
    * and spent inside a transaction, because a snapshot is evidence for a
    * decision and never permission to skip the spend.
    */
-  const deps: RunDeps = { store, registry, workspace, model, say, track };
+  const deps: RunDeps = { store, registry, workspace, model, say };
   const facts: RunFacts = { projectId, profile, autonomyMode, budgetLimits };
 
   // -- Phase 2: Plan (or, resuming, the exact bound plan) --------------------
@@ -463,7 +479,6 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       workspacesRoot,
       validationWorkspacesRoot: options.validationWorkspacesRoot!,
       say,
-      track,
     }));
 
     if (recovered) {

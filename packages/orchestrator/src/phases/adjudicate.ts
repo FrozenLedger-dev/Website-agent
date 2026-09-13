@@ -124,7 +124,6 @@ export async function adjudicateDefects(
       },
       autonomyMode: facts.autonomyMode,
     });
-    deps.track('sol', decided);
 
     proposedAdjudication = {
       action: decided.value.action,

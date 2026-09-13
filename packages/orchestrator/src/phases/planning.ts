@@ -41,7 +41,6 @@ export async function producePlan(ctx: FixedContext, attempt: number): Promise<P
     detail: attempt === 0 ? 'Sol is producing the specification' : 'Sol is revising the specification',
   });
   const planned = await planSite(deps.model, facts.profile);
-  deps.track('sol', planned);
   const produced = planned.value;
 
   deps.say({
@@ -190,7 +189,6 @@ export async function revisePlan(
         reviewRejections: budget.limits.reviewRejections - budget.used.reviewRejections,
       },
     });
-    deps.track('sol', replanned);
 
     revisedPlan = replanned.value.revisedPlan;
     record.model = replanned.model;

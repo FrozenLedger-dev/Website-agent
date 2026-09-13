@@ -870,7 +870,7 @@ function coordinatorDeps() {
     store,
     registry,
     engine,
-    model: new AgentsModelClient(),
+    model: new AgentsModelRuntime(),
     workerIdentity: { workerId: 'terra-5m-1', tier: 'terra' as const },
     workspacesRoot,
     validationWorkspacesRoot,
@@ -886,10 +886,10 @@ const launchLegacy = async (projectId: string) => {
   return launchRun({ store, intake: INTAKE, workspacesRoot, frontendBackendExecutionMode: 'legacy_direct', projectId });
 };
 
-let AgentsModelClient: typeof Agents.ModelClient;
+let AgentsModelRuntime: typeof Agents.ModelRuntime;
 
 beforeAll(async () => {
-  AgentsModelClient = (await import('@statxai/agents')).ModelClient;
+  AgentsModelRuntime = (await import('@statxai/agents')).ModelRuntime;
 });
 
 describe('stale 5g-1 evidence cannot authorise acceptance after abandonment', () => {

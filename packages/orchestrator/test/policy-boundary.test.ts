@@ -109,7 +109,7 @@ describe('what the policy engine is not allowed to touch', () => {
       [/mongodb|MongoClient|collection\(/, 'database'],
       [/\bfetch\(|node:http/, 'network'],
       [/Date\.now\(|new Date\(/, 'clock'],
-      [/ModelClient|openai/i, 'model'],
+      [/ModelClient|ModelRuntime|openai/i, 'model'],
     ];
     for (const { file, code } of await policySources()) {
       for (const [pattern, what] of forbidden) {

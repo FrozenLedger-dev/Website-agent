@@ -22,7 +22,7 @@
 import type { ArtifactRef, JobOrigin, JobSpec, JobState } from '@statxai/contracts';
 import type { JobDocument, StateStore } from '@statxai/state';
 import { contentHash, type ArtifactRegistry, type BuildResult } from '@statxai/workspace';
-import type { ModelClient } from '@statxai/agents';
+import type { ModelRuntime } from '@statxai/agents';
 import { JobRunner, type JobEngine, type JobWorkerIdentity, type SleepFn } from '@statxai/job-engine';
 import {
   createTerraFrontendBackendHandler,
@@ -34,7 +34,7 @@ import {
 } from '../job-validation/frontend-backend.js';
 import { acceptValidatedFrontendBackendCandidate } from '../job-acceptance/frontend-backend.js';
 import { promoteAcceptedFrontendBackendCandidate } from '../job-promotion/frontend-backend.js';
-import type { Progress, RunDeps } from '../run-context.js';
+import type { Progress } from '../run-context.js';
 
 const ROLE = 'frontend_backend';
 
@@ -82,7 +82,7 @@ export interface FrontendBackendLifecycleDeps {
   readonly store: StateStore;
   readonly registry: ArtifactRegistry;
   readonly engine: JobEngine;
-  readonly model: ModelClient;
+  readonly model: ModelRuntime;
   /** Must be `tier: 'terra'` — this is specifically the production frontend_backend Terra lifecycle. */
   readonly workerIdentity: JobWorkerIdentity;
   /** Root of the canonical, harness-owned project workspaces Phase 5h promotes into. */
@@ -90,7 +90,6 @@ export interface FrontendBackendLifecycleDeps {
   /** Root under which Phase 5g-1 creates and tears down its own disposable validation workspace per call. */
   readonly validationWorkspacesRoot: string;
   readonly say?: Progress;
-  readonly track?: RunDeps['track'];
   readonly leaseMs?: number;
   readonly heartbeatEveryMs?: number;
   readonly now?: () => Date;
@@ -200,7 +199,6 @@ export function createFrontendBackendLifecycleCoordinator(
     registry: deps.registry,
     model: deps.model,
     ...(deps.say !== undefined ? { say: deps.say } : {}),
-    ...(deps.track !== undefined ? { track: deps.track } : {}),
   });
 
   const runner = new JobRunner({

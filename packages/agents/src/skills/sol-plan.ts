@@ -7,7 +7,7 @@
  * unfalsifiable.
  */
 import { SitePlan, type BusinessProfile } from '@statxai/contracts';
-import type { ModelClient } from '../client.js';
+import type { ModelRuntime } from '../runtime.js';
 
 const SYSTEM = `You are Sol, the project orchestrator for an autonomous website delivery platform.
 
@@ -116,8 +116,9 @@ photography. Be concrete enough to be checkable. For example:
 Do not write generic praise. "Clean, modern and professional" tells the builder nothing
 and produces exactly the site you would expect from it.`;
 
-export async function planSite(client: ModelClient, profile: BusinessProfile) {
-  return client.call({
+export async function planSite(runtime: ModelRuntime, profile: BusinessProfile) {
+  return runtime.invoke({
+    skill: 'sol-plan',
     tier: 'sol',
     label: 'sol:plan',
     system: SYSTEM,

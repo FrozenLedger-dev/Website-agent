@@ -34,10 +34,10 @@
 import type { ArtifactRef, WorkerRole } from '@statxai/contracts';
 import type { JobDocument } from '@statxai/state';
 import type { ArtifactRegistry } from '@statxai/workspace';
-import type { ModelClient } from '@statxai/agents';
+import type { ModelRuntime } from '@statxai/agents';
 import { jobOutputNamespace, type JobHandler, type JobHandlerResult } from '@statxai/job-engine';
 import { prepareBuildFromPlan, type BuildCandidate, type PrepareContext } from '../phases/build.js';
-import type { Progress, RunDeps, RunFacts } from '../run-context.js';
+import type { Progress, RunFacts } from '../run-context.js';
 
 const ROLE: WorkerRole = 'frontend_backend';
 
@@ -82,11 +82,10 @@ export function frontendBackendCandidateName(jobId: string, attempt: number): st
 
 export interface FrontendBackendHandlerDeps {
   registry: ArtifactRegistry;
-  model: ModelClient;
+  /** The model runtime — which also reports each call's usage to whoever constructed it. */
+  model: ModelRuntime;
   /** Defaults to a no-op: a job execution is not part of a `RunRecorder` run. */
   say?: Progress;
-  /** Defaults to a no-op, for the same reason. */
-  track?: RunDeps['track'];
 }
 
 function requiredRef(job: JobDocument, key: string): ArtifactRef {
@@ -110,7 +109,6 @@ function requiredRef(job: JobDocument, key: string): ArtifactRef {
  */
 export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDeps): JobHandler {
   const say: Progress = deps.say ?? (() => {});
-  const track: RunDeps['track'] = deps.track ?? (() => {});
 
   return async (job, ctx): Promise<JobHandlerResult> => {
     if (job.role !== ROLE) {
@@ -140,7 +138,7 @@ export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDe
     // so there is nothing here that could materialise into it before this
     // execution's authority is proven.
     const prepareContext: PrepareContext = {
-      deps: { model: deps.model, say, track },
+      deps: { model: deps.model, say },
       facts: { profile: profile as RunFacts['profile'] },
     };
     const candidate: BuildCandidate = await prepareBuildFromPlan(
@@ -149,9 +147,9 @@ export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDe
       ctx.signal,
     );
 
-    // The model call inside prepareBuildFromPlan cannot be cancelled once
-    // sent. Authority may have been lost while it was in flight; the result
-    // is checked again here, before it is even staged.
+    // The signal cancels the model call at the provider, but authority can
+    // still be lost the instant after it resolves; the result is checked again
+    // here, before it is even staged.
     ctx.signal.throwIfAborted();
 
     // Staged, not published. The name is namespaced under this exact job and

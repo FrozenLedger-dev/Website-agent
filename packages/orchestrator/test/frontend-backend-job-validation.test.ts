@@ -159,7 +159,7 @@ describe('the validator never touches job-lifecycle or acceptance authority', ()
     );
 
     expect(src).not.toMatch(/JobEngine/);
-    expect(src).not.toMatch(/ModelClient/);
+    expect(src).not.toMatch(/ModelClient|ModelRuntime/);
     expect(src).not.toMatch(/reviewSite|deploySite/);
     for (const call of [
       '.accept(',

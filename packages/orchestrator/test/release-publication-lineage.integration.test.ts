@@ -410,7 +410,7 @@ describe('receipt build authority', () => {
 
     const workspace = await ProjectWorkspace.open(projectId, workspacesRoot);
     const ctx = {
-      deps: { store, registry: new ArtifactRegistry(store), workspace, model: {} as never, say: () => {}, track: () => {} },
+      deps: { store, registry: new ArtifactRegistry(store), workspace, model: {} as never, say: () => {} },
       facts: { projectId, profile: { businessName: 'Acme' } as never, autonomyMode: 'full_autonomous' as const, budgetLimits: {} as never },
       progress: { qualityScore: 91, gatesCertified: ['build'], approvalModel: 'm', approvalArtifactVersion: 1, approvalDecision: 'accept' as const } as never,
     } as unknown as RunContext;

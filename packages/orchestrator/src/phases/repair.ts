@@ -98,7 +98,6 @@ export async function executeRepairs(
       ];
       try {
         const repaired = await repairDefect(deps.model, facts.profile, defect, context);
-        deps.track('luna', repaired);
 
         // Luna may only rewrite files it was given. Enforced here rather than
         // trusted to the prompt.

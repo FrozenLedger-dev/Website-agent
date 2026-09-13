@@ -204,7 +204,6 @@ export async function evaluateSite(ctx: RunContext): Promise<EvaluationOutcome> 
       return { kind: 'review_unavailable', reason: message };
     }
     reviewRan = true;
-    deps.track('terra', reviewed);
     qualityScore = reviewed.value.qualityScore;
 
     const reviewDefects = reviewed.value.issues.map(fromReviewIssue);

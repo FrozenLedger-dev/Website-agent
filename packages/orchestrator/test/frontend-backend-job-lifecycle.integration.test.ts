@@ -28,7 +28,7 @@ import { StateStore } from '@statxai/state';
 import { ArtifactRegistry, ProjectWorkspace, type BuildResult } from '@statxai/workspace';
 import type * as Workspace from '@statxai/workspace';
 import type * as Gates from '@statxai/gates';
-import { ModelClient, type Provider, type ProviderRequest, type ProviderResponse } from '@statxai/agents';
+import { ModelRuntime, type Provider, type ProviderRequest, type ProviderResponse } from '@statxai/agents';
 import { JobEngine } from '@statxai/job-engine';
 import type { ArtifactRef, JobSpec, SitePlan } from '@statxai/contracts';
 import type { BuildCandidate } from '../src/phases/build.js';
@@ -260,30 +260,30 @@ const buildOutput = (files: { path: string; contents: string }[]): ProviderRespo
   stopReason: 'complete',
 });
 
-function routingModel(terraBuild: (request: ProviderRequest) => ProviderResponse | Promise<ProviderResponse>): ModelClient {
-  return new ModelClient(
-    new FakeProvider((request) => {
+function routingModel(terraBuild: (request: ProviderRequest) => ProviderResponse | Promise<ProviderResponse>): ModelRuntime {
+  return new ModelRuntime({
+    provider: new FakeProvider((request) => {
       if (request.schemaName.startsWith('sol_route')) return solRouteOneShot();
       if (request.schemaName.startsWith('terra_build')) return terraBuild(request);
       throw new Error(`unexpected model call in test: ${request.schemaName}`);
     }),
-  );
+  });
 }
 
-function neverCalledModel(): ModelClient {
-  return new ModelClient(
-    new FakeProvider(() => {
+function neverCalledModel(): ModelRuntime {
+  return new ModelRuntime({
+    provider: new FakeProvider(() => {
       throw new Error('model must not be called in this test');
     }),
-  );
+  });
 }
 
-function successModel(contents = 'export default function Home(){return null}'): ModelClient {
+function successModel(contents = 'export default function Home(){return null}'): ModelRuntime {
   return routingModel(() => buildOutput([{ path: 'app/page.tsx', contents }]));
 }
 
 function coordinatorDeps(
-  model: ModelClient,
+  model: ModelRuntime,
   overrides: Partial<FrontendBackendLifecycleDeps> = {},
 ): FrontendBackendLifecycleDeps {
   return {

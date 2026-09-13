@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { StateStore } from '@statxai/state';
 import { ArtifactRegistry, ProjectWorkspace } from '@statxai/workspace';
-import { ModelClient, type Provider, type ProviderRequest, type ProviderResponse } from '@statxai/agents';
+import { ModelRuntime, type Provider, type ProviderRequest, type ProviderResponse } from '@statxai/agents';
 import { JobEngine, JobRunner, type JobHandler } from '@statxai/job-engine';
 import type { ArtifactRef, JobSpec, SitePlan } from '@statxai/contracts';
 import type { BuildCandidate } from '../src/phases/build.js';
@@ -132,7 +132,7 @@ function jobSpec(projectId: string, jobId: string, profileRef: ArtifactRef, plan
   };
 }
 
-function handlerDeps(model: ModelClient, overrides: Partial<FrontendBackendHandlerDeps> = {}): FrontendBackendHandlerDeps {
+function handlerDeps(model: ModelRuntime, overrides: Partial<FrontendBackendHandlerDeps> = {}): FrontendBackendHandlerDeps {
   return { registry, model, ...overrides };
 }
 
@@ -175,14 +175,14 @@ const buildOutput = (files: { path: string; contents: string }[]): ProviderRespo
 });
 
 /** Routes by the two calls this build makes; anything else is a test bug. */
-function routingModel(terraBuild: (request: ProviderRequest) => ProviderResponse | Promise<ProviderResponse>): ModelClient {
-  return new ModelClient(
-    new FakeProvider((request) => {
+function routingModel(terraBuild: (request: ProviderRequest) => ProviderResponse | Promise<ProviderResponse>): ModelRuntime {
+  return new ModelRuntime({
+    provider: new FakeProvider((request) => {
       if (request.schemaName.startsWith('sol_route')) return solRouteOneShot();
       if (request.schemaName.startsWith('terra_build')) return terraBuild(request);
       throw new Error(`unexpected model call in test: ${request.schemaName}`);
     }),
-  );
+  });
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
@@ -248,7 +248,7 @@ class ManualScheduler {
   }
 }
 
-function runnerFor(model: ModelClient, workerId = 'terra-frontend-backend-1', overrides: Partial<{ now: () => Date; sleep: ManualScheduler['sleep']; leaseMs: number; heartbeatEveryMs: number }> = {}) {
+function runnerFor(model: ModelRuntime, workerId = 'terra-frontend-backend-1', overrides: Partial<{ now: () => Date; sleep: ManualScheduler['sleep']; leaseMs: number; heartbeatEveryMs: number }> = {}) {
   return new JobRunner({
     engine,
     identity: { workerId, tier: 'terra' },

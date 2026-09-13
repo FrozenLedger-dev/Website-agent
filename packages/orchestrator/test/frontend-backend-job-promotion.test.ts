@@ -21,6 +21,7 @@ describe('the promotion module cannot reach a model, deployment, validation, or 
 
     for (const forbidden of [
       'ModelClient',
+      'ModelRuntime',
       'reviewSite',
       'deploySite',
       'DeployResult',

@@ -83,6 +83,7 @@ describe('the acceptance module cannot reach a model, the canonical workspace, o
     for (const forbidden of [
       'ProjectWorkspace',
       'ModelClient',
+      'ModelRuntime',
       'reviewSite',
       'deploySite',
       'scaffoldSite',

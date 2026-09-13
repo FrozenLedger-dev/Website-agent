@@ -13,7 +13,7 @@
  * and routing one through the other is what produced the defect.
  */
 import { SolReplanResult, type BusinessProfile, type SolReplanRequest } from '@statxai/contracts';
-import type { ModelClient } from '../client.js';
+import type { ModelRuntime } from '../runtime.js';
 
 const SYSTEM = `You are Sol, the orchestrator for an autonomous website delivery platform.
 
@@ -65,8 +65,9 @@ export interface ReplanEvidence extends SolReplanRequest {
   profile: BusinessProfile;
 }
 
-export async function replanSite(client: ModelClient, evidence: ReplanEvidence) {
-  return client.call({
+export async function replanSite(runtime: ModelRuntime, evidence: ReplanEvidence) {
+  return runtime.invoke({
+    skill: 'sol-replan',
     tier: 'sol',
     label: 'sol:replan',
     system: SYSTEM,

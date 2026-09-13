@@ -121,7 +121,6 @@ const context = (): RunContext =>
       },
       model: {},
       say: () => {},
-      track: () => {},
     },
     facts: { projectId: 'proj_test', profile: {}, autonomyMode: 'full_autonomous', budgetLimits: {} },
     progress: { reviewCycle: 2 },

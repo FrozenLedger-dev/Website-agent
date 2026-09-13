@@ -123,7 +123,6 @@ export async function seekRelease(
         'authorised by': RELEASE_POLICY_VERSION,
       },
     });
-    deps.track('sol', recommended);
 
     recommendation = recommended.value;
     checked = verifyAcknowledged(recommended.value.acknowledgedIssues, context.openNonBlocking);

@@ -14,7 +14,7 @@ import {
   type PageSpec,
   type SitePlan,
 } from '@statxai/contracts';
-import type { ModelClient } from '../client.js';
+import type { ModelCallOptions, ModelRuntime } from '../runtime.js';
 
 /**
  * lucide-react exports that are known to exist.
@@ -315,8 +315,10 @@ const SYSTEM = `You are Terra, a senior frontend engineer building a complete sm
 
 ${STACK}`;
 
-export async function buildSite(client: ModelClient, profile: BusinessProfile, plan: SitePlan) {
-  return client.call({
+export async function buildSite(runtime: ModelRuntime, profile: BusinessProfile, plan: SitePlan, options: ModelCallOptions = {}) {
+  return runtime.invoke({
+    skill: 'terra-build',
+    ...(options.signal !== undefined ? { signal: options.signal } : {}),
     tier: 'terra',
     label: 'terra:build',
     system: SYSTEM,
@@ -344,10 +346,12 @@ ${JSON.stringify(plan, null, 2)}`,
  * Every later page is built to match this, which is what keeps separately
  * generated pages looking like one site.
  */
-export async function buildAnchor(client: ModelClient, profile: BusinessProfile, plan: SitePlan) {
+export async function buildAnchor(runtime: ModelRuntime, profile: BusinessProfile, plan: SitePlan, options: ModelCallOptions = {}) {
   const home = plan.sitemap.pages.find((p) => p.route === HOME_ROUTE) ?? plan.sitemap.pages[0]!;
 
-  return client.call({
+  return runtime.invoke({
+    skill: 'terra-build',
+    ...(options.signal !== undefined ? { signal: options.signal } : {}),
     tier: 'terra',
     label: 'terra:build:anchor',
     system: SYSTEM,
@@ -387,14 +391,17 @@ ${JSON.stringify(home, null, 2)}`,
  * below the output ceiling that defeats the whole-site attempt.
  */
 export async function buildPage(
-  client: ModelClient,
+  runtime: ModelRuntime,
   profile: BusinessProfile,
   plan: SitePlan,
   page: PageSpec,
   anchorSource: string,
   layoutSource: string,
+  options: ModelCallOptions = {},
 ) {
-  return client.call({
+  return runtime.invoke({
+    skill: 'terra-build',
+    ...(options.signal !== undefined ? { signal: options.signal } : {}),
     tier: 'terra',
     label: `terra:build:${page.route}`,
     system: SYSTEM,

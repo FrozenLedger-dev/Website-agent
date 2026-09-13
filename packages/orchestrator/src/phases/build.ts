@@ -10,10 +10,9 @@
  *
  * `signal`, threaded optionally through every function here, is Phase 5e's:
  * `JobRunner` may lose lease authority mid-build, and a model call it cannot
- * cancel (`ModelClient` takes no signal today) can still resolve afterward.
- * Every durable write is preceded by `signal?.throwIfAborted()`, so a response
- * that arrives after authority is gone is read, tracked for telemetry, and
- * then discarded rather than persisted. The direct delivery loop never passes
+ * cancel is now cancelled at the provider through the model runtime, and every
+ * durable write is still preceded by `signal?.throwIfAborted()`, so a response
+ * that arrives after authority is gone is discarded rather than persisted. The direct delivery loop never passes
  * a signal, so `signal` is always `undefined` there and every check is a
  * no-op — this changes nothing about the path §2's runProject still uses.
  *
@@ -90,7 +89,7 @@ export interface BuildCandidate {
  * without ever opening the canonical project workspace at all.
  */
 export interface PrepareContext {
-  readonly deps: Pick<FixedContext['deps'], 'model' | 'say' | 'track'>;
+  readonly deps: Pick<FixedContext['deps'], 'model' | 'say'>;
   readonly facts: Pick<RunFacts, 'profile'>;
 }
 
@@ -133,8 +132,7 @@ async function decideStrategy(
       sectionCount: current.sitemap.pages.reduce((n, p) => n + p.sections.length, 0),
       serviceCount: facts.profile.services.length,
       permittedStrategies: permitted,
-    });
-    deps.track('sol', routed);
+    }, signal !== undefined ? { signal } : {});
 
     proposed = {
       action: routed.value.action,
@@ -201,13 +199,11 @@ async function executeOneShot(ctx: PrepareContext, current: SitePlan, signal?: A
   deps.say({ phase: 'build', detail: 'Terra is attempting the complete site in one pass' });
 
   signal?.throwIfAborted();
-  const built = await buildSite(deps.model, facts.profile, current);
-  deps.track('terra', built);
+  const built = await buildSite(deps.model, facts.profile, current, signal !== undefined ? { signal } : {});
 
-  // The call above cannot be cancelled once sent. Authority may have been
-  // lost while it was in flight, so the response is tracked for telemetry —
-  // it did happen — but the caller checks the signal again before treating
-  // this as something to publish.
+  // Authority may have been lost while the call was in flight. The runtime has
+  // already reported its usage — it did happen — and the caller checks the
+  // signal again before treating this as something to publish.
   signal?.throwIfAborted();
 
   deps.say({
@@ -227,8 +223,7 @@ async function executeOneShot(ctx: PrepareContext, current: SitePlan, signal?: A
 async function executeDecomposed(ctx: PrepareContext, current: SitePlan, signal?: AbortSignal): Promise<GeneratedFile[]> {
   const { deps, facts } = ctx;
   signal?.throwIfAborted();
-  const anchor = await buildAnchor(deps.model, facts.profile, current);
-  deps.track('terra', anchor);
+  const anchor = await buildAnchor(deps.model, facts.profile, current, signal !== undefined ? { signal } : {});
   signal?.throwIfAborted();
 
   // The homepage anchors the design system. Selecting by array order once put
@@ -244,10 +239,11 @@ async function executeDecomposed(ctx: PrepareContext, current: SitePlan, signal?
   const rest = current.sitemap.pages.filter((p) => p.route !== home.route);
   signal?.throwIfAborted();
   const pages = await Promise.all(
-    rest.map((page) => buildPage(deps.model, facts.profile, current, page, anchorSource, layoutSource)),
+    rest.map((page) =>
+      buildPage(deps.model, facts.profile, current, page, anchorSource, layoutSource, signal !== undefined ? { signal } : {}),
+    ),
   );
   signal?.throwIfAborted();
-  for (const page of pages) deps.track('terra', page);
   deps.say({ phase: 'build', detail: `${rest.length} further pages built in parallel`, level: 'ok' });
 
   return [...anchor.value.files, ...pages.flatMap((p) => p.value.files)];

@@ -8,7 +8,7 @@
  * by only accepting files the repair was scoped to touch.
  */
 import { BuildOutput, type BusinessProfile } from '@statxai/contracts';
-import type { ModelClient } from '../client.js';
+import type { ModelRuntime } from '../runtime.js';
 
 const SYSTEM = `You are Luna. You perform one narrow, surgical repair.
 
@@ -56,14 +56,15 @@ export interface RepairTask {
 }
 
 export async function repairDefect(
-  client: ModelClient,
+  runtime: ModelRuntime,
   profile: BusinessProfile,
   task: RepairTask,
   files: readonly { path: string; contents: string }[],
 ) {
   const rendered = files.map((f) => `=== FILE: ${f.path} ===\n${f.contents}`).join('\n\n');
 
-  return client.call({
+  return runtime.invoke({
+    skill: 'luna-repair',
     tier: 'luna',
     label: `luna:repair:${task.id}`,
     system: SYSTEM,

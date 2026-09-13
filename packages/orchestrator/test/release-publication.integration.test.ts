@@ -123,7 +123,6 @@ async function fixture(): Promise<Fixture> {
       workspace,
       model: {} as never,
       say: () => {},
-      track: () => {},
     },
     facts: {
       projectId,

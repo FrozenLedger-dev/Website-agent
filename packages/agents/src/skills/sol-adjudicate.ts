@@ -11,7 +11,7 @@
  * and there is no field through which Sol could change them.
  */
 import { SolAdjudicationDecision } from '@statxai/contracts';
-import type { ModelClient } from '../client.js';
+import type { ModelRuntime } from '../runtime.js';
 
 const SYSTEM = `You are Sol, the orchestrator for an autonomous website delivery platform.
 
@@ -106,8 +106,9 @@ export interface AdjudicationEvidence {
   autonomyMode: string;
 }
 
-export async function adjudicate(client: ModelClient, evidence: AdjudicationEvidence) {
-  return client.call({
+export async function adjudicate(runtime: ModelRuntime, evidence: AdjudicationEvidence) {
+  return runtime.invoke({
+    skill: 'sol-adjudicate',
     tier: 'sol',
     label: 'sol:adjudicate',
     system: SYSTEM,

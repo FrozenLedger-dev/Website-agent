@@ -21,6 +21,8 @@
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as Agents from '@statxai/agents';
+import type { ModelRuntime, ModelSkill, Provider } from '@statxai/agents';
+import * as z from 'zod/v4';
 import type * as Gates from '@statxai/gates';
 import type * as Workspace from '@statxai/workspace';
 import { StateStore } from '@statxai/state';
@@ -89,6 +91,32 @@ const PLAN = {
 
 const usage = { inputTokens: 10, outputTokens: 5, ms: 1 };
 
+/**
+ * Usage now comes only from the model runtime, never from a skill's return
+ * value. So the review and approval fakes hand their canned output to the real
+ * runtime, backed by a scripted provider, rather than inventing token counts —
+ * which keeps the exit-path telemetry assertions below measuring real usage.
+ */
+let scriptedOutput: unknown = null;
+const scriptedProvider: Provider = {
+  name: 'scripted',
+  schemaDialect: 'standard',
+  async complete(request) {
+    return { text: JSON.stringify(scriptedOutput), model: request.model, inputTokens: 10, outputTokens: 5, stopReason: 'complete' };
+  },
+};
+const throughRuntime = (runtime: ModelRuntime, skill: ModelSkill, value: unknown) => {
+  scriptedOutput = value;
+  return runtime.invoke({
+    skill,
+    tier: skill.startsWith('sol') ? 'sol' : 'terra',
+    label: skill,
+    system: '',
+    prompt: '',
+    schema: z.unknown(),
+  });
+};
+
 vi.mock('@statxai/agents', async (importOriginal) => {
   const actual = await importOriginal<typeof Agents>();
   return {
@@ -105,21 +133,17 @@ vi.mock('@statxai/agents', async (importOriginal) => {
       model: 'gpt-5.6-terra',
       ...usage,
     })),
-    reviewSite: vi.fn(async () => {
+    reviewSite: vi.fn(async (runtime: ModelRuntime) => {
       const r = next(reviewSequence);
-      return {
-        value: {
-          decision: r.blocking ? 'reject' : 'accept',
-          qualityScore: r.qualityScore,
-          blocking: r.blocking,
-          issues: r.issues,
-          summary: 's',
-        },
-        model: 'gpt-5.6-terra',
-        ...usage,
-      };
+      return throughRuntime(runtime, 'terra-review', {
+        decision: r.blocking ? 'reject' : 'accept',
+        qualityScore: r.qualityScore,
+        blocking: r.blocking,
+        issues: r.issues,
+        summary: 's',
+      });
     }),
-    recommendApproval: vi.fn(async () => ({ value: approval, model: 'gpt-5.6-sol', ...usage })),
+    recommendApproval: vi.fn(async (runtime: ModelRuntime) => throughRuntime(runtime, 'sol-approve', approval)),
     adjudicate: vi.fn(async () => ({ value: next(adjudications), model: 'gpt-5.6-sol', ...usage })),
     replanSite: vi.fn(),
     repairDefect: vi.fn(async (_client: unknown, _profile: unknown, task: { id: string }) => {
@@ -231,7 +255,7 @@ beforeEach(async () => {
 
 const run = async (projectId: string, autonomyMode: 'full_autonomous' | 'supervised_autonomous') => {
   const { runProject } = await import('../src/orchestrator.js');
-  return runProject({ projectId, intake: INTAKE, store, workspacesRoot: root, autonomyMode });
+  return runProject({ projectId, intake: INTAKE, store, workspacesRoot: root, autonomyMode, modelProvider: scriptedProvider });
 };
 
 describe('a delivery whose release Sol rejects', () => {
@@ -880,6 +904,7 @@ describe('a repair cycle that was refused every spend', () => {
       intake: INTAKE,
       store,
       workspacesRoot: root,
+    modelProvider: scriptedProvider,
       autonomyMode: 'full_autonomous',
       onProgress: (e) => {
         if (e.phase === 'repair' && e.detail.includes('written')) armAfterFirstRepair();

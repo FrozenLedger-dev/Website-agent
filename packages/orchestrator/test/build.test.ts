@@ -31,7 +31,7 @@
  * and passes against this one.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { ModelClient, type Provider, type ProviderRequest, type ProviderResponse } from '@statxai/agents';
+import { ModelRuntime, type Provider, type ProviderRequest, type ProviderResponse } from '@statxai/agents';
 import type { SitePlan } from '@statxai/contracts';
 import type { FixedContext, RunDeps, RunFacts } from '../src/run-context.js';
 import { buildFromPlan, prepareBuildFromPlan, publishBuildDirectly } from '../src/phases/build.js';
@@ -109,8 +109,8 @@ function rig(options: {
   const calls: string[] = [];
   let projectStateUpdated = false;
 
-  const model = new ModelClient(
-    new FakeProvider((request) => {
+  const model = new ModelRuntime({
+    provider: new FakeProvider((request) => {
       if (request.schemaName.startsWith('sol_route')) {
         calls.push('model:sol-route');
         options.onSolRoute?.();
@@ -123,7 +123,7 @@ function rig(options: {
       }
       throw new Error(`unexpected model call: ${request.schemaName}`);
     }),
-  );
+  });
 
   const registryPut = vi.fn(async (_projectId: string, name: string, _data: unknown) => {
     calls.push(`registry.put:${name}`);
@@ -162,7 +162,6 @@ function rig(options: {
     } as unknown as RunDeps['workspace'],
     model,
     say: () => {},
-    track: () => {},
   };
 
   return {
@@ -284,5 +283,22 @@ describe('cancellation checkpoints, each isolated from the others', () => {
 
     await expect(publishBuildDirectly(candidate, ctx, controller.signal)).rejects.toThrow();
     expect(commit).not.toHaveBeenCalled();
+  });
+});
+
+describe('the lease signal reaches the model provider', () => {
+  it('forwards the caller’s signal through the runtime to Sol routing and Terra building', async () => {
+    const { ctx } = rig();
+    const seen: { schema: string; signal: AbortSignal | undefined }[] = [];
+    const provider = new FakeProvider((request) => {
+      seen.push({ schema: request.schemaName, signal: request.signal });
+      return request.schemaName.startsWith('sol_route') ? solRouteOneShot() : buildOutput('export default function P(){return null}');
+    });
+    const controller = new AbortController();
+
+    await prepareBuildFromPlan({ ...ctx, deps: { ...ctx.deps, model: new ModelRuntime({ provider }) } }, plan(), controller.signal);
+
+    expect(seen.map((s) => s.schema)).toEqual(['sol_route', 'terra_build']);
+    expect(seen.every((s) => s.signal === controller.signal)).toBe(true);
   });
 });
