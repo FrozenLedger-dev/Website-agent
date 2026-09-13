@@ -25,7 +25,7 @@ import { join } from 'node:path';
 import * as z from 'zod/v4';
 import { GeneratedFile, type ArtifactRef, type BusinessProfile, type SitePlan } from '@statxai/contracts';
 import type { JobDocument } from '@statxai/state';
-import { ProjectWorkspace, scaffoldSite, type ArtifactRegistry, type BuildResult } from '@statxai/workspace';
+import { ProjectWorkspace, assertModelWritableFiles, scaffoldSite, type ArtifactRegistry, type BuildResult } from '@statxai/workspace';
 import { jobOutputNamespace } from '@statxai/job-engine';
 import { runDeterministicGates } from '../phases/evaluate.js';
 import type { BuildCandidate } from '../phases/build.js';
@@ -287,6 +287,11 @@ export async function validateFrontendBackendCandidate(
     throw new CandidateValidationShapeInvalid(job._id, parsed.error.issues.map((i) => i.message).join('; '));
   }
   const candidate = parsed.data as BuildCandidate;
+
+  // Refused before anything is created, scaffolded or compiled: a candidate
+  // that would replace package.json, a config file or a scaffold primitive
+  // never reaches `pnpm install` or `pnpm build`.
+  assertModelWritableFiles(candidate.files);
 
   const validationRoot = await mkdtemp(join(deps.validationWorkspacesRoot, `${job._id}-attempt${job.attempt}-`));
   try {

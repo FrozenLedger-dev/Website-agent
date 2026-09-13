@@ -33,30 +33,60 @@ export interface BuildResult {
 const WRITABLE_PREFIXES = ['app/', 'components/site/'] as const;
 
 export class WriteOutsideModelScope extends Error {
-  constructor(readonly path: string) {
+  /** Every refused path in the rejected set, in input order. */
+  readonly paths: readonly string[];
+
+  constructor(
+    readonly path: string,
+    paths: readonly string[] = [path],
+  ) {
     super(
-      `Refusing to write "${path}": the model may only write ${WRITABLE_PREFIXES.map((p) => `${p}**`).join(' and ')}.`,
+      `Refusing to write ${paths.map((p) => `"${p}"`).join(', ')}: the model may only write ` +
+        `${WRITABLE_PREFIXES.map((p) => `${p}**`).join(' and ')} (never components/ui/**).`,
     );
+    this.paths = paths;
     this.name = 'WriteOutsideModelScope';
   }
 }
 
 /**
- * True when a path is the model's to write.
+ * True when a path is the model's to write — checked exactly as spelled.
  *
  * `components/ui/**` is excluded deliberately: those are the shadcn primitives
  * the scaffold guarantees, and a builder that "fixes" one breaks every page
- * composing it. Config files and `package.json` are excluded because installing
- * model-authored dependencies would execute model-authored postinstall scripts.
+ * composing it. Config files, the lockfile and `package.json` are excluded
+ * because installing or building from model-authored manifests would execute
+ * model-authored scripts.
+ *
+ * Nothing is normalised first. A leading slash, a backslash, a drive letter,
+ * an empty, `.` or `..` segment, or any hidden segment (so `.env` and `.git`)
+ * is refused outright rather than rewritten into a path that would pass —
+ * an unauthorised spelling never becomes an authorised one.
  */
 export function isModelWritable(path: string): boolean {
-  const normalised = path.replace(/^\/+/, '');
-  if (normalised.startsWith('components/ui/')) return false;
-  return WRITABLE_PREFIXES.some((prefix) => normalised.startsWith(prefix));
+  if (path.length === 0 || path.startsWith('/') || path.includes('\\') || path.includes('\0')) return false;
+  if (/^[a-zA-Z]:/.test(path)) return false;
+  if (path.split('/').some((segment) => segment === '' || segment === '.' || segment === '..' || segment.startsWith('.'))) {
+    return false;
+  }
+  if (path.startsWith('components/ui/')) return false;
+  return WRITABLE_PREFIXES.some((prefix) => path.startsWith(prefix));
 }
 
 export function assertModelWritable(path: string): void {
   if (!isModelWritable(path)) throw new WriteOutsideModelScope(path);
+}
+
+/**
+ * The one check every model candidate passes before any of it is written.
+ *
+ * All or nothing: the whole set is examined first, and a single refused path
+ * rejects the candidate with every refused path named — so a mixed candidate
+ * never lands its permitted half.
+ */
+export function assertModelWritableFiles(files: readonly { readonly path: string }[]): void {
+  const refused = files.map((file) => file.path).filter((path) => !isModelWritable(path));
+  if (refused.length > 0) throw new WriteOutsideModelScope(refused[0]!, refused);
 }
 
 const SCAFFOLD_EXCLUDE = /(^|[/\\])(node_modules|\.next|out)([/\\]|$)/;

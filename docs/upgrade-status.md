@@ -5400,6 +5400,60 @@ for empty-segment and drive-letter paths now kill them.
 
 **Not implemented:** `test_runner`, browser, Git, shell and filesystem writes.
 
+## Model candidate write boundary — **DONE**
+
+**Why.** A `test_runner` gate stopped on a live hole. `GeneratedFile.path` accepts
+any string, and `isModelWritable` — meant to confine model output to `app/**`
+and `components/site/**` — was called by no production code. A candidate could
+replace `package.json`, the lockfile or a config file before `pnpm install` and
+`pnpm build` ran it in official validation, the direct build or canonical
+evaluation.
+
+**One shared boundary.** Every production path that lands model output reaches
+the file system only through `ProjectWorkspace.writeSiteFiles`: 5g-1 validation,
+the direct build (including a legacy replan rebuild), Luna repair and 5h
+promotion. That method now runs `assertModelWritableFiles` over the whole
+candidate before writing a single file. A job-lifecycle replan goes through the
+same validator and promotion. Trusted harness content is unaffected: the
+scaffold is copied by `scaffoldSite`, and harness records use
+`materialiseArtifact`.
+
+**Stricter ownership, no normalisation.** `isModelWritable` now decides on the
+path exactly as spelled:
+
+- **Refused:** a leading `/`, backslashes, NUL, drive letters, empty, `.` or `..`
+  segments, and hidden segments (`.env`, `.git`); also `components/ui/**`
+  (scaffold-owned) and anything outside `app/` and `components/site/`.
+- **All or nothing:** a mixed candidate is rejected whole, naming every refused
+  path.
+- **Reads unchanged:** `safeSitePath` still guards reads by containment.
+- **Changed on purpose:** a leading-slash path used to be rewritten to
+  site-relative. It is now refused, so a model emitting `/app/page.tsx` fails
+  closed. Current Terra and Luna prompts name bare `app/...` paths.
+
+**Refused before any side effect.** The 5g-1 validator checks immediately after
+parsing the candidate, before creating its temp workspace, scaffolding or
+compiling. 5h promotion checks before the fence, the receipt or any canonical
+write. A refused validation leaves the job `validating`, as a malformed
+candidate already did.
+
+**Tests.** The ownership rules cover every forbidden form, and mixed candidates
+write nothing. The validator refuses `package.json`, the lockfile, `next.config`,
+`tsconfig`, `components/ui` and mixed candidates with zero compiles and zero temp
+workspaces. Promotion leaves no receipt, no fence and no canonical change. The
+direct build commits nothing. A structural test pins the four materialisers, the
+check-before-write order, the single ownership rule and both replan paths.
+Fixtures that faked foreign canonical edits through `writeSiteFiles` now write
+to disk directly, and old normalisation expectations were updated.
+Focused mutations: 11 of 13 killed. The two survivors — removing the explicit
+`components/ui` exclusion and removing the drive-letter check — are equivalent
+under the allowlist, since neither path can start with `app/` or
+`components/site/`; both stay as defence in depth.
+
+**Not in this slice:** sandboxing. Page code still executes during `next build`
+with harness privileges; that isolation is the next prerequisite before a
+`test_runner`.
+
 ## Phases 6–17
 
 Not started.

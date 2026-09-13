@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   WriteOutsideModelScope,
   assertModelWritable,
+  assertModelWritableFiles,
   ensureStylesheetPrelude,
   isModelWritable,
   readSourceFiles,
@@ -49,15 +50,65 @@ describe('model write scope', () => {
     expect(() => assertModelWritable(path)).toThrow(WriteOutsideModelScope);
   });
 
-  it('normalises a leading slash before deciding', () => {
-    expect(isModelWritable('/app/page.tsx')).toBe(true);
+  it.each([
+    'app/services/team/page.tsx',
+    'app/favicon.ico',
+    'components/site/nav/menu.tsx',
+  ])('allows nested model-namespace path %s', (path) => {
+    expect(isModelWritable(path)).toBe(true);
+  });
+
+  it.each([
+    ['env file', '.env'],
+    ['env file inside app', 'app/.env.local'],
+    ['git internals', '.git/config'],
+    ['git internals inside app', 'app/.git/HEAD'],
+    ['traversal', '../app/page.tsx'],
+    ['traversal back out of the namespace', 'app/../package.json'],
+    ['dot segment', 'app/./page.tsx'],
+    ['empty segment', 'app//page.tsx'],
+    ['absolute path', '/etc/passwd'],
+    ['drive letter', 'C:/app/page.tsx'],
+    ['backslash', 'app\\page.tsx'],
+    // Starts inside the namespace, but is a traversal wherever `\\` separates paths.
+    ['backslash traversal inside the namespace', 'app/x\\..\\..\\package.json'],
+    ['bare namespace prefix', 'app/'],
+    ['namespace name alone', 'app'],
+    ['case-altered ui path', 'components/site/../UI/button.tsx'],
+    ['lib', 'lib/utils.ts'],
+    ['public asset root', 'public/logo.svg'],
+  ])('refuses %s (%s)', (_label, path) => {
+    expect(isModelWritable(path)).toBe(false);
+  });
+
+  it('checks a whole candidate at once and names every refused path', () => {
+    const error = (() => {
+      try {
+        assertModelWritableFiles([
+          { path: 'app/page.tsx' },
+          { path: 'package.json' },
+          { path: 'components/ui/button.tsx' },
+          { path: 'components/site/header.tsx' },
+        ]);
+        return null;
+      } catch (e) {
+        return e;
+      }
+    })();
+    expect(error).toBeInstanceOf(WriteOutsideModelScope);
+    expect((error as WriteOutsideModelScope).paths).toEqual(['package.json', 'components/ui/button.tsx']);
+    expect(() => assertModelWritableFiles([{ path: 'app/page.tsx' }, { path: 'components/site/a.tsx' }])).not.toThrow();
+  });
+
+  it('refuses a leading slash rather than normalising it into a writable path', () => {
+    expect(isModelWritable('/app/page.tsx')).toBe(false);
     expect(isModelWritable('/package.json')).toBe(false);
   });
 
   it('does not let a ui path masquerade as a site path', () => {
-    expect(isModelWritable('components/site/../ui/button.tsx')).toBe(true);
-    // The path guard in ProjectWorkspace resolves traversal; this check is
-    // about ownership, so both layers are required and neither is sufficient.
+    // Ownership is decided on the path exactly as spelled, so a traversal that
+    // would resolve into components/ui is refused before any resolution runs.
+    expect(isModelWritable('components/site/../ui/button.tsx')).toBe(false);
   });
 });
 

@@ -31,6 +31,11 @@
  * and passes against this one.
  */
 import { describe, expect, it, vi } from 'vitest';
+import { existsSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ProjectWorkspace, WriteOutsideModelScope } from '@statxai/workspace';
 import { ModelRuntime, type Provider, type ProviderRequest, type ProviderResponse } from '@statxai/agents';
 import type { SitePlan } from '@statxai/contracts';
 import type { FixedContext, RunDeps, RunFacts } from '../src/run-context.js';
@@ -300,5 +305,36 @@ describe('the lease signal reaches the model provider', () => {
 
     expect(seen.map((s) => s.schema)).toEqual(['sol_route', 'terra_build']);
     expect(seen.every((s) => s.signal === controller.signal)).toBe(true);
+  });
+});
+
+describe('the direct build path honours the model-writable boundary', () => {
+  it('a candidate with one forbidden file writes and commits nothing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'statxai-direct-boundary-'));
+    try {
+      const workspace = await ProjectWorkspace.open('proj_direct_boundary', root);
+      const { ctx } = rig();
+      const commit = vi.spyOn(workspace, 'commit');
+      const real = { ...ctx, deps: { ...ctx.deps, workspace } } as FixedContext;
+
+      await expect(
+        publishBuildDirectly(
+          {
+            routeDecisions: [],
+            files: [
+              { path: 'app/page.tsx', contents: 'fine' },
+              { path: 'next.config.ts', contents: 'export default {}' },
+            ],
+          },
+          real,
+        ),
+      ).rejects.toBeInstanceOf(WriteOutsideModelScope);
+
+      expect(commit).not.toHaveBeenCalled();
+      expect(existsSync(join(workspace.siteRoot, 'app/page.tsx'))).toBe(false);
+      expect(await workspace.currentCommit()).toBeNull();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

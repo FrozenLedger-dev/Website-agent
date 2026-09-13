@@ -33,7 +33,14 @@ import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ArtifactRef } from '@statxai/contracts';
 import type { JobDocument, JobPromotionRecord, StateStore } from '@statxai/state';
-import { ProjectWorkspace, contentHash, scaffoldSite, scaffoldTemplatePaths, type ArtifactRegistry } from '@statxai/workspace';
+import {
+  ProjectWorkspace,
+  assertModelWritableFiles,
+  contentHash,
+  scaffoldSite,
+  scaffoldTemplatePaths,
+  type ArtifactRegistry,
+} from '@statxai/workspace';
 import { jobOutputNamespace, type JobEngine } from '@statxai/job-engine';
 import { CandidateShape } from '../job-validation/frontend-backend.js';
 import type { BuildCandidate } from '../phases/build.js';
@@ -380,6 +387,9 @@ export async function promoteAcceptedFrontendBackendCandidate(
     throw new PromotionCandidateShapeInvalid(job._id, parsed.error.issues.map((i) => i.message).join('; '));
   }
   const candidate = parsed.data as BuildCandidate;
+  // Refused before the fence, the receipt or any canonical write — never a
+  // half-started promotion over a candidate that could not land anyway.
+  assertModelWritableFiles(candidate.files);
 
   const binding: PromotionBinding = { projectId: job.projectId, jobId: job._id, attempt: job.attempt, output: outputRef };
   const promotionId = computePromotionId(binding);

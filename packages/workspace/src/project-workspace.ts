@@ -15,6 +15,7 @@ import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import type { GeneratedFile } from '@statxai/contracts';
+import { assertModelWritableFiles } from './site-build.js';
 
 const exec = promisify(execFile);
 
@@ -110,8 +111,18 @@ export class ProjectWorkspace {
     return relative(this.root, this.safeSitePath(path));
   }
 
-  /** Write generated site files. Returns the paths actually written. */
+  /**
+   * Write model-generated site files. Returns the paths actually written.
+   *
+   * The model-candidate write boundary: every production path that lands model
+   * output — validation, the direct build, repair, promotion — comes through
+   * here, so the model-writable check runs once, for all of them, over the
+   * whole set before a single file is written. Trusted harness content never
+   * uses this: the scaffold is copied by `scaffoldSite`, and harness records go
+   * through `materialiseArtifact`.
+   */
   async writeSiteFiles(files: readonly GeneratedFile[]): Promise<string[]> {
+    assertModelWritableFiles(files);
     const written: string[] = [];
     for (const file of files) {
       const target = this.safeSitePath(file.path);
