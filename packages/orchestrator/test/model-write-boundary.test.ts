@@ -60,6 +60,8 @@ describe('the model-candidate write boundary', () => {
       'packages/orchestrator/src/job-validation/frontend-backend.ts',
       'packages/orchestrator/src/phases/build.ts',
       'packages/orchestrator/src/phases/repair.ts',
+      // Advisory measurement of a proposed build: a disposable workspace, the same boundary.
+      'packages/orchestrator/src/tool-gateway/test-runner.ts',
     ]);
   });
 

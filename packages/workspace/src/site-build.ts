@@ -33,6 +33,8 @@ export interface BuildResult {
   output: string;
   /** Directory containing the exported static site. */
   outDir: string;
+  /** Present only when the build was terminated for exceeding a sandbox limit. */
+  limit?: 'time' | 'memory';
 }
 
 /** Paths the model may write. Everything else is platform-owned. */
@@ -250,6 +252,7 @@ export async function buildSite(siteRoot: string, options: BuildSiteOptions = {}
     durationMs: Date.now() - started,
     output: tail([run.output, verdict].filter(Boolean).join('\n')),
     outDir,
+    ...(run.timedOut ? { limit: 'time' as const } : run.oomKilled ? { limit: 'memory' as const } : {}),
   };
 }
 

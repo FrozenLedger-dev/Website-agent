@@ -31,7 +31,9 @@
  * A validating job's staged candidate is not accepted, promoted or deployed
  * by anything in this phase — that is the next slice's work.
  */
-import type { ArtifactRef, FilesystemReadResult, ToolId, WorkerRole } from '@statxai/contracts';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { ArtifactRef, ToolId, ToolResult, WorkerRole } from '@statxai/contracts';
 import type { JobDocument } from '@statxai/state';
 import { defaultTemplateRoot, type ArtifactRegistry } from '@statxai/workspace';
 import type { ModelRuntime } from '@statxai/agents';
@@ -40,6 +42,7 @@ import { prepareBuildFromPlan, type BuildCandidate, type PrepareContext } from '
 import type { Progress, RunFacts } from '../run-context.js';
 import { effectiveTools, ToolGateway } from '../tool-gateway/gateway.js';
 import { createScaffoldFilesystemAdapter } from '../tool-gateway/filesystem.js';
+import { createTestRunnerAdapter } from '../tool-gateway/test-runner.js';
 
 const ROLE: WorkerRole = 'frontend_backend';
 
@@ -47,7 +50,7 @@ const ROLE: WorkerRole = 'frontend_backend';
  * The tools this handler implements. A job's grant is intersected with this,
  * so a spec naming more cannot make the handler capable of more.
  */
-export const FRONTEND_BACKEND_SUPPORTED_TOOLS: readonly ToolId[] = Object.freeze(['filesystem']);
+export const FRONTEND_BACKEND_SUPPORTED_TOOLS: readonly ToolId[] = Object.freeze(['filesystem', 'test_runner']);
 
 /**
  * Defense in depth at the adapter boundary. `JobRunner`'s `claimableRoles`
@@ -95,10 +98,27 @@ export interface FrontendBackendHandlerDeps {
   /** Defaults to a no-op: a job execution is not part of a `RunRecorder` run. */
   say?: Progress;
   /**
-   * The gateway every tool call from this handler crosses. Defaults to one
-   * registering only the read-only scaffold filesystem.
+   * The gateway every tool call from this handler crosses. Defaults to one per
+   * job registering exactly the read-only scaffold filesystem and the advisory
+   * test runner bound to that job's pinned profile and plan.
    */
   tools?: ToolGateway;
+  /** Where advisory test builds create their disposable workspaces. */
+  advisoryWorkspacesRoot?: string;
+}
+
+/** The production gateway for one claimed job: exactly the two tools this handler supports. */
+export function createFrontendBackendToolGateway(options: { profile: unknown; plan: unknown; advisoryWorkspacesRoot: string }): ToolGateway {
+  return new ToolGateway({
+    adapters: [
+      createScaffoldFilesystemAdapter({ root: defaultTemplateRoot() }),
+      createTestRunnerAdapter({
+        profile: options.profile as RunFacts['profile'],
+        plan: options.plan as Parameters<typeof prepareBuildFromPlan>[1],
+        workspacesRoot: options.advisoryWorkspacesRoot,
+      }),
+    ],
+  });
 }
 
 function requiredRef(job: JobDocument, key: string): ArtifactRef {
@@ -122,8 +142,7 @@ function requiredRef(job: JobDocument, key: string): ArtifactRef {
  */
 export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDeps): JobHandler {
   const say: Progress = deps.say ?? (() => {});
-  const gateway =
-    deps.tools ?? new ToolGateway({ adapters: [createScaffoldFilesystemAdapter({ root: defaultTemplateRoot() })] });
+  const advisoryWorkspacesRoot = deps.advisoryWorkspacesRoot ?? join(tmpdir(), 'statxai-advisory');
 
   return async (job, ctx): Promise<JobHandlerResult> => {
     if (job.role !== ROLE) {
@@ -147,6 +166,8 @@ export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDe
 
     ctx.signal.throwIfAborted();
 
+    const gateway = deps.tools ?? createFrontendBackendToolGateway({ profile, plan, advisoryWorkspacesRoot });
+
     // No workspace, artifact acceptance, or store mutation happens here or
     // inside prepareBuildFromPlan — generation only calls the model. The
     // canonical project workspace is never opened by this handler at all,
@@ -162,7 +183,7 @@ export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDe
         tools: {
           grantedTools: effectiveTools(job.spec.allowedTools, FRONTEND_BACKEND_SUPPORTED_TOOLS),
           execute: (request, signal) =>
-            gateway.execute<FilesystemReadResult>({
+            gateway.execute<ToolResult>({
               tool: request.tool,
               input: request.input,
               context: {

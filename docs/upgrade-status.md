@@ -5612,6 +5612,151 @@ Sources were restored byte-identical after each mutation.
 **Not in this slice:** `test_runner` and browser rendering. The future
 `test_runner` should be a thin adapter over `runSandboxed`.
 
+## Bounded Terra test feedback — the second real tool — **DONE**
+
+**Why.** Terra could read the scaffold but not check a build before answering, so
+a type error or blocking gate finding surfaced only at official validation. With
+the sandbox in place (`b69e841`), Terra can ask the platform to measure a
+proposed build first.
+
+**One execution core, advisory only.** `test_runner` (`tool-gateway/test-runner.ts`)
+takes a proposed `BuildOutput` and measures it exactly as 5g-1 validation does:
+
+1. **Refuse** unless every file is model-writable (`assertModelWritableFiles`).
+2. **Materialise** a fresh disposable workspace from the platform scaffold via
+   `writeSiteFiles`.
+3. **Measure** with `runDeterministicGates` — the same sandboxed build and the
+   same gates that official validation and canonical evaluation run.
+4. **Clean up**: the workspace is removed however the run ends.
+
+The adapter starts no process, and holds no store, registry, job engine or
+project workspace. It cannot record authentic validation, accept, promote,
+release or change project state. The official validator still validates Terra's
+final `BuildOutput` from scratch, even when it is byte-identical to a candidate
+that already passed. Advisory builds run one at a time per job.
+
+**Contract** (`contracts/tools.ts`).
+
+- **Input:** `TestRunnerInput` is a strict `{ candidate: BuildOutput }`. A
+  command, working directory, environment, Docker option or limit is refused,
+  not ignored.
+- **Result (`TestRunnerResult`):**
+  - `status`: `passed`, `failed`, `timed_out`, `refused` or `unavailable`;
+  - `passed`, `candidateHash`, and `compile` (`{ ok, diagnostics }`);
+  - `findings` (`{ gate, severity, location, message }`, most severe first),
+    `findingCount`, `refusedPaths` and `truncated`.
+- **Outcomes:**
+  - a compile failure or blocking gate finding is a successful tool call with
+    `passed: false`;
+  - a sandbox time-limit hit is `timed_out` (`BuildResult` gained an optional
+    `limit` field);
+  - `SandboxUnavailable` is `unavailable`;
+  - any other infrastructure error, or cancellation, fails the tool call.
+- **Bounds:**
+  - at most 20 findings, 400 characters per message and 160 per location;
+  - 3,000 characters of compiler-diagnostic tail, and 12 KB for the whole result;
+  - text passes through the sandbox sanitizer again.
+  - For scale: gate message templates run 60–111 characters, and a real measured
+    scaffold page returned 2 findings in 550 bytes.
+
+**Authority.**
+
+- **Grant:** `frontend_backend` `JobSpec.allowedTools` is now exactly
+  `['filesystem', 'test_runner']`. That changes the deterministic `jobId` of new
+  frontend_backend specs.
+- **Handler:** `FRONTEND_BACKEND_SUPPORTED_TOOLS` matches. Permission is still
+  the intersection of the two.
+- **Gateway:** the handler builds one per claimed job, registering exactly the
+  scaffold filesystem and a test runner bound to that job's pinned profile and
+  plan. The model never supplies them.
+- **Replan:** a job-lifecycle replan uses the same factory and handler, so it gets
+  the same grant. The legacy direct build still receives no tool access.
+- **Other skills:** Sol and Luna receive no tools.
+- **Evidence:** records `candidateHash`, `files`, `status`, `passed` and
+  `findings`, never candidate source (new adapter `summarize` hook).
+
+**Loop** (`terra-build.ts`, still one `runtime.invoke` site serving whole-site,
+anchor and page builds).
+
+- **Protocol:** each turn is exactly one strict action — a `filesystem` read, a
+  `test_runner` request whose input must be `{ candidate }`, or a final
+  `BuildOutput`.
+- **Bounds:**
+  - model turns stay at 4 (read → test → retest → final fits);
+  - reads stay at 3, and file feedback at 24 KB;
+  - tests are capped at 2, independently of reads.
+- **Duplicates:** an exact duplicate request is served from the build's own
+  record. It spends a turn but not a run.
+- **Cancellation:** stops the loop between every step. Tools create no model
+  usage; only turns do.
+
+**Tests.**
+
+- **`terra-tool-loop.test.ts`:**
+  - flows: test-only; read → test → final; failed test → corrected final;
+    test → test → final (3 usage events, 2 runs);
+  - limits: a third test refused; duplicate caching; budget independence;
+    last-turn refusal;
+  - scope: all three call shapes, and cancellation with no further turn;
+  - strictness: command, cwd, env, malformed-candidate and crossed inputs are
+    refused.
+- **`test-runner.test.ts`:**
+  - permission denied by the JobSpec and by the handler;
+  - strict input;
+  - outcomes: passed; compile failure (sanitized, bounded, still `succeeded`
+    evidence); gate findings (sorted and bounded); `timed_out`; `unavailable`;
+    infrastructure failure; `refused` manifest;
+  - cancellation reaching the build with no gates after;
+  - independent serialised workspaces, and safe evidence.
+- **`terra-test-feedback.test.ts`:** the real handler and gateway, from a read
+  through a failed test and a corrected test to the staged final. Also zero-tool
+  answers, the default gateway, Sol, a filesystem-only grant being denied, and a
+  lease lost mid-test.
+- **`terra-test-feedback.integration.test.ts` (Mongo):**
+  - a byte-identical candidate that passed `test_runner` is still validated
+    officially, then accepted and promoted;
+  - when official validation fails, the advisory pass accepts, promotes and
+    changes nothing;
+  - an advisory result is not authentic, and a forged validation built from it is
+    refused, as is promotion.
+- **`test-runner.integration.test.ts` (Docker):** a real TS2322 failure; a
+  hostile candidate that reports no secrets, no sentinel, no network and the
+  trusted manifest; real gate findings; unchanged canonical workspace and HEAD;
+  real cancellation leaving no containers.
+- **Structural:**
+  - exactly two adapters, both constructed only by the handler;
+  - the adapter path is write boundary → workspace → `runDeterministicGates` with
+    cleanup, and nothing else;
+  - no validation, acceptance, promotion, release, job or project authority;
+  - one loop with independent budgets;
+  - the replan grant is untouched, and only the handler supplies tool access.
+
+**Mutations: 24 of 24 killed.** Each ran against the tool, loop, runtime and
+sandbox unit and structural suites, plus the matching integration test where one
+applies; sources were restored byte-identical after each.
+
+- **Behavioural suites:**
+  - permission removed, union instead of intersection, and forced grant;
+  - bypassing `BuildOutput` validation, or accepting a command, cwd or
+    environment;
+  - bypassing the sandbox — structural, unit and real sandbox;
+  - `process.env` back in the build — sandbox unit and the real hostile probe;
+  - recording authentic validation — structural and the Mongo acceptance test;
+  - compile failure thrown as an infrastructure failure;
+  - removing the diagnostic bounds or sanitisation;
+  - removing the test or turn limit;
+  - cancellation not stopping the next turn;
+  - a duplicate rerunning the sandbox;
+  - a test creating model usage;
+  - a Terra call shape bypassing the loop.
+- **Structural suite only**, because these are code-shape properties with no
+  runtime entry point: Sol or Luna gaining `ToolAccess`, advisory code importing
+  acceptance or promotion, and the replan grant being edited.
+- **Mongo lifecycle test only:** skipping official validation after an advisory
+  pass.
+
+**Not in this slice:** browser rendering, screenshots and visual review.
+
 ## Phases 6–17
 
 Not started.

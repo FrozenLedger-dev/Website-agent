@@ -13,12 +13,14 @@ import {
   type BusinessProfile,
   type PageSpec,
   type SitePlan,
+  type ToolId,
 } from '@statxai/contracts';
 import type * as z from 'zod/v4';
 import type { ModelCallOptions, ModelInvocationResult, ModelRuntime } from '../runtime.js';
 import {
   TERRA_MAX_MODEL_TURNS,
   TERRA_MAX_RETURNED_BYTES,
+  TERRA_MAX_TEST_RUNS,
   TERRA_MAX_TOOL_CALLS,
   TerraBuildAction,
   ToolLoopBudgetExhausted,
@@ -336,24 +338,56 @@ interface TerraBuildRequest {
   readonly effort: 'high' | 'xhigh';
 }
 
-function inspectionSection(transcript: readonly string[], remaining: number): string {
-  return `
+interface LoopState {
+  readonly transcript: readonly string[];
+  readonly readsLeft: number;
+  readonly testsLeft: number;
+}
 
-INSPECTING THE SCAFFOLD
+function toolSection(granted: readonly ToolId[], state: LoopState): string {
+  const reads = granted.includes('filesystem');
+  const tests = granted.includes('test_runner');
+  const sections: string[] = [];
+  const actions: string[] = [];
+
+  if (reads) {
+    sections.push(`INSPECTING THE SCAFFOLD
 Your files are added to a fixed platform scaffold you have not been shown: the
 shadcn components in components/ui/, the theme in app/globals.css, the template
 app/layout.tsx, lib/utils.ts, package.json and its configuration. Before
-answering you may read up to ${remaining} more of those files, one per response —
+answering you may read up to ${state.readsLeft} more of those files, one per response —
 to check a component's exact props and variants, or the theme you are extending.
-Paths are relative to the site root. Reading never changes anything.
+Paths are relative to the site root. Reading never changes anything.`);
+    actions.push('  {"action":"tool","tool":"filesystem","input":{"path":"components/ui/card.tsx"},"output":null}');
+  }
+  if (tests) {
+    sections.push(`TESTING A CANDIDATE
+You may test up to ${state.testsLeft} more complete proposed build outputs before answering.
+The platform adds your files to the scaffold, compiles the site in its sandbox
+and runs its deterministic gates, then tells you whether it passed, the
+compiler's diagnostics and the gate findings — so you can fix what failed. You
+choose only the candidate; the platform decides how it is built. A test is
+advisory: your final answer is validated again regardless. When you are asked
+for only some files, they are tested alone against the scaffold, so findings
+about routes you were not asked to build are expected. Testing the same
+candidate twice returns the same result.`);
+    actions.push('  {"action":"tool","tool":"test_runner","input":{"candidate":<a complete build output>},"output":null}');
+  }
+  actions.push('  {"action":"final","tool":null,"input":null,"output":<the complete build output>}');
+
+  return `
+
+${sections.join('\n\n')}
 
 Respond with exactly one JSON action:
-  {"action":"tool","tool":"filesystem","input":{"path":"components/ui/card.tsx"},"output":null}
-  {"action":"final","tool":null,"input":null,"output":<the complete build output>}
+${actions.join('\n')}
 
-FILES READ SO FAR
-${transcript.length === 0 ? '(none)' : transcript.join('\n\n')}`;
+TOOL RESULTS SO FAR
+${state.transcript.length === 0 ? '(none)' : state.transcript.join('\n\n')}`;
 }
+
+/** The tools this loop knows how to offer. Anything else granted is never described. */
+const LOOP_TOOLS: readonly ToolId[] = ['filesystem', 'test_runner'];
 
 /**
  * Every Terra build invocation, bounded.
@@ -362,19 +396,22 @@ ${transcript.length === 0 ? '(none)' : transcript.join('\n\n')}`;
  * and schema a build always had. With them, each turn is still one ordinary
  * runtime invocation — its own usage, the same skill and tier — whose answer is
  * either one tool request, carried out by the harness's gateway and fed back,
- * or the final build. Bounded by turns, tool calls and returned bytes, and
- * stopped by the signal between every step. Callers only ever see the final
- * `BuildOutput`.
+ * or the final build. Bounded by turns, file reads, candidate tests and
+ * returned file bytes, each independently, and stopped by the signal between
+ * every step. A repeated request is answered from this build's own record
+ * without running again. Callers only ever see the final `BuildOutput`.
  */
 async function invokeTerraBuild(
   runtime: ModelRuntime,
   request: TerraBuildRequest,
   options: TerraBuildOptions,
 ): Promise<ModelInvocationResult<BuildOutput>> {
-  const tools = options.tools?.grantedTools.includes('filesystem') ? options.tools : undefined;
+  const granted = options.tools?.grantedTools.filter((tool) => LOOP_TOOLS.includes(tool)) ?? [];
+  const tools = granted.length > 0 ? options.tools : undefined;
   const transcript: string[] = [];
   const answered = new Map<string, string>();
-  let toolCalls = 0;
+  let reads = 0;
+  let tests = 0;
   let returnedBytes = 0;
 
   for (let turn = 0; turn < (tools ? TERRA_MAX_MODEL_TURNS : 1); turn += 1) {
@@ -388,7 +425,9 @@ async function invokeTerraBuild(
       schema: (tools ? TerraBuildAction : BuildOutput) as z.ZodType<unknown>,
       maxTokens: request.maxTokens,
       effort: request.effort,
-      prompt: tools ? request.prompt + inspectionSection(transcript, TERRA_MAX_TOOL_CALLS - toolCalls) : request.prompt,
+      prompt: tools
+        ? request.prompt + toolSection(granted, { transcript, readsLeft: TERRA_MAX_TOOL_CALLS - reads, testsLeft: TERRA_MAX_TEST_RUNS - tests })
+        : request.prompt,
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
     });
 
@@ -397,22 +436,28 @@ async function invokeTerraBuild(
     const action = result.value as TerraBuildAction;
     if (action.action === 'final') return { ...result, value: action.output! };
 
-    // A repeat of a read already answered is served from this build's own
-    // record: it executes nothing and spends no tool call, but it still spends
-    // a turn — which is what keeps the turn limit meaningful on its own.
+    // A repeat of a request already answered — the same file, or the exact same
+    // candidate — is served from this build's own record: it executes nothing
+    // and spends no tool budget, but it still spends a turn, which is what keeps
+    // the turn limit meaningful on its own.
+    const testing = action.tool === 'test_runner';
     const key = JSON.stringify([action.tool, action.input]);
     let fed = answered.get(key);
-    if (fed === undefined && toolCalls >= TERRA_MAX_TOOL_CALLS) {
+    if (fed === undefined && testing && tests >= TERRA_MAX_TEST_RUNS) {
+      throw new ToolLoopBudgetExhausted('test_runs', TERRA_MAX_TEST_RUNS);
+    }
+    if (fed === undefined && !testing && reads >= TERRA_MAX_TOOL_CALLS) {
       throw new ToolLoopBudgetExhausted('tool_calls', TERRA_MAX_TOOL_CALLS);
     }
-    // A read requested on the last turn could never be used: refused before it runs.
+    // A request made on the last turn could never be used: refused before it runs.
     if (turn + 1 >= TERRA_MAX_MODEL_TURNS) throw new ToolLoopBudgetExhausted('model_turns', TERRA_MAX_MODEL_TURNS);
     options.signal?.throwIfAborted();
 
     if (fed === undefined) {
-      toolCalls += 1;
+      if (testing) tests += 1;
+      else reads += 1;
       const outcome = await tools.execute({ tool: action.tool!, input: action.input }, options.signal);
-      if (outcome.ok) {
+      if (outcome.tool === 'filesystem' && outcome.ok) {
         returnedBytes += Buffer.byteLength(outcome.content, 'utf8');
         if (returnedBytes > TERRA_MAX_RETURNED_BYTES) {
           throw new ToolLoopBudgetExhausted('returned_bytes', TERRA_MAX_RETURNED_BYTES);

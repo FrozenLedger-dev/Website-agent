@@ -89,7 +89,7 @@ describe('the production frontend_backend grant', () => {
     const { runtime, requests } = terra([read('components/ui/button.tsx'), final()]);
     const { registry: reg, put } = registry();
     const claimed = createFrontendBackendJobSpec({ projectId: PROJECT, businessProfileRef: profileRef, sitePlanRef: planRef });
-    expect(claimed.allowedTools).toEqual(['filesystem']);
+    expect(claimed.allowedTools).toEqual(['filesystem', 'test_runner']);
 
     const handler = createTerraFrontendBackendHandler({ registry: reg, model: runtime });
     await handler(job(claimed.allowedTools), { signal: new AbortController().signal });

@@ -11,9 +11,10 @@
  * different answer from forbidden. Nothing is looked up dynamically: the
  * registry is the adapters the harness constructed.
  *
- * What is not a tool, and never registered here: candidate materialisation,
- * validation, acceptance, promotion, commits, state writes and release
- * publication. Those are the harness's own operations.
+ * What is not a tool, and never registered here: official validation,
+ * acceptance, promotion, commits, state writes and release publication. Those
+ * are the harness's own operations. `test_runner` measures a candidate the way
+ * validation does, but records nothing and establishes nothing.
  *
  * The gateway holds no credentials and records evidence only through the sink
  * it is given — never the input or the result, only safe metadata.
@@ -40,6 +41,8 @@ export interface ToolAdapter<I = unknown, R = unknown> {
   execute(input: I, signal?: AbortSignal): Promise<R>;
   /** Non-secret facts about one call, for evidence. */
   describe(input: I): Readonly<Record<string, string>>;
+  /** Non-secret facts about a completed call's result, added to its evidence. */
+  summarize?(result: R): Readonly<Record<string, string>>;
 }
 
 export interface ToolEvidence {
@@ -157,7 +160,7 @@ export class ToolGateway {
     try {
       const result = (await adapter.execute(parsed.data, signal)) as R;
       signal?.throwIfAborted();
-      record('succeeded', detail);
+      record('succeeded', { ...detail, ...adapter.summarize?.(result) });
       return result;
     } catch (error) {
       record(signal?.aborted ? 'cancelled' : 'failed', detail);

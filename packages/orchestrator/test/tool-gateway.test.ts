@@ -146,8 +146,8 @@ describe('permission', () => {
 });
 
 describe('what is registered', () => {
-  it('the frontend_backend handler supports exactly the one executable tool', () => {
-    expect(FRONTEND_BACKEND_SUPPORTED_TOOLS).toEqual(['filesystem']);
+  it('the frontend_backend handler supports exactly the two executable tools', () => {
+    expect(FRONTEND_BACKEND_SUPPORTED_TOOLS).toEqual(['filesystem', 'test_runner']);
   });
 
   it('a gateway refuses to register one tool twice', () => {

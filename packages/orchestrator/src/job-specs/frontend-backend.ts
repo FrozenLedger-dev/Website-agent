@@ -24,12 +24,13 @@ const OBJECTIVE = 'Build the site from the approved plan.';
 const ACCEPTANCE_CRITERIA = Object.freeze(['site files written from the approved plan']);
 
 /**
- * The durable tool grant for every `frontend_backend` job: read-only
- * inspection of the platform scaffold its build is added to, through the tool
- * gateway. Nothing else — the handler supports nothing else either, and the
- * gateway allows only what both agree on.
+ * The durable tool grant for every `frontend_backend` job, through the tool
+ * gateway: read-only inspection of the platform scaffold its build is added
+ * to, and advisory sandboxed measurement of a proposed build. Nothing else —
+ * the handler supports nothing else either, and the gateway allows only what
+ * both agree on.
  */
-const ALLOWED_TOOLS = Object.freeze(['filesystem'] as const);
+const ALLOWED_TOOLS = Object.freeze(['filesystem', 'test_runner'] as const);
 
 /**
  * The one logical output identity every `frontend_backend` job for a given

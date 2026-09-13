@@ -89,6 +89,8 @@ export interface FrontendBackendLifecycleDeps {
   readonly workspacesRoot: string;
   /** Root under which Phase 5g-1 creates and tears down its own disposable validation workspace per call. */
   readonly validationWorkspacesRoot: string;
+  /** Where Terra's advisory `test_runner` builds create disposable workspaces. Defaults under the OS temp directory. */
+  readonly advisoryWorkspacesRoot?: string;
   readonly say?: Progress;
   readonly leaseMs?: number;
   readonly heartbeatEveryMs?: number;
@@ -199,6 +201,7 @@ export function createFrontendBackendLifecycleCoordinator(
     registry: deps.registry,
     model: deps.model,
     ...(deps.say !== undefined ? { say: deps.say } : {}),
+    ...(deps.advisoryWorkspacesRoot !== undefined ? { advisoryWorkspacesRoot: deps.advisoryWorkspacesRoot } : {}),
   });
 
   const runner = new JobRunner({
