@@ -68,6 +68,11 @@ export interface ApprovalEvidence {
   gateFindings: readonly string[];
   buildSummary: string;
   reviewSummary: string | null;
+  /**
+   * The rendered visual quality review from this evaluation, already rendered as
+   * text that names its exact artifact and screenshot set. Advisory evidence.
+   */
+  visualReview: string | null;
   openNonBlocking: readonly { id: string; severity: string; category: string; location: string; reason: string }[];
   repairHistory: readonly { defectId: string; outcome: string }[];
   replanCount: number;
@@ -105,6 +110,9 @@ ${evidence.gateFindings.map((f) => `  ${f}`).join('\n') || '  no findings'}
 
 INDEPENDENT REVIEW
 ${evidence.reviewSummary ?? '  (not run this cycle)'}
+
+RENDERED VISUAL QUALITY REVIEW (advisory; Terra judged the rendered pages)
+${evidence.visualReview ?? '  (not run this cycle)'}
 
 OPEN NON-BLOCKING ISSUES (${evidence.openNonBlocking.length})
 ${

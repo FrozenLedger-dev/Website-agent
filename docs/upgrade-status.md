@@ -6048,6 +6048,180 @@ container debris cleared after each.
 **Not in this slice:** multimodal review, visual scoring, refinement,
 customer or editor UI, and any browser tool.
 
+## Multimodal Terra visual review — **DONE**
+
+**Why.** Every quality judgement so far read source or HTML text. The exact
+screenshot set from `b9ef481` lets Terra judge the rendered pixels a visitor
+actually sees.
+
+**Gate findings.**
+
+- **Provider path:** text-only. `ProviderRequest` had one prompt string, and
+  `OpenAiProvider` sent a string user message. The installed SDK (openai 7.4.0)
+  accepts base64 data-URL `image_url` parts.
+- **Provider image limits:** fit into 2048 px, then the shortest side scaled to
+  768 at high detail. A 1440×16,000 capture sent whole would be about 184 px wide,
+  so tall captures need deterministic derivatives.
+- **Existing `visual-review`:** textual (source and exported HTML against
+  `ReviewOutcomeInput`, P0–P3 defects that can block). It is also read by
+  latest-version lookups in `release.ts` and the console. Those lookups are
+  untouched.
+
+**Runtime.** `ModelInvocation`, `CallOptions` and `ProviderRequest` gain an
+optional `images` field of labelled PNG bytes.
+
+- **Provider:** `OpenAiProvider.userContent` sends each label, then the image, as
+  a high-detail base64 data URL.
+- **Text-only:** a request without images stays a plain string, byte-for-byte.
+- **Retries:** a truncation retry keeps the images.
+- **Usage:** one invocation is still one usage event, from the runtime alone.
+
+**Frames (`statxai-visual-review-frames@1`, `workspace/src/review-frames.ts`).**
+
+- **Decoder:** exact, for 8-bit RGB and RGBA non-interlaced PNGs (all five
+  filters), verified on real Chromium captures. Anything else is refused.
+- **Framing:**
+  - frames are one viewport tall at native width, never scaled;
+  - at most 4 per capture; a taller page is sampled evenly from its top to its
+    bottom, never only the hero;
+  - encoding is deterministic (filter 0, fixed deflate level);
+  - each frame records route, viewport, index and count, offset, size, sha256,
+    and its source screenshot's sha256 and height.
+- **Budget:** 48 frames and 20 MB per review. Frames per capture drop first; then
+  captures beyond the budget, in set order, are listed as `notReviewed`.
+- **Immutability:** durable screenshots are only read.
+
+**Contract (`contracts/visual-review.ts`).**
+
+- **Model output, `VisualQualityAssessment`:** strict.
+  - `overallScore` plus 8 scores, all integers 0–100: `composition`,
+    `typography`, `spacingRhythm`, `hierarchy`, `brandDistinctiveness`,
+    `assetQuality`, `conversionClarity`, `mobileQuality`;
+  - `summary`, `routeReviews`, `strengths`;
+  - `issues`: VQ id, route, viewports, dimension, severity (major, moderate,
+    minor), problem, direction;
+  - `antiPatterns` from a fixed list of 10 template patterns;
+  - up to 10 ranked `refinementPriorities`.
+  - Nothing executable.
+- **Persisted artifact, `visual-quality-review` (`VisualQualityReview`,
+  `statxai-visual-review@1`):**
+  - the frame policy version, the exact `screenshotSet` ref, the screenshot
+    policy version and the exact subject;
+  - `status` and coverage: expected and reviewed targets, `missing` with
+    reasons, `notReviewed`, and `complete`;
+  - the frames, the assessment, the failure, and the reviewer's skill, tier,
+    model, invocation ID and tokens.
+- **Historical `visual-review`:** keeps its name and textual meaning, is still
+  written, and does not parse as a multimodal review.
+
+**Review (`phases/visual-review.ts`, `reviewScreenshotSetVisually`).**
+
+- **Inputs:** the set is read by the exact ref via `registry.resolve`. Every
+  image is read by its exact blob key and re-hashed against the set's recorded
+  sha256 and byte count.
+- **Fail closed:** a missing, altered or undecodable image is `evidence_invalid`,
+  with no model call. A set with nothing captured, or nothing fitting the budget,
+  is `no_evidence`.
+- **Invocation:** one `terra-review` invocation (label `terra:visual-review`) with
+  the frames as images, plus the brand system, pages, a list of targets not
+  shown, and concise browser findings.
+- **Model failures:**
+  - a refusal is `refused`;
+  - a malformed answer is `malformed_output`;
+  - any other error is `provider_failed`;
+  - an answer describing a target it was not shown is also `malformed_output`,
+    with no assessment kept.
+- **Persistence:** every outcome writes an additive `visual-quality-review`, and
+  the exact ref is returned.
+
+**Integration.** `evaluateSite` runs:
+
+> screenshot set → visual review → the existing textual review
+
+and returns `visualQualityReview` (exact ref plus content).
+
+- **Sol:** `seekRelease` and `adjudicateDefects` receive it from the evaluation,
+  never by lookup. Both Sol prompts gain a "rendered visual quality review"
+  section naming `visual-quality-review@N of screenshot-set@M`. The approval
+  record stores the exact `visualQualityReview` ref.
+- **Advisory:** no defect, gate, adjudication or release policy changes.
+- **Authority:** no tools (the ToolGateway stays filesystem and test_runner), no
+  build output, and no files, Git, jobs, promotion or deployment.
+
+**Tests.**
+
+- **`terra-visual-review.test.ts`:**
+  - labelled images reach the request, with one usage event;
+  - the prompt names all 8 scores and 10 patterns, and the schema has nothing
+    executable;
+  - out-of-range, missing score, build-output and unknown-dimension answers are
+    malformed;
+  - refusal and provider failure stay distinct, and a truncation retry keeps its
+    images;
+  - OpenAI request contract: `image_url` data URLs of the exact bytes, and
+    text-only requests unchanged.
+- **`review-frames.test.ts`:** all filters for RGB and RGBA; refusal of anything
+  undecodable; the offset policy, including even top-to-bottom sampling; exact
+  frame rows; the source untouched; determinism.
+- **`visual-review.integration.test.ts` (Mongo):**
+  - desktop, tablet, mobile and the second route all reach the request as real
+    frame bytes;
+  - the tall page gets 4 frames to the bottom; the durable blob is unchanged;
+  - provenance: exact set ref, both policy versions and the subject;
+  - coverage names the missing target, and full coverage is not claimed;
+  - reads the given set, not a newer one;
+  - an unseen-target answer is malformed; repeated reviews are additive;
+  - corrupt, missing and set-hash-mismatched blobs fail closed with no call;
+  - refusal, malformed output and provider failure each keep their status;
+  - no evidence means no call; the budget reduction is deterministic;
+  - a historical textual review is not parsed as multimodal.
+- **`screenshot-capture.integration.test.ts`:** real Chromium PNGs decode and
+  frame exactly.
+- **Parity:** Sol's evidence names the exact review, and the approval record
+  stores its exact ref; lineage gains `visual-quality-review@1`.
+- **Phase 5q recovery:** re-evaluation writes a fresh set and review bound to the
+  recovered binding.
+- **`visual-review-boundary.test.ts` (structural):**
+  - only `terra-review` sends images, in one runtime invocation, and only the
+    provider builds image parts;
+  - the skill has no tools, build output or files;
+  - only the phase calls the skill, and only evaluation runs the phase;
+  - the phase uses `resolve` and `put` only, reads by blob key, re-hashes, and
+    has no lookups;
+  - no tool, file, Git, job, promotion or deployment authority;
+  - evaluation order, exact hand-off to Sol, and no refinement consumers.
+
+**Mutations: 22 of 22 killed.** Each ran against the visual-review structural,
+agents, frame, browser and tool-gateway unit suites, plus the phase, parity or
+recovery integration tests where applicable. Sources were restored
+byte-identical after each.
+
+- **Phase suite:**
+  - the set resolved by latest, and the set-hash check removed;
+  - the desktop image, mobile image or second route omitted, and a tall page
+    reduced to its hero;
+  - an incomplete review marked complete;
+  - the set ref, screenshot policy version or review schema version omitted.
+- **Agents contract and runtime suite:**
+  - the composition, brandDistinctiveness or mobileQuality score omitted, and
+    score range validation removed;
+  - the model call bypassing `ModelRuntime`, and images replaced by a text-only
+    prompt;
+  - usage recorded twice, the skill given tool permission, and a `BuildOutput`
+    accepted as a review.
+- **Parity suite plus structural:** Sol recording a latest-lookup reference,
+  instead of the exact ref.
+- **Parity lineage and Sol evidence tests:** the multimodal review written under
+  the historical `visual-review` name.
+- **Parity, Phase 5q recovery and structural tests:** evaluation skipping visual
+  review.
+
+**Known flake:** the pre-existing `acceptance vs abandonment race` integration
+test is timing-sensitive. It failed once in 18 runs with this change, passed 8 of
+8 at baseline, and exercises no code this capability touches.
+
+**Not in this slice:** visual refinement, customer UI, and any browser tool.
+
 ## Phases 6–17
 
 Not started.

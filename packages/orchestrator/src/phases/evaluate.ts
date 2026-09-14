@@ -30,6 +30,7 @@ import {
   readSourceFiles,
   type BuildResult,
 } from '@statxai/workspace';
+import { reviewScreenshotSetVisually, type VisualQualityReviewOutcome } from './visual-review.js';
 import { blocking, buildFailureDefect, fromGateFinding, fromReviewIssue, mergeByFingerprint, type Defect } from '../defects.js';
 import type { RunContext } from '../run-context.js';
 
@@ -96,6 +97,12 @@ export interface Evaluation {
    * rendered. Handed on by reference: nothing looks it up again.
    */
   screenshotSet: ArtifactRef | null;
+  /**
+   * Terra's multimodal review of exactly that screenshot set — its exact
+   * reference and content — or null when there was no set. Advisory: it adds
+   * no defect and blocks nothing.
+   */
+  visualQualityReview: VisualQualityReviewOutcome | null;
   /** Source files a repair may edit. Read even when the build failed. */
   sources: SourceFiles;
   /** Export path → the source file that produced it, for scoping a repair. */
@@ -257,6 +264,25 @@ export async function evaluateSite(ctx: RunContext, subject: EvaluationSubject):
     });
   }
 
+  // Terra looks at the exact screenshots just written — by reference, never "the latest".
+  const visualQualityReview = screenshots
+    ? await reviewScreenshotSetVisually(
+        { registry: deps.registry, blobs: new BlobStore(deps.store), model: deps.model },
+        { projectId: facts.projectId, profile: facts.profile, plan: progress.plan, screenshotSet: screenshots.ref, browserRender },
+      )
+    : null;
+  if (visualQualityReview) {
+    const { review } = visualQualityReview;
+    deps.say({
+      phase: 'evaluate',
+      detail:
+        review.status === 'reviewed'
+          ? `Visual review: overall ${review.assessment!.overallScore}, ${review.assessment!.issues.length} issues, ${review.coverage.reviewedTargets}/${review.coverage.expectedTargets} targets`
+          : `Visual review ${review.status}${review.failure ? `: ${review.failure.detail}` : ''}`,
+      level: review.status === 'reviewed' ? 'ok' : 'warn',
+    });
+  }
+
   let defects: Defect[] = gateDefects;
 
   if (blockingGates.length === 0) {
@@ -312,6 +338,7 @@ export async function evaluateSite(ctx: RunContext, subject: EvaluationSubject):
     gateRun,
     browserRender,
     screenshotSet: screenshots?.ref ?? null,
+    visualQualityReview,
     sources,
     sourceOf,
     reviewSummary,

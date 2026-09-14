@@ -9,10 +9,23 @@
  */
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
+/**
+ * One image the model sees alongside the prompt, in order. Bytes only — how a
+ * vendor wants them encoded is the provider's business. `label` is shown to the
+ * model immediately before the image, so each image arrives already named.
+ */
+export interface ModelImage {
+  readonly label: string;
+  readonly mediaType: 'image/png';
+  readonly data: Uint8Array;
+}
+
 export interface ProviderRequest {
   model: string;
   system: string;
   prompt: string;
+  /** Images following the prompt, in order. Absent or empty: a text-only request, exactly as before. */
+  images?: readonly ModelImage[];
   /** JSON Schema in whichever dialect the provider accepts. */
   schema: Record<string, unknown>;
   schemaName: string;

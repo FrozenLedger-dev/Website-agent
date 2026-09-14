@@ -325,6 +325,14 @@ describe('post-promotion recovery re-enters evaluation', () => {
     expect(calls.terra).toBe(0);
     expect(calls.compile).toBe(1); // evaluation, and only evaluation, ran again
     expect(calls.review).toBe(1);
+    // Re-evaluation made fresh, exact visual evidence, bound to the recovered canonical build.
+    const sets = await store.artifacts.find({ projectId, name: 'screenshot-set' }).toArray();
+    const reviews = await store.artifacts.find({ projectId, name: 'visual-quality-review' }).toArray();
+    expect(sets).toHaveLength(1);
+    expect(reviews).toHaveLength(1);
+    const review = reviews[0]!.data as { screenshotSet: { version: number }; subject: { authority: unknown } };
+    expect(review.screenshotSet.version).toBe(sets[0]!.version);
+    expect(review.subject.authority).toEqual({ mode: 'job_lifecycle', buildBindingId: binding!._id, promotionId: binding!.promotionId, promotionCommitSha: binding!.promotionCommitSha });
     expect(await countArtifacts(projectId, 'business-profile')).toBe(profileVersions);
     expect(await store.jobs.countDocuments({ projectId })).toBe(jobs);
     expect(await store.promotions.countDocuments({ projectId })).toBe(promotions);

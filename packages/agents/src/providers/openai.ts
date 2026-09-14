@@ -1,5 +1,5 @@
 import OpenAI from 'openai';
-import type { Effort, Provider, ProviderRequest, ProviderResponse } from './types.js';
+import type { Effort, ModelImage, Provider, ProviderRequest, ProviderResponse } from './types.js';
 
 /**
  * OpenAI provider.
@@ -36,7 +36,7 @@ export class OpenAiProvider implements Provider {
       reasoning_effort: toReasoningEffort(request.effort),
       messages: [
         { role: 'system', content: request.system },
-        { role: 'user', content: request.prompt },
+        { role: 'user', content: userContent(request.prompt, request.images) },
       ],
       response_format: {
         type: 'json_schema',
@@ -64,6 +64,25 @@ export class OpenAiProvider implements Provider {
       refusalCategory: message?.refusal ?? null,
     };
   }
+}
+
+/**
+ * The user turn. Text-only requests stay a plain string, byte-for-byte what they
+ * always were; images follow the prompt as base64 data URLs at high detail, each
+ * preceded by its label so the model knows which route and viewport it shows.
+ */
+export function userContent(
+  prompt: string,
+  images: readonly ModelImage[] | undefined,
+): string | ({ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string; detail: 'high' } })[] {
+  if (!images || images.length === 0) return prompt;
+  return [
+    { type: 'text', text: prompt },
+    ...images.flatMap((image) => [
+      { type: 'text' as const, text: image.label },
+      { type: 'image_url' as const, image_url: { url: `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`, detail: 'high' as const } },
+    ]),
+  ];
 }
 
 /** This provider caps the schema name at 64 characters; labels can exceed it. */

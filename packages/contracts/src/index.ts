@@ -6,3 +6,4 @@ export * from './model-schemas.js';
 export * from './decisions.js';
 export * from './tools.js';
 export * from './browser.js';
+export * from './visual-review.js';

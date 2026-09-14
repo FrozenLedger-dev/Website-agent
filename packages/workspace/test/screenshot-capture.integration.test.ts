@@ -18,7 +18,10 @@ import {
   BlobStore,
   SANDBOX_LABEL,
   buildSite,
+  MAX_FRAMES_PER_CAPTURE,
   captureInBrowser,
+  decodePng,
+  frameScreenshot,
   persistScreenshotSet,
   pngDimensions,
   scaffoldSite,
@@ -143,10 +146,15 @@ describe('a real Next.js export', () => {
 describe('representative pages', () => {
   let set: ScreenshotSet;
   let reportFindings: Map<string, string[]>;
+  /** Real Chromium PNG bytes, read back from the blob store right after capture (each test starts with an empty store). */
+  const realPngs = new Map<string, Buffer>();
 
   beforeAll(async () => {
     const result = await captureAndPersist(['/', '/long', '/error', '/external', '/animated', '/responsive', '/missing', '/stall'], { readiness: { readyTimeoutMs: 3_000, closeTimeoutMs: 2_000 } });
     set = result.set;
+    for (const capture of set.captures.filter((c) => c.image && (c.route === '/long' || c.route === '/'))) {
+      realPngs.set(`${capture.route}@${capture.viewport.name}`, await blobs.get(capture.image!.blob));
+    }
     reportFindings = new Map(result.outcome.report.renders.map((r) => [`${r.route}@${r.viewport}`, r.findings.map((f) => f.category)]));
   }, 900_000);
 
@@ -159,6 +167,27 @@ describe('representative pages', () => {
       expect(capture.truncated).toBe(true);
     }
     expect(find(set, '/', 'desktop').truncated).toBe(false);
+  });
+
+  it('real Chromium screenshots decode and frame exactly for visual review, top to bottom', async () => {
+    for (const viewport of ['desktop', 'tablet', 'mobile'] as const) {
+      const capture = find(set, '/long', viewport);
+      const stored = realPngs.get(`/long@${viewport}`)!;
+      const before = Buffer.from(stored);
+      const frames = frameScreenshot(stored, capture.viewport.height, MAX_FRAMES_PER_CAPTURE);
+      expect(frames).toHaveLength(MAX_FRAMES_PER_CAPTURE);
+      expect(frames.map((f) => f.offsetY)[0]).toBe(0);
+      expect(frames.at(-1)!.offsetY + frames.at(-1)!.height).toBe(capture.image!.height);
+      for (const frame of frames) {
+        expect(pngDimensions(frame.png)).toEqual({ width: capture.viewport.width, height: capture.viewport.height });
+        const decoded = decodePng(frame.png);
+        expect(decoded.pixels.length).toBe(capture.viewport.width * capture.viewport.height * decoded.channels);
+      }
+      // Framing only reads: the screenshot bytes are unchanged, and still hash to what the set records.
+      expect(stored.equals(before)).toBe(true);
+      expect(sha(stored)).toBe(capture.image!.sha256);
+    }
+    expect(frameScreenshot(realPngs.get('/@desktop')!, 900, MAX_FRAMES_PER_CAPTURE)).toHaveLength(1);
   });
 
   it('a page that threw after loading is captured as diagnostic evidence, and its finding is kept', () => {

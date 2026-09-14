@@ -7,3 +7,4 @@ export * from './preview.js';
 export * from './browser-renderer.js';
 export * from './blob-store.js';
 export * from './screenshot-evidence.js';
+export * from './review-frames.js';

@@ -673,6 +673,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
           ? `succeeded in ${(compiled.durationMs / 1000).toFixed(1)}s`
           : 'failed',
         reviewSummary,
+        visualReview: evaluation.visualQualityReview,
         openNonBlocking: progress.openDefects.filter((d) => d.severity !== 'P0' && d.severity !== 'P1'),
       });
 
@@ -700,7 +701,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       break;
     }
 
-    const decided = await adjudicateDefects(ctx(), mustFix, { gateRun, reviewSummary });
+    const decided = await adjudicateDefects(ctx(), mustFix, { gateRun, reviewSummary, visualReview: evaluation.visualQualityReview });
     const adjudication = decided.authorization;
     const proposedAdjudication = decided.proposed;
 

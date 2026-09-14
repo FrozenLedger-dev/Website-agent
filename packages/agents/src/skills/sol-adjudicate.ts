@@ -81,6 +81,11 @@ export interface AdjudicationEvidence {
   legalActions: readonly string[];
   gateFindings: readonly string[];
   reviewSummary: string | null;
+  /**
+   * The rendered visual quality review from this evaluation, already rendered as
+   * text that names its exact artifact and screenshot set. Advisory evidence.
+   */
+  visualReview: string | null;
   openBlockingDefects: readonly {
     id: string;
     category: string;
@@ -161,6 +166,9 @@ DETERMINISTIC GATE FINDINGS
 ${evidence.gateFindings.map((f) => `  ${f}`).join('\n') || '  (none)'}
 
 INDEPENDENT REVIEW
-${evidence.reviewSummary ?? '  (not run this cycle)'}`,
+${evidence.reviewSummary ?? '  (not run this cycle)'}
+
+RENDERED VISUAL QUALITY REVIEW (advisory; Terra judged the rendered pages)
+${evidence.visualReview ?? '  (not run this cycle)'}`,
   });
 }

@@ -5,6 +5,7 @@
  * persisted in, which is a harness concern. They stay separate on purpose, so
  * the trail can show a recommendation and an authorisation that disagree.
  */
+import type { ArtifactRef } from '@statxai/contracts';
 import type { ReleaseAction, ReleaseEvidence } from '@statxai/policy-engine';
 
 /** What gets stored as the versioned `approval-recommendation` artifact. */
@@ -13,6 +14,8 @@ export interface ApprovalRecord {
   sitePlanVersion: number | null;
   testReportVersion: number | null;
   visualReviewVersion: number | null;
+  /** The exact rendered visual quality review this recommendation was given — by reference, from the current evaluation. */
+  visualQualityReview: ArtifactRef | null;
   recommendation: 'accept' | 'reject' | 'human_review' | null;
   reason: string | null;
   acknowledgedIssues: string[];

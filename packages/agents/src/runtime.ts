@@ -30,7 +30,7 @@ import { randomUUID } from 'node:crypto';
 import type * as z from 'zod/v4';
 import type { AgentTier } from '@statxai/contracts';
 import { ModelClient, type CallResult } from './client.js';
-import type { Effort, Provider } from './providers/types.js';
+import type { Effort, ModelImage, Provider } from './providers/types.js';
 
 /**
  * Every production model skill, by its existing name, and the one tier it runs
@@ -77,6 +77,8 @@ export interface ModelInvocation<T> extends ModelCallOptions {
   readonly label: string;
   readonly system: string;
   readonly prompt: string;
+  /** Images the model sees after the prompt. One invocation, however many images: still one usage event. */
+  readonly images?: readonly ModelImage[];
   readonly schema: z.ZodType<T>;
   readonly maxTokens?: number;
   readonly effort?: Effort;
@@ -133,6 +135,7 @@ export class ModelRuntime {
       label: invocation.label,
       system: invocation.system,
       prompt: invocation.prompt,
+      ...(invocation.images !== undefined ? { images: invocation.images } : {}),
       schema: invocation.schema,
       ...(invocation.maxTokens !== undefined ? { maxTokens: invocation.maxTokens } : {}),
       ...(invocation.effort !== undefined ? { effort: invocation.effort } : {}),

@@ -297,6 +297,26 @@ describe('a delivery that is released', () => {
     expect(result.manifest?.authorization.action).toBe('release');
   });
 
+  it('hands Sol the exact visual quality review this evaluation wrote, and records its reference', async () => {
+    const projectId = 'proj_parity_visual_review';
+    await run(projectId);
+
+    const reviewDoc = await store.artifacts.findOne({ projectId, name: 'visual-quality-review' });
+    const setDoc = await store.artifacts.findOne({ projectId, name: 'screenshot-set' });
+    expect(reviewDoc?.version).toBe(1);
+    const review = reviewDoc!.data as { screenshotSet: { name: string; version: number }; status: string };
+    expect(review.screenshotSet).toMatchObject({ name: 'screenshot-set', version: setDoc!.version });
+    // This suite's compiler is faked, so there is no export and nothing to look at: no evidence, no model call.
+    expect(review.status).toBe('no_evidence');
+
+    const agents = await import('@statxai/agents');
+    const evidence = vi.mocked(agents.recommendApproval).mock.calls.at(-1)![1];
+    expect(evidence.visualReview).toContain('visual-quality-review@1 of screenshot-set@1 — no_evidence');
+
+    const approval = await store.artifacts.findOne({ projectId, name: 'approval-recommendation' });
+    expect((approval!.data as { visualQualityReview: unknown }).visualQualityReview).toEqual({ name: 'visual-quality-review', version: 1, contentHash: reviewDoc!.contentHash });
+  });
+
   it('leaves the project released', async () => {
     const projectId = 'proj_parity_state';
     await run(projectId);
@@ -330,6 +350,8 @@ describe('a delivery that is released', () => {
       'test-report@1',
       // The browser's screenshots of the exact build (no export exists under this suite's faked compiler, so the set is honestly empty).
       'screenshot-set@1',
+      // Terra's multimodal review of exactly that set — honestly `no_evidence` here, with no model call.
+      'visual-quality-review@1',
       'visual-review@1',
       'approval-recommendation@1',
       'release-authorization@1',

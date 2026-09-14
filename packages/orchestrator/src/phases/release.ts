@@ -22,6 +22,7 @@ import type { ArtifactRef, SolApprovalRecommendation } from '@statxai/contracts'
 import type { ApprovalRecord, AuthorizationRecord } from '../release.js';
 import type { Defect } from '../defects.js';
 import type { RunContext } from '../run-context.js';
+import { summarizeVisualReview, type VisualQualityReviewOutcome } from './visual-review.js';
 
 export interface ReleaseEvidenceInput {
   gateRun: {
@@ -32,6 +33,8 @@ export interface ReleaseEvidenceInput {
   buildOk: boolean;
   buildSummary: string;
   reviewSummary: string | null;
+  /** This evaluation's exact visual quality review, handed on — never looked up. */
+  visualReview: VisualQualityReviewOutcome | null;
   openNonBlocking: readonly Defect[];
 }
 
@@ -80,6 +83,7 @@ export async function seekRelease(
     sitePlanVersion: planDoc?.version ?? null,
     testReportVersion: reportDoc?.version ?? null,
     visualReviewVersion: reviewDoc?.version ?? null,
+    visualQualityReview: context.visualReview?.ref ?? null,
     recommendation: null,
     reason: null,
     acknowledgedIssues: [],
@@ -105,6 +109,7 @@ export async function seekRelease(
       ),
       buildSummary: context.buildSummary,
       reviewSummary: context.reviewSummary,
+      visualReview: context.visualReview ? summarizeVisualReview(context.visualReview) : null,
       openNonBlocking: context.openNonBlocking.map((d) => ({
         id: d.id,
         severity: d.severity,

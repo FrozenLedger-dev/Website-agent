@@ -9,11 +9,14 @@
  */
 import {
   ReviewOutcomeInput,
+  VisualQualityAssessment,
+  type BrowserViewportName,
   type BusinessProfile,
   type GeneratedFile,
+  type ScreenshotCaptureReason,
   type SitePlan,
 } from '@statxai/contracts';
-import type { ModelRuntime } from '../runtime.js';
+import type { ModelCallOptions, ModelRuntime } from '../runtime.js';
 
 const SYSTEM = `You are Terra acting as an independent reviewer. You did not build this site.
 
@@ -115,5 +118,113 @@ ${JSON.stringify(plan.sitemap, null, 2)}
 
 DELIVERED SITE
 ${rendered}`,
+  });
+}
+
+const VISUAL_SYSTEM = `You are Terra acting as an independent visual reviewer. You did not build this site.
+
+You are shown screenshots of the rendered website — real pixels from a real browser — at
+desktop (1440px wide), tablet (768px) and mobile (390px). Judge what a visitor actually
+sees. You are not shown source code and must not speculate about it.
+
+Tall pages arrive as frames one screen tall, labelled with their route, viewport, frame
+number and vertical position. When a page had more frames than were sent, the frames are
+evenly spaced from its top to its bottom: judge the whole composition from them, and do
+not treat the first frame as the whole page.
+
+SCORE each dimension 0-100 (100 = work a design-led studio would publish):
+- composition: layout structure, asymmetry, variety of section forms, use of space
+- typography: type scale contrast, measure, pairing, rhythm of headings and body
+- spacingRhythm: deliberate, varied vertical rhythm rather than identical padding everywhere
+- hierarchy: what the eye reads first, second, third on each screen
+- brandDistinctiveness: does this look like this specific business, not any business
+- assetQuality: quality and fitness of imagery, illustration, iconography and graphic devices
+- conversionClarity: is the primary action obvious and reachable on every page
+- mobileQuality: is mobile designed for a phone, not merely the desktop stacked vertically
+overallScore is your holistic judgement, also 0-100.
+
+LOOK SPECIFICALLY FOR template-like patterns, and report each one you see in antiPatterns:
+generic centred hero with two buttons (generic_centered_hero), three equal cards
+(three_equal_cards), cards everywhere (cards_everywhere), repetitive icon circles
+(repetitive_icon_circles), arbitrary gradients (arbitrary_gradients), unnecessary pills or
+badges (unnecessary_pills), everything centred (all_centered_composition), identical spacing
+everywhere (uniform_spacing), a huge heading with nothing composed around it
+(oversized_heading_without_composition), mobile that is the desktop stacked
+(mobile_is_stacked_desktop). These are things to judge, not automatic failures.
+
+REPORTING
+- Only review routes and viewports you were shown. Never describe a page or viewport you
+  did not see; the targets you were not shown are listed so you know they are missing.
+- Each issue names its route, the viewports it appears on, one dimension, a severity
+  (major, moderate, minor), the problem as seen, and a direction for improving it.
+  Directions describe the visual outcome, never files, code or commands.
+- issue ids are sequential: VQ-001, VQ-002, ...
+- refinementPriorities are at most 10, ranked 1 (most valuable) upward.
+- Correctness is judged elsewhere: do not report broken builds, accessibility violations
+  or console errors as visual issues unless you can see their effect on the page.
+- Be honest in both directions: do not inflate scores, and do not invent problems.`;
+
+/** One image of the rendered site, identified by the target it shows. */
+export interface VisualReviewImage {
+  readonly route: string;
+  readonly viewport: BrowserViewportName;
+  readonly index: number;
+  readonly count: number;
+  readonly offsetY: number;
+  readonly sourceHeight: number;
+  readonly png: Uint8Array;
+}
+
+export interface VisualReviewInput {
+  readonly profile: BusinessProfile;
+  readonly plan: SitePlan;
+  /** Every image the reviewer sees, in a fixed order. */
+  readonly frames: readonly VisualReviewImage[];
+  /** Targets with no screenshot, and targets with one that was not sent. */
+  readonly missing: readonly { route: string; viewport: BrowserViewportName; reason: ScreenshotCaptureReason }[];
+  readonly notReviewed: readonly { route: string; viewport: BrowserViewportName }[];
+  /** Concise browser findings per target, for context only. */
+  readonly browserFindings: readonly string[];
+}
+
+/**
+ * Terra's multimodal visual quality review: one invocation, the rendered frames
+ * as images, a strict assessment back. No tools, no build output, no files.
+ */
+export async function reviewVisualQuality(runtime: ModelRuntime, input: VisualReviewInput, options: ModelCallOptions = {}) {
+  const shown = [...new Set(input.frames.map((f) => `${f.route} @ ${f.viewport}`))];
+  return runtime.invoke({
+    skill: 'terra-review',
+    tier: 'terra',
+    label: 'terra:visual-review',
+    system: VISUAL_SYSTEM,
+    schema: VisualQualityAssessment,
+    maxTokens: 16_000,
+    effort: 'high',
+    prompt: `Review the rendered website shown in the ${input.frames.length} images that follow.
+
+BUSINESS
+${JSON.stringify({ businessName: input.profile.businessName, industry: input.profile.industry, location: input.profile.location, audience: input.profile.audience, tone: input.profile.tone }, null, 2)}
+
+BRAND SYSTEM (what the design intended)
+${JSON.stringify(input.plan.brandSystem, null, 2)}
+
+PAGES (route, purpose, primary action)
+${input.plan.sitemap.pages.map((p) => `  ${p.route}  ${p.title} — goal: ${p.goal}; primary action: ${p.primaryAction}`).join('\n')}
+
+TARGETS SHOWN (${shown.length})
+${shown.map((t) => `  ${t}`).join('\n')}
+
+TARGETS NOT SHOWN — do not review these
+${[...input.missing.map((m) => `  ${m.route} @ ${m.viewport} (no screenshot: ${m.reason})`), ...input.notReviewed.map((m) => `  ${m.route} @ ${m.viewport} (not sent: review budget)`)].join('\n') || '  (none)'}
+
+BROWSER FINDINGS (context only; correctness is judged elsewhere)
+${input.browserFindings.map((f) => `  ${f}`).join('\n') || '  (none)'}`,
+    images: input.frames.map((frame, i) => ({
+      label: `IMAGE ${i + 1}: ${frame.route} @ ${frame.viewport} — frame ${frame.index} of ${frame.count}, from y=${frame.offsetY}px of a ${frame.sourceHeight}px page`,
+      mediaType: 'image/png' as const,
+      data: frame.png,
+    })),
+    ...(options.signal !== undefined ? { signal: options.signal } : {}),
   });
 }

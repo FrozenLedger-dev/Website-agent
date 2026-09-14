@@ -28,6 +28,7 @@ import type { AdjudicationAction } from '@statxai/contracts';
 import { recordedConstraints, type AdjudicationRecord } from '../adjudication.js';
 import type { Defect } from '../defects.js';
 import type { RunContext } from '../run-context.js';
+import { summarizeVisualReview, type VisualQualityReviewOutcome } from './visual-review.js';
 
 export interface AdjudicationOutcome {
   authorization: AdjudicationAuthorization;
@@ -56,6 +57,8 @@ export async function adjudicateDefects(
   evidence: {
     gateRun: { findings: { severity: string; gate: string; location: string; message: string }[] };
     reviewSummary: string | null;
+    /** This evaluation's exact visual quality review, handed on — never looked up. */
+    visualReview: VisualQualityReviewOutcome | null;
   },
 ): Promise<AdjudicationOutcome> {
   const { deps, facts, progress } = ctx;
@@ -104,6 +107,7 @@ export async function adjudicateDefects(
         (f) => `${f.severity} ${f.gate} ${f.location} — ${f.message}`,
       ),
       reviewSummary: evidence.reviewSummary,
+      visualReview: evidence.visualReview ? summarizeVisualReview(evidence.visualReview) : null,
       openBlockingDefects: mustFix.map((d) => ({
         id: d.id,
         category: d.category,

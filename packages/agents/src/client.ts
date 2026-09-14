@@ -14,10 +14,10 @@
 import type * as z from 'zod/v4';
 import { stripNulls, toModelSchema, toStrictModelSchema, type AgentTier } from '@statxai/contracts';
 import { OpenAiProvider } from './providers/openai.js';
-import type { Effort, Provider } from './providers/types.js';
+import type { Effort, ModelImage, Provider } from './providers/types.js';
 
-export type { Effort, Provider, ProviderRequest, ProviderResponse } from './providers/types.js';
-export { OpenAiProvider, schemaName, toReasoningEffort } from './providers/openai.js';
+export type { Effort, ModelImage, Provider, ProviderRequest, ProviderResponse } from './providers/types.js';
+export { OpenAiProvider, schemaName, toReasoningEffort, userContent } from './providers/openai.js';
 
 /**
  * Tier defaults.
@@ -79,6 +79,8 @@ export interface CallOptions<T> {
   tier: AgentTier;
   system: string;
   prompt: string;
+  /** Images following the prompt, forwarded unchanged — including on a truncation retry. */
+  images?: readonly ModelImage[];
   schema: z.ZodType<T>;
   maxTokens?: number;
   effort?: Effort;
@@ -138,6 +140,7 @@ export class ModelClient {
         model: modelFor(options.tier),
         system: options.system,
         prompt: options.prompt,
+        ...(options.images !== undefined && options.images.length > 0 ? { images: options.images } : {}),
         schema: strict ? toStrictModelSchema(options.schema) : toModelSchema(options.schema),
         schemaName: options.label.replace(/[^a-zA-Z0-9_-]/g, '_'),
         maxTokens: options.maxTokens ?? 32_000,

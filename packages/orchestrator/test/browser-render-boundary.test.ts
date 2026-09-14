@@ -234,11 +234,16 @@ describe('durable screenshot evidence', () => {
     expect(site).not.toMatch(/registry\.(get|latest)\(/);
   });
 
-  it('no tool adapter or model skill reaches screenshots or blobs', async () => {
-    for (const dir of ['packages/orchestrator/src/tool-gateway', 'packages/agents/src']) {
-      for (const file of await productionFiles(dir)) {
-        expect(await src(file), file).not.toMatch(/screenshot|captureInBrowser|BlobStore|blobs/i);
-      }
+  it('no tool adapter reaches screenshots; no model skill reaches capture or blob storage, and only terra-review sees screenshots', async () => {
+    for (const file of await productionFiles('packages/orchestrator/src/tool-gateway')) {
+      expect(await src(file), file).not.toMatch(/screenshot|captureInBrowser|BlobStore|blobs/i);
     }
+    const seeing: string[] = [];
+    for (const file of await productionFiles('packages/agents/src')) {
+      const code = await src(file);
+      expect(code, file).not.toMatch(/captureInBrowser|BlobStore|\bblobs\b|@statxai\/workspace/);
+      if (/screenshot/i.test(code)) seeing.push(file);
+    }
+    expect(seeing).toEqual(['packages/agents/src/skills/terra-review.ts']);
   });
 });
