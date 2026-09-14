@@ -17,6 +17,7 @@ import type {
   ProjectDocument,
   ReleasePublicationDocument,
   ReviewDocument,
+  VisualRefinementIntentDocument,
 } from './documents.js';
 import type { RunDocument, RunEventDocument } from './runs.js';
 
@@ -115,6 +116,14 @@ export class StateStore {
    */
   get releasePublications(): Collection<ReleasePublicationDocument> {
     return this.db.collection<ReleasePublicationDocument>('release_publications');
+  }
+  /**
+   * Durable visual-refinement authorisations — one per refined predecessor
+   * build, keyed deterministically, written with the budget spend that
+   * authorised it. See `VisualRefinementIntentDocument`.
+   */
+  get visualRefinementIntents(): Collection<VisualRefinementIntentDocument> {
+    return this.db.collection<VisualRefinementIntentDocument>('visual_refinement_intents');
   }
 
   /**
@@ -266,6 +275,14 @@ export class StateStore {
         partialFilterExpression: { 'buildAuthority.lineageRootBindingId': { $exists: true } },
         name: 'projectId_1_buildAuthority_lineageRoot',
       },
+    ]);
+
+    // At most one visual refinement per exact predecessor build, ever — the
+    // same predecessor-keyed shape as the one-successor index above, and never
+    // keyed on a review: a re-evaluation of the same build writes a new review,
+    // and must find the refinement already authorised rather than authorise another.
+    await this.visualRefinementIntents.createIndexes([
+      { key: { projectId: 1, predecessorBindingId: 1 }, unique: true },
     ]);
   }
 

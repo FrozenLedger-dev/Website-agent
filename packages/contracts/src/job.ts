@@ -137,6 +137,11 @@ export const JobOrigin = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('rebuild'), reviewCycle: z.number().int().nonnegative() }),
   /** Sol specification/architecture revision. */
   z.object({ kind: z.literal('replan'), reviewCycle: z.number().int().nonnegative() }),
+  /**
+   * A bounded Terra visual refinement of the canonical build, authorised by the
+   * harness from an exact visual quality review. Not a replan: the plan is unchanged.
+   */
+  z.strictObject({ kind: z.literal('visual_refine'), refinementCycle: z.number().int().min(1).max(1_000) }),
 ]);
 export type JobOrigin = z.infer<typeof JobOrigin>;
 

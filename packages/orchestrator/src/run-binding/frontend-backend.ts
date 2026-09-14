@@ -717,6 +717,23 @@ export function verifyBindingConsistency(
   if (!specPlanRef || !sameRef(specPlanRef, binding.sitePlan)) {
     throw new FrontendBackendBuildBindingCorrupt(binding._id, 'spec sitePlan input does not match binding.sitePlan');
   }
+
+  // A refinement job and a visual-refinement successor are the same fact, told
+  // twice: the spec pins exactly the review and screenshot set the lineage names,
+  // and no other binding's spec pins refinement inputs at all.
+  const specSource = spec.inputs[FRONTEND_BACKEND_INPUT.visualRefinementSource];
+  const specReview = spec.inputs[FRONTEND_BACKEND_INPUT.visualQualityReview];
+  const specSet = spec.inputs[FRONTEND_BACKEND_INPUT.screenshotSet];
+  if (stored.kind === 'successor' && stored.provenance.kind === 'visual_refinement') {
+    if (!specSource || !specReview || !specSet) {
+      throw new FrontendBackendBuildBindingCorrupt(binding._id, 'a visual refinement successor\'s spec does not pin its source, review and screenshot set');
+    }
+    if (!sameRef(specReview, stored.provenance.visualQualityReview) || !sameRef(specSet, stored.provenance.screenshotSet)) {
+      throw new FrontendBackendBuildBindingCorrupt(binding._id, 'spec refinement inputs do not match the stored visual refinement provenance');
+    }
+  } else if (specSource || specReview || specSet) {
+    throw new FrontendBackendBuildBindingCorrupt(binding._id, 'spec pins visual refinement inputs, but the binding is not a visual refinement successor');
+  }
 }
 
 // ---------------------------------------------------------------------------

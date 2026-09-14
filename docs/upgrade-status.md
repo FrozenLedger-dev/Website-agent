@@ -6352,6 +6352,262 @@ Sources were restored byte-identical after each.
 `visual_refine` job origin, refinement budget or thresholds, and any production
 caller that prepares a visual-refinement successor.
 
+## Bounded Terra visual refinement — **DONE**
+
+**Why.** A canonical build now has an exact screenshot set and an exact
+multimodal review. This slice lets the harness act on that review. It allows a
+small, durable, policy-bounded number of Terra refinements, and each one is an
+ordinary successor build.
+
+**Gate findings.**
+
+- **Source authority.** The binding's `promotionId` names a committed receipt,
+  and that receipt names the exact accepted `build-candidate` and commit. The
+  candidate alone is not the current source, because Luna repairs commit
+  directly to the canonical tree after promotion. The exact rendered source is
+  the commit in the screenshot set's `subject.sourceCommit`.
+- **Job identity.** The job id is `contentHash` over the whole spec except
+  `jobId`. A refinement that pinned only the profile and plan would collide with
+  B0.
+- **Budgets.** `BudgetDocument` had no honest key for refinement.
+  `spend` is a guarded `$expr` update that runs inside a transaction.
+- **Successor spec commit.** `ensureSpecificationCommitted` throws when there is
+  nothing to commit, and Phase 5q requires `specificationCommitSha`. The plan does
+  not change, so the refinement's own harness record is what gets committed.
+- **Prepared successors.** Phase 5k resume already refuses any prepared successor
+  (`verifyBindingConsistency` with no lineage). That behaviour is unchanged here,
+  so a prepared refinement successor is refused exactly as a prepared replan
+  successor is.
+
+**Source (`contracts/visual-refinement.ts`, `ProjectWorkspace.readModelSourceAtCommit`).**
+Before anything is read, the authorisation proves all of these:
+
+- the build is promoted, with a committed receipt for the same job and commit;
+- exactly one canonical commit carries its promotion marker;
+- the build is the exact active-lineage tip;
+- the review's subject is this build and plan;
+- canonical HEAD equals `sourceCommit`;
+- `sourceCommit` descends from the promotion commit.
+
+It then reads the model-owned source files (`isModelSourceFile`) tracked at
+exactly that SHA from Git's object store. It never reads the working tree, and it
+accepts only a full SHA. The snapshot is bounded to 80 files and 400 KB, and a
+larger site is refused (`source_too_large`), never truncated. The
+`visual-refinement-source` artifact records the predecessor, the promotion, the
+source commit, the cycle, the review and set refs, the files and `filesDigest`.
+The filesystem tool is unchanged: it still reads the platform scaffold only.
+
+**Policy (`visual-refinement/policy.ts`, `statxai-visual-refinement-policy@1`).**
+The policy is pure, and it reads structured evidence only. It checks, in order:
+
+1. Fences: `awaiting_human_review`, or any release publication for the lineage
+   in any status.
+2. Review status is `reviewed`. Otherwise the review is `review_unusable`.
+3. Coverage is complete.
+4. Budget remains.
+5. At least one trigger holds:
+   - overall score below 80;
+   - composition, typography, hierarchy or mobileQuality below 70;
+   - any `major` issue.
+6. When the build is itself a visual refinement, its overall score must be
+   strictly above the score of the review that triggered it. Otherwise the
+   result is `not_improved`: refinement stops, and nothing is rolled back.
+
+Refinement priorities and prose never trigger a pass.
+
+**Durable budget and intent.**
+
+- **Budget.** `visualRefinements` has a limit of 2 (`DEFAULT_BUDGET_LIMITS`). The
+  field is optional, so a budget written before it existed matches no guarded
+  spend and is never refined. There is no backfill.
+- **Intent.** `visual_refinement_intents` holds one document per predecessor,
+  with a deterministic `_id` and a unique index on `{ projectId,
+  predecessorBindingId }`. It records the review, set, cycle, policy, source
+  commit, source ref, job spec, job id, successor binding id and budget slot.
+- **Transaction.** One transaction spends the slot, puts the source and inserts
+  the intent, before any model call.
+- **Replay.** A replay for the same build returns the stored intent. That covers
+  a restart and a re-evaluation with a newer review alike. A replay spends
+  nothing and makes no new decision, although the fences still apply.
+- **When a slot is spent.** It is spent at authorisation and never refunded. A
+  model failure, an invalid output and a failed validation each keep it.
+- **Cycle.** The cycle is derived by walking exact predecessor ids.
+
+**Job.**
+
+- **Spec.** `createFrontendBackendVisualRefinementJobSpec` uses the same identity
+  primitive, grant (`filesystem`, `test_runner`) and output as a build. It has its
+  own objective and three extra pinned inputs, each with a content hash:
+  `visualRefinementSource`, `visualQualityReview` and `screenshotSet`. B0, B1 and
+  B2 therefore differ deterministically.
+- **Origin.** `{ kind: 'visual_refine', refinementCycle }`, strict.
+- **Consistency.** `verifyBindingConsistency` requires a visual successor's spec to
+  pin exactly its provenance's review and set. No other binding's spec may pin
+  refinement inputs.
+
+**Terra-refine (`agents/skills/terra-refine.ts`).**
+
+- It is a distinct skill at tier `terra`. `terra-review` is unchanged.
+- It runs through Terra's existing bounded build loop, with the same turn, read
+  and test bounds.
+- The loop now takes a skill, a system prompt and images, and every stateless
+  turn carries the same images.
+- Its input covers:
+  - the profile, the fixed plan and its routes;
+  - the allowed namespaces;
+  - the cycle and predecessor;
+  - the exact source;
+  - the scores, summary, ranked priorities, issues, anti-patterns and strengths;
+  - the exact reviewed frames.
+- It returns a strict, complete `BuildOutput`.
+- **Frames.** The handler recuts them with `reproduceReviewFrames`. Each image is
+  read by exact blob key and re-hashed, and each frame must match the review's
+  recorded sha256, offset and size.
+
+**Lifecycle (`orchestrator.ts`).** Refinement is considered only when nothing
+blocks, and before `seekRelease`.
+
+1. Authorise the refinement.
+2. Prepare the successor, with `successorProvenance.kind = visual_refinement`.
+3. Set the project state to `building`.
+4. Materialise and commit `decisions/visual-refinement.json` as the specification
+   commit.
+5. Run `lifecycleCoordinator.run(intent.jobSpec, { kind: 'visual_refine' })`.
+   That is the Terra handler, the write boundary, sandboxed 5g-1 validation, 5g-2
+   acceptance, the 5n fence, the 5h receipt and exact-replacement promotion.
+6. Finalise the binding, then `continue` to a fresh evaluation.
+
+The fresh evaluation runs gates, render, a new screenshot set and a new review,
+all bound to the new build. A non-promoted refinement stops the run as `blocked`,
+exactly as an unpromoted replan rebuild does.
+
+Validation of a refinement job adds `plan-conformance` findings (P0) for an added
+or dropped page route. Sol's approval therefore always receives the final build's
+exact review.
+
+**Phase 5q.** `ActiveContinuationSuccessorNotOwned` is removed. A promoted
+visual-refinement tip is proven like any other tip and then evaluated. Whether to
+refine again is decided from its own typed provenance: the cycle, and the
+triggering review for the improvement rule. The call that produced it is never
+replayed.
+
+**Tests.**
+
+- **`visual-refinement-policy.test.ts` (31):**
+  - the pinned policy and budget defaults;
+  - exact thresholds;
+  - every unusable status;
+  - incomplete coverage;
+  - the model cannot ask for a pass;
+  - fences and budget, including a missing budget;
+  - improvement, equal and worse second passes;
+  - B0, B1 and B2 identity, replay identity, sensitivity to each pinned input,
+    and refusal of unhashed refs.
+- **`terra-refine.test.ts` (9):**
+  - a distinct terra skill, one usage event per invocation, strict `BuildOutput`;
+  - labelled images and the exact evidence and source in the prompt;
+  - the same images on every tool-loop turn;
+  - only filesystem and test_runner described;
+  - an ungranted tool is malformed, and the turn bound holds;
+  - advisory tests are never the answer.
+- **`source-snapshot.test.ts` (6):** the exact tracked model source at a SHA,
+  pinned against later commits and the dirty tree, deterministic, bounded,
+  exact-SHA only, and ancestry.
+- **`visual-refinement-authority.integration.test.ts` (17):**
+  - one slot, source and intent;
+  - a source read at a post-promotion repair commit, never the stale candidate;
+  - replay across a restart with a newer review, and concurrent convergence;
+  - nothing spent when refinement is ineligible;
+  - no third pass, and a legacy budget refines nothing;
+  - fail closed on a stale HEAD, a non-descendant commit, a different build, a
+    missing receipt or a foreign promotion;
+  - working-tree independence;
+  - the tip requirement, and no replan branch from the same predecessor;
+  - human review, including on replay, and each release status.
+- **`visual-refinement-run.integration.test.ts` (8), real `runProject`:**
+  - **B0 → B1 → B2:**
+    - typed provenance, root and cycles;
+    - fresh gates, render, sets and reviews bound to each build;
+    - Terra saw the exact triggering review, set, frames and predecessor source;
+    - job origins, fences and receipts;
+    - the budget stopping a third pass;
+    - Sol judged once, on B2's exact review.
+  - **No improvement:** the worse build stays canonical and is judged.
+  - **Good review:** no refinement.
+  - **Validation failure:** blocked, the slot kept, B0's tree kept.
+  - **Forbidden path:** refused at the write boundary.
+  - **Model failure:** the slot kept, and the next run refuses the prepared
+    successor, as Phase 5k does for any successor.
+  - **Crash after B1 promoted:** recovery evaluates B1 without re-refining or
+    re-spending.
+  - **Recovered second pass:** cycle 2.
+- **`visual-refinement-boundary.test.ts` (13, structural):**
+  - skill separation, with no write or authority imports;
+  - the loop carries images on every turn;
+  - only filesystem and test_runner adapters, and the filesystem tool is not
+    widened;
+  - the source is read only after its proofs;
+  - the pure policy, reached only through the authorisation and the run;
+  - the transactional budget, with no process counter;
+  - refinement before Sol, and only through the coordinator;
+  - no latest lookups, and a pinned identity;
+  - recovery never refines.
+- **Migrated to the new truth:** the runtime skill table, the model-boundary
+  shared-loop rule, the tool-gateway suppliers, the state-transition counts
+  (`building` ×4), the browser-render promotion sites and screenshot viewers, the
+  visual-review image senders, consumers and frame reproduction, the provenance
+  suites (5q now owns visual tips, and specs pin refinement inputs) and the budget
+  defaults.
+
+**Mutations: 36 of 36 killed.** Each ran against the relevant unit or structural
+suites and the authority or run integration tests. Sources were restored
+byte-identical after each.
+
+- **Policy:**
+  - eligibility removed;
+  - a high-quality review refined;
+  - an unusable review refined;
+  - the limit removed;
+  - a non-improving build given another pass;
+  - a third pass allowed.
+- **Budget and replay:**
+  - a memory counter instead of the durable spend;
+  - replay spending twice;
+  - a failed refinement refunding its slot;
+  - crash replay spending another slot.
+- **Identity:**
+  - B0 and B1 sharing a job id;
+  - the source snapshot, screenshot set or review removed from the job;
+  - the source commit replaced by the promotion commit.
+- **Source and tools:**
+  - the source read without HEAD and ancestry proof;
+  - the filesystem tool widened;
+  - terra-refine bypassing `ModelRuntime`;
+  - images omitted;
+  - terra-review returning `BuildOutput`;
+  - `browser_preview` granted.
+- **Lifecycle:**
+  - official validation skipped;
+  - the write boundary bypassed;
+  - the successor labelled a replan;
+  - the predecessor substituted;
+  - the provenance refs substituted;
+  - the one-successor index made reason-specific;
+  - the promotion fence skipped.
+- **Evidence:**
+  - B1 reusing S0 or V0;
+  - Sol judging before refinement;
+  - final approval using the stale review.
+- **Recovery and fences:**
+  - crash replay restarting from the predecessor;
+  - 5q rejecting a visual tip;
+  - the human-review fence bypassed;
+  - the release fence bypassed.
+
+**Not in this slice:** a structured editable site model, a customer editor, a
+browser tool, automatic rollback, visual release-blocking policy, and automatic
+resume of a prepared, unpromoted successor, for replans and refinements alike.
+
 ## Phases 6–17
 
 Not started.

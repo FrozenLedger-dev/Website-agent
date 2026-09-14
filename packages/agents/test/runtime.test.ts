@@ -103,6 +103,7 @@ describe('skill and tier authority', () => {
       'sol-approve': 'sol',
       'terra-build': 'terra',
       'terra-review': 'terra',
+      'terra-refine': 'terra',
       'luna-repair': 'luna',
     });
   });

@@ -104,25 +104,6 @@ export class ActiveContinuationAwaitingHumanReview extends Error {
   }
 }
 
-/**
- * The promoted tip is a well-formed successor of a kind post-promotion recovery
- * does not yet know how to continue. Refused explicitly — never corrupt, and
- * never treated as though it were a replan.
- */
-export class ActiveContinuationSuccessorNotOwned extends Error {
-  constructor(
-    readonly projectId: string,
-    readonly bindingId: string,
-    readonly successorKind: string,
-  ) {
-    super(
-      `project "${projectId}": promoted build "${bindingId}" is a ${successorKind} successor, whose continuation ` +
-        `post-promotion recovery does not own yet; it is not resumed automatically`,
-    );
-    this.name = 'ActiveContinuationSuccessorNotOwned';
-  }
-}
-
 /** The active lineage's tip is not a promoted build, so this is not post-promotion recovery. */
 export class ActiveContinuationNotPromoted extends Error {
   constructor(
@@ -264,10 +245,9 @@ export async function resolvePostPromotionRecovery(
     position.kind === 'successor' ? { predecessorBindingId: position.predecessorBindingId, provenance: position.provenance } : undefined,
     root._id,
   );
-  // Structurally sound, but not a continuation this recovery owns yet.
-  if (position.kind === 'successor' && position.provenance.kind !== 'replan') {
-    throw new ActiveContinuationSuccessorNotOwned(projectId, tip._id, position.provenance.kind);
-  }
+  // Every successor kind is a continuation this recovery owns: a promoted
+  // replan or visual refinement is evaluated afresh, and whether to refine again
+  // is decided from its own typed provenance — never by replaying the call that made it.
 
   // Durable run state this continuation reuses, never recreates.
   const projectDoc = await store.projects.findOne({ _id: projectId });

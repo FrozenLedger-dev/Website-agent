@@ -42,12 +42,18 @@ const PHASE = 'packages/orchestrator/src/phases/visual-review.ts';
 const EVALUATE = 'packages/orchestrator/src/phases/evaluate.ts';
 
 describe('images reach a model only through Terra’s visual review and the runtime', () => {
-  it('terra-review is the only skill that sends images, in exactly one runtime invocation', async () => {
+  it('terra-review sends images in exactly one runtime invocation, and terra-refine is the only other skill that sends any', async () => {
     const senders: string[] = [];
     for (const file of await productionFiles('packages/agents/src/skills')) {
       if (/\bimages:/.test(await src(file))) senders.push(file);
     }
-    expect(senders).toEqual([REVIEW_SKILL]);
+    expect(senders.sort()).toEqual(['packages/agents/src/skills/terra-build.ts', 'packages/agents/src/skills/terra-refine.ts', REVIEW_SKILL].sort());
+    // Terra's shared build loop only passes a request's images through; no build call supplies any.
+    const build = await src('packages/agents/src/skills/terra-build.ts');
+    expect(build.match(/\bimages:/g)).toEqual(['images:']);
+    expect(build).toContain('...(request.images !== undefined ? { images: request.images } : {}),');
+    const refine = await src('packages/agents/src/skills/terra-refine.ts');
+    expect(refine).toMatch(/images: input\.frames\.map\(/);
     const visual = body(await src(REVIEW_SKILL), 'export async function reviewVisualQuality(', '\n}\n');
     expect(visual.match(/runtime\.invoke\(\{/g)).toHaveLength(1);
     expect(visual).toContain("skill: 'terra-review',");
@@ -89,7 +95,9 @@ describe('images reach a model only through Terra’s visual review and the runt
 describe('the review reads exact evidence and holds no authority', () => {
   it('reads the screenshot set by the exact reference, and each image by its exact blob key, re-hashed', async () => {
     const phase = await src(PHASE);
-    expect(phase.match(/deps\.registry\.\w+\(/g)).toEqual(['deps.registry.resolve(', 'deps.registry.put(']);
+    // The review resolves its set and puts its artifact; reproducing a recorded review's frames resolves exactly the set that review names.
+    expect(phase.match(/deps\.registry\.\w+\(/g)).toEqual(['deps.registry.resolve(', 'deps.registry.put(', 'deps.registry.resolve(']);
+    expect(phase).toContain('ScreenshotSet.parse(await deps.registry.resolve(projectId, review.screenshotSet))');
     expect(phase).toContain('ScreenshotSet.parse(await deps.registry.resolve(input.projectId, input.screenshotSet))');
     expect(phase).toContain('bytes = await deps.blobs.get(image.blob);');
     expect(phase).toContain("if (createHash('sha256').update(bytes).digest('hex') !== image.sha256 || bytes.length !== image.bytes) {");
@@ -128,20 +136,25 @@ describe('the review reads exact evidence and holds no authority', () => {
     }
   });
 
-  it('no production code applies a visual review: no refinement exists yet', async () => {
+  it('a visual review is applied only through the harness-authorised refinement, never by what the review itself builds or writes', async () => {
     const consumers: string[] = [];
     for (const file of await allProductionFiles()) {
       const code = await src(file);
-      // The one permitted name is the typed successor identity, which records a review ref and performs nothing.
-      expect(code, file).not.toMatch(/refineVisual|applyVisual|visualRefinement(?!SuccessorProvenance)/i);
+      expect(code, file).not.toMatch(/applyVisual/i);
       if (/visualQualityReview|VisualQualityReviewOutcome|summarizeVisualReview/.test(code)) consumers.push(file);
     }
-    // Who touches a review: the phase that makes it, evaluation that returns it, Sol's evidence, and build-successor
-    // identity that names its exact ref — nothing that builds or writes.
+    // Who touches a review: the phase that makes it, evaluation that returns it, Sol's evidence, build-successor
+    // identity and the refinement intent that name its exact ref, the refinement job that pins it, and the handler
+    // that shows its frames to terra-refine — none of them writes a file.
     expect(consumers.sort()).toEqual([
       'packages/contracts/src/build-lineage.ts',
+      'packages/contracts/src/visual-refinement.ts',
+      'packages/state/src/documents.ts',
       'packages/orchestrator/src/run-binding/frontend-backend.ts',
       'packages/orchestrator/src/orchestrator.ts',
+      'packages/orchestrator/src/job-handlers/frontend-backend.ts',
+      'packages/orchestrator/src/job-specs/frontend-backend.ts',
+      'packages/orchestrator/src/visual-refinement/authorize.ts',
       'packages/orchestrator/src/phases/adjudicate.ts',
       EVALUATE,
       'packages/orchestrator/src/phases/release.ts',
@@ -151,8 +164,16 @@ describe('the review reads exact evidence and holds no authority', () => {
     for (const file of consumers.filter((f) => f !== 'packages/orchestrator/src/orchestrator.ts')) {
       expect(await src(file), file).not.toMatch(/writeSiteFiles\(|buildSite\(|buildFromPlan\(|repairSite\(/);
     }
-    // In the orchestrator the review is only ever handed to Sol.
+    // The only skill that acts on a review is terra-refine, and only the job handler calls it.
+    const refiners: string[] = [];
+    for (const file of await allProductionFiles()) {
+      if (/refineSiteVisually\(/.test(await src(file)) && file !== 'packages/agents/src/skills/terra-refine.ts') refiners.push(file);
+    }
+    expect(refiners).toEqual(['packages/orchestrator/src/job-handlers/frontend-backend.ts']);
+    // In the orchestrator the review is handed to Sol, or to the refinement authorisation — nowhere else.
     const orchestrator = await src('packages/orchestrator/src/orchestrator.ts');
-    expect(orchestrator.match(/visualQualityReview/g)).toHaveLength(2);
+    expect(orchestrator.match(/visualReview: evaluation\.visualQualityReview/g)).toHaveLength(2);
+    expect(orchestrator.match(/\breview: evaluation\.visualQualityReview/g)).toHaveLength(1);
+    expect(orchestrator.match(/evaluation\.visualQualityReview/g)).toHaveLength(4);
   });
 });

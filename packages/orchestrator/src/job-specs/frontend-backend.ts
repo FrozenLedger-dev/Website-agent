@@ -109,3 +109,60 @@ export function createFrontendBackendJobSpec(input: CreateFrontendBackendJobSpec
   };
   return { ...identity, jobId: computeJobId(identity) };
 }
+
+const REFINE_OBJECTIVE = 'Visually refine the canonical build within the approved plan.';
+const REFINE_ACCEPTANCE_CRITERIA = Object.freeze([
+  'site files written from the approved plan',
+  'every planned route kept, and no route added',
+]);
+
+export interface CreateFrontendBackendVisualRefinementJobSpecInput extends CreateFrontendBackendJobSpecInput {
+  /**
+   * The exact harness-written source snapshot. Its content — the predecessor
+   * build, its promotion and source commit, the refinement cycle and every
+   * source file — is pinned by the ref's content hash, which is part of the
+   * job's identity.
+   */
+  readonly visualRefinementSourceRef: ArtifactRef;
+  /** The exact review that authorised the refinement. */
+  readonly visualQualityReviewRef: ArtifactRef;
+  /** The exact screenshot set that review judged. */
+  readonly screenshotSetRef: ArtifactRef;
+}
+
+/**
+ * The one deterministic `JobSpec` for a visual refinement of one exact
+ * canonical build.
+ *
+ * The same identity primitive as {@link createFrontendBackendJobSpec}, with a
+ * distinct objective and three more pinned inputs — so it can never collide
+ * with the initial build, a replan build of any plan, or another refinement:
+ * every refinement pins a different source snapshot (a different predecessor,
+ * commit and cycle), review and screenshot set. The same intent always yields
+ * the same spec, with no time or randomness anywhere in it.
+ */
+export function createFrontendBackendVisualRefinementJobSpec(input: CreateFrontendBackendVisualRefinementJobSpecInput): JobSpec {
+  for (const [label, ref] of [
+    ['visualRefinementSourceRef', input.visualRefinementSourceRef],
+    ['visualQualityReviewRef', input.visualQualityReviewRef],
+    ['screenshotSetRef', input.screenshotSetRef],
+  ] as const) {
+    if (!ref.contentHash) throw new Error(`createFrontendBackendVisualRefinementJobSpec: ${label} must carry its exact content hash`);
+  }
+  const identity: FrontendBackendJobIdentity = {
+    projectId: input.projectId,
+    role: ROLE,
+    objective: REFINE_OBJECTIVE,
+    inputs: {
+      [FRONTEND_BACKEND_INPUT.businessProfile]: input.businessProfileRef,
+      [FRONTEND_BACKEND_INPUT.sitePlan]: input.sitePlanRef,
+      [FRONTEND_BACKEND_INPUT.visualRefinementSource]: input.visualRefinementSourceRef,
+      [FRONTEND_BACKEND_INPUT.visualQualityReview]: input.visualQualityReviewRef,
+      [FRONTEND_BACKEND_INPUT.screenshotSet]: input.screenshotSetRef,
+    },
+    acceptanceCriteria: [...REFINE_ACCEPTANCE_CRITERIA],
+    allowedTools: [...ALLOWED_TOOLS],
+    output: [...OUTPUT],
+  };
+  return { ...identity, jobId: computeJobId(identity) };
+}

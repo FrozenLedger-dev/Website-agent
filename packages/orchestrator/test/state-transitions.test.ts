@@ -44,14 +44,15 @@ describe('the project state transition surface', () => {
 
     expect(counts).toEqual({
       planning: 1,
-      // Three, across two build boundaries, and at most one runs per build:
+      // Four, across three build boundaries, and at most one runs per build:
       // `orchestrator.ts` writes it on the `job_lifecycle` branch of the
-      // initial boundary and again on the `job_lifecycle` replan rebuild
+      // initial boundary, again on the `job_lifecycle` replan rebuild
       // (Phase 5q0 — a replanned rebuild is a real build and announces
-      // itself as one); `build.ts` writes it on the `legacy_direct` branch
-      // both times. The same "mutually exclusive" shape `blocked` below has,
-      // one cycle at a time.
-      building: 3,
+      // itself as one), and again on a visual refinement, which is a real
+      // build too; `build.ts` writes it on the `legacy_direct` branch.
+      // The same "mutually exclusive" shape `blocked` below has, one cycle
+      // at a time.
+      building: 4,
       validating: 1,
       releasing: 1,
       released: 1,
@@ -71,9 +72,9 @@ describe('the project state transition surface', () => {
     expect(writes['validating']).toEqual(['evaluate.ts']);
     // `.sort()`: which of the mutually-exclusive owners `readdir` visits first
     // is not a claim this test makes. `orchestrator.ts` appears twice because
-    // it owns the transition for both job-mode build boundaries — the initial
-    // one and the replan rebuild.
-    expect(writes['building']?.slice().sort()).toEqual(['build.ts', 'orchestrator.ts', 'orchestrator.ts']);
+    // it owns the transition for every job-mode build boundary — the initial
+    // one, the replan rebuild and the visual refinement.
+    expect(writes['building']?.slice().sort()).toEqual(['build.ts', 'orchestrator.ts', 'orchestrator.ts', 'orchestrator.ts']);
     expect(writes['releasing']).toEqual(['publish.ts']);
     expect(writes['released']).toEqual(['publish.ts']);
   });

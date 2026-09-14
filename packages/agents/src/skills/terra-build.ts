@@ -17,6 +17,7 @@ import {
 } from '@statxai/contracts';
 import type * as z from 'zod/v4';
 import type { ModelCallOptions, ModelInvocationResult, ModelRuntime } from '../runtime.js';
+import type { ModelImage } from '../providers/types.js';
 import {
   TERRA_MAX_MODEL_TURNS,
   TERRA_MAX_RETURNED_BYTES,
@@ -326,16 +327,28 @@ const SYSTEM = `You are Terra, a senior frontend engineer building a complete sm
 
 ${STACK}`;
 
+/** The build contract every build-producing Terra skill writes against — the same stack, rules and design bar. */
+export const TERRA_BUILD_STACK = STACK;
+
 /** Per-call options for a Terra build: cancellation, and any tools the harness granted. */
 export interface TerraBuildOptions extends ModelCallOptions {
   readonly tools?: ToolAccess;
 }
 
-interface TerraBuildRequest {
+export interface TerraBuildRequest {
   readonly label: string;
   readonly prompt: string;
   readonly maxTokens: number;
   readonly effort: 'high' | 'xhigh';
+  /** Which Terra skill this is. Defaults to `terra-build`; a build-producing Terra skill only. */
+  readonly skill?: 'terra-build' | 'terra-refine';
+  /** Defaults to the build system prompt. */
+  readonly system?: string;
+  /**
+   * Images every turn sees. Each turn is a separate, stateless invocation, so
+   * evidence the model needs is sent with every one of them, never only the first.
+   */
+  readonly images?: readonly ModelImage[];
 }
 
 interface LoopState {
@@ -401,7 +414,7 @@ const LOOP_TOOLS: readonly ToolId[] = ['filesystem', 'test_runner'];
  * every step. A repeated request is answered from this build's own record
  * without running again. Callers only ever see the final `BuildOutput`.
  */
-async function invokeTerraBuild(
+export async function invokeTerraBuild(
   runtime: ModelRuntime,
   request: TerraBuildRequest,
   options: TerraBuildOptions,
@@ -418,10 +431,11 @@ async function invokeTerraBuild(
     options.signal?.throwIfAborted();
 
     const result = await runtime.invoke({
-      skill: 'terra-build',
+      skill: request.skill ?? 'terra-build',
       tier: 'terra',
       label: request.label,
-      system: SYSTEM,
+      system: request.system ?? SYSTEM,
+      ...(request.images !== undefined ? { images: request.images } : {}),
       schema: (tools ? TerraBuildAction : BuildOutput) as z.ZodType<unknown>,
       maxTokens: request.maxTokens,
       effort: request.effort,

@@ -111,9 +111,14 @@ describe('the tool boundary', () => {
     // Tool access is supplied by the job handler alone, so the legacy direct build is given none.
     const suppliers: string[] = [];
     for (const file of await productionFiles('packages/orchestrator/src')) {
-      if (/\btools: \{/.test(await src(file))) suppliers.push(file);
+      if (/\btools: (\{|toolAccess\()/.test(await src(file))) suppliers.push(file);
     }
     expect(suppliers).toEqual(['packages/orchestrator/src/job-handlers/frontend-backend.ts']);
+    // A visual refinement runs through the same coordinator, handler and grant: its spec is the factory's, untouched.
+    expect(orchestrator).toMatch(/lifecycleCoordinator\.run\(intent\.jobSpec, \{ kind: 'visual_refine', refinementCycle: intent\.refinementCycle \}\)/);
+    expect(spec.match(/allowedTools: \[\.\.\.ALLOWED_TOOLS\],/g)).toHaveLength(2);
+    const handler = await src('packages/orchestrator/src/job-handlers/frontend-backend.ts');
+    expect(handler.match(/toolAccess\('terra-(build|refine)'\)/g)?.sort()).toEqual(["toolAccess('terra-build')", "toolAccess('terra-refine')"]);
   });
 
   it('the handler takes permission from the claimed job, intersected with what it supports', async () => {

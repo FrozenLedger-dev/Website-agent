@@ -33,16 +33,17 @@
  */
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ArtifactRef, ToolId, ToolResult, WorkerRole } from '@statxai/contracts';
+import { VisualQualityReview, VisualRefinementSource, type ArtifactRef, type ToolId, type ToolResult, type WorkerRole } from '@statxai/contracts';
 import type { JobDocument } from '@statxai/state';
-import { defaultTemplateRoot, type ArtifactRegistry } from '@statxai/workspace';
-import type { ModelRuntime } from '@statxai/agents';
+import { contentHash, defaultTemplateRoot, type ArtifactRegistry, type BlobStore } from '@statxai/workspace';
+import { refineSiteVisually, type ModelRuntime, type ToolAccess } from '@statxai/agents';
 import { jobOutputNamespace, type JobHandler, type JobHandlerResult } from '@statxai/job-engine';
 import { prepareBuildFromPlan, type BuildCandidate, type PrepareContext } from '../phases/build.js';
 import type { Progress, RunFacts } from '../run-context.js';
 import { effectiveTools, ToolGateway } from '../tool-gateway/gateway.js';
 import { createScaffoldFilesystemAdapter } from '../tool-gateway/filesystem.js';
 import { createTestRunnerAdapter } from '../tool-gateway/test-runner.js';
+import { reproduceReviewFrames } from '../phases/visual-review.js';
 
 const ROLE: WorkerRole = 'frontend_backend';
 
@@ -81,7 +82,21 @@ export class FrontendBackendInputInvalid extends Error {
 export const FRONTEND_BACKEND_INPUT = {
   businessProfile: 'businessProfile',
   sitePlan: 'sitePlan',
+  /**
+   * Present, all three together, only on a visual refinement: the exact
+   * harness-read source snapshot of the build being refined, and the exact
+   * review and screenshot set that authorised it. Their presence is what makes
+   * a job a refinement; nothing else does.
+   */
+  visualRefinementSource: 'visualRefinementSource',
+  visualQualityReview: 'visualQualityReview',
+  screenshotSet: 'screenshotSet',
 } as const;
+
+/** Whether a job spec is a visual refinement — decided by its pinned inputs alone. */
+export function isVisualRefinementSpec(spec: { readonly inputs: Readonly<Record<string, unknown>> }): boolean {
+  return spec.inputs[FRONTEND_BACKEND_INPUT.visualRefinementSource] !== undefined;
+}
 
 /** The one staged output this handler ever produces, by label. */
 export const FRONTEND_BACKEND_OUTPUT_LABEL = 'build-candidate';
@@ -105,6 +120,13 @@ export interface FrontendBackendHandlerDeps {
   tools?: ToolGateway;
   /** Where advisory test builds create their disposable workspaces. */
   advisoryWorkspacesRoot?: string;
+  /** Durable screenshot images, read by exact key. Required to execute a visual refinement. */
+  blobs?: BlobStore;
+}
+
+/** Two refs name the same exact artifact: same name and version, and the same content hash wherever both record one. */
+function sameExactRef(a: ArtifactRef, b: ArtifactRef): boolean {
+  return a.name === b.name && a.version === b.version && (a.contentHash === undefined || b.contentHash === undefined || a.contentHash === b.contentHash);
 }
 
 /** The production gateway for one claimed job: exactly the two tools this handler supports. */
@@ -144,6 +166,63 @@ export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDe
   const say: Progress = deps.say ?? (() => {});
   const advisoryWorkspacesRoot = deps.advisoryWorkspacesRoot ?? join(tmpdir(), 'statxai-advisory');
 
+  /**
+   * A visual refinement's generation half: the exact pinned source, review and
+   * screenshots — each resolved by exact ref and proven to name the others — and
+   * one bounded `terra-refine` proposal. Like a build, it writes nothing.
+   */
+  async function prepareVisualRefinement(
+    job: JobDocument,
+    profile: RunFacts['profile'],
+    plan: Parameters<typeof prepareBuildFromPlan>[1],
+    tools: ToolAccess,
+    signal: AbortSignal,
+  ): Promise<BuildCandidate> {
+    if (!deps.blobs) throw new FrontendBackendInputInvalid(`frontend_backend job "${job._id}" is a visual refinement, but this handler has no screenshot store`);
+    const sourceRef = requiredRef(job, FRONTEND_BACKEND_INPUT.visualRefinementSource);
+    const reviewRef = requiredRef(job, FRONTEND_BACKEND_INPUT.visualQualityReview);
+    const setRef = requiredRef(job, FRONTEND_BACKEND_INPUT.screenshotSet);
+
+    const [rawSource, rawReview] = await Promise.all([
+      deps.registry.resolve(job.projectId, sourceRef),
+      deps.registry.resolve(job.projectId, reviewRef),
+    ]);
+    const source = VisualRefinementSource.parse(rawSource);
+    const review = VisualQualityReview.parse(rawReview);
+
+    const refuse = (detail: string) => new FrontendBackendInputInvalid(`visual refinement job "${job._id}": ${detail}`);
+    if (sourceRef.contentHash !== undefined && contentHash(rawSource) !== sourceRef.contentHash) throw refuse('the source snapshot does not match its pinned content hash');
+    if (source.projectId !== job.projectId) throw refuse('the source snapshot belongs to another project');
+    if (contentHash(source.files) !== source.filesDigest) throw refuse('the source snapshot files do not match their digest');
+    if (!sameExactRef(source.visualQualityReview, reviewRef) || !sameExactRef(source.screenshotSet, setRef)) {
+      throw refuse('the source snapshot names a different review or screenshot set than the job pins');
+    }
+    if (!sameExactRef(review.screenshotSet, setRef)) throw refuse('the review judged a different screenshot set than the job pins');
+    if (review.status !== 'reviewed' || !review.assessment) throw refuse(`the review is ${review.status}, not a usable assessment`);
+
+    signal.throwIfAborted();
+    // Exactly the images the reviewer judged, recut from the durable screenshots and matched frame by frame.
+    const frames = await reproduceReviewFrames({ registry: deps.registry, blobs: deps.blobs }, job.projectId, review);
+    signal.throwIfAborted();
+
+    say({ phase: 'build', detail: `Terra is refining build ${source.predecessorBindingId} (visual refinement ${source.refinementCycle})` });
+    const refined = await refineSiteVisually(
+      deps.model,
+      {
+        profile,
+        plan,
+        refinementCycle: source.refinementCycle,
+        predecessor: { bindingId: source.predecessorBindingId, sourceCommit: source.sourceCommit },
+        source: source.files,
+        review: { ref: reviewRef, screenshotSet: setRef, assessment: review.assessment },
+        frames,
+      },
+      { signal, tools },
+    );
+    // No route decision: a refinement is not routed, and says so rather than inventing one.
+    return { routeDecisions: [], files: refined.value.files };
+  }
+
   return async (job, ctx): Promise<JobHandlerResult> => {
     if (job.role !== ROLE) {
       throw new FrontendBackendRoleMismatch(job.role);
@@ -168,43 +247,43 @@ export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDe
 
     const gateway = deps.tools ?? createFrontendBackendToolGateway({ profile, plan, advisoryWorkspacesRoot });
 
+    // Bound to this claimed job. Permission is re-checked by the gateway on
+    // every call, against this job's own spec — never against anything the
+    // model says. The same grant for a build and a refinement; only the skill
+    // named in the evidence differs.
+    const toolAccess = (skill: 'terra-build' | 'terra-refine'): ToolAccess => ({
+      grantedTools: effectiveTools(job.spec.allowedTools, FRONTEND_BACKEND_SUPPORTED_TOOLS),
+      execute: (request, signal) =>
+        gateway.execute<ToolResult>({
+          tool: request.tool,
+          input: request.input,
+          context: {
+            projectId: job.projectId,
+            jobId: job._id,
+            skill,
+            role: job.role,
+            allowedTools: job.spec.allowedTools,
+            supportedTools: FRONTEND_BACKEND_SUPPORTED_TOOLS,
+          },
+          ...(signal !== undefined ? { signal } : {}),
+        }),
+    });
+
     // No workspace, artifact acceptance, or store mutation happens here or
     // inside prepareBuildFromPlan — generation only calls the model. The
     // canonical project workspace is never opened by this handler at all,
     // so there is nothing here that could materialise into it before this
     // execution's authority is proven.
-    const prepareContext: PrepareContext = {
-      deps: {
-        model: deps.model,
-        say,
-        // Bound to this claimed job. Permission is re-checked by the gateway on
-        // every call, against this job's own spec — never against anything the
-        // model says.
-        tools: {
-          grantedTools: effectiveTools(job.spec.allowedTools, FRONTEND_BACKEND_SUPPORTED_TOOLS),
-          execute: (request, signal) =>
-            gateway.execute<ToolResult>({
-              tool: request.tool,
-              input: request.input,
-              context: {
-                projectId: job.projectId,
-                jobId: job._id,
-                skill: 'terra-build',
-                role: job.role,
-                allowedTools: job.spec.allowedTools,
-                supportedTools: FRONTEND_BACKEND_SUPPORTED_TOOLS,
-              },
-              ...(signal !== undefined ? { signal } : {}),
-            }),
-        },
-      },
-      facts: { profile: profile as RunFacts['profile'] },
-    };
-    const candidate: BuildCandidate = await prepareBuildFromPlan(
-      prepareContext,
-      plan as Parameters<typeof prepareBuildFromPlan>[1],
-      ctx.signal,
-    );
+    let candidate: BuildCandidate;
+    if (isVisualRefinementSpec(job.spec)) {
+      candidate = await prepareVisualRefinement(job, profile as RunFacts['profile'], plan as Parameters<typeof prepareBuildFromPlan>[1], toolAccess('terra-refine'), ctx.signal);
+    } else {
+      const prepareContext: PrepareContext = {
+        deps: { model: deps.model, say, tools: toolAccess('terra-build') },
+        facts: { profile: profile as RunFacts['profile'] },
+      };
+      candidate = await prepareBuildFromPlan(prepareContext, plan as Parameters<typeof prepareBuildFromPlan>[1], ctx.signal);
+    }
 
     // The signal cancels the model call at the provider, but authority can
     // still be lost the instant after it resolves; the result is checked again

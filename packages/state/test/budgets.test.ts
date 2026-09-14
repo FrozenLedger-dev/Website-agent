@@ -49,7 +49,27 @@ describe('project budgets', () => {
       fullRebuilds: 1,
       replans: 2,
       failedDeployments: 2,
+      visualRefinements: 2,
     });
+  });
+
+  it('allows exactly two durable visual refinements, and a budget that predates them allows none — without any migration', async () => {
+    await spend(store, PROJECT, 'visualRefinements');
+    await spend(store, PROJECT, 'visualRefinements');
+    await expect(spend(store, PROJECT, 'visualRefinements')).rejects.toBeInstanceOf(BudgetExhausted);
+
+    const legacy = `${PROJECT}_legacy`;
+    await store.budgets.deleteOne({ _id: legacy });
+    await store.budgets.insertOne({
+      _id: legacy,
+      limits: { reviewRejections: 3, repairsPerDefect: 2, totalRepairJobs: 8, fullRebuilds: 1, replans: 2, failedDeployments: 2 },
+      used: { reviewRejections: 0, totalRepairJobs: 0, fullRebuilds: 0, replans: 0, failedDeployments: 0 },
+      updatedAt: new Date(),
+    });
+    await expect(spend(store, legacy, 'visualRefinements')).rejects.toBeInstanceOf(BudgetExhausted);
+    expect((await store.budgets.findOne({ _id: legacy }))!.used).not.toHaveProperty('visualRefinements');
+    await spend(store, legacy, 'replans');
+    await store.budgets.deleteOne({ _id: legacy });
   });
 
   it('permits exactly the configured number of spends, then refuses', async () => {

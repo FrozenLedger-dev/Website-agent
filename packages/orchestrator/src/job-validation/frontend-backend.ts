@@ -23,13 +23,13 @@
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import * as z from 'zod/v4';
-import { GeneratedFile, type ArtifactRef, type BusinessProfile, type SitePlan } from '@statxai/contracts';
+import { GeneratedFile, routeToSourcePath, type ArtifactRef, type BusinessProfile, type SitePlan } from '@statxai/contracts';
 import type { JobDocument } from '@statxai/state';
 import { ProjectWorkspace, assertModelWritableFiles, scaffoldSite, type ArtifactRegistry, type BuildResult } from '@statxai/workspace';
 import { jobOutputNamespace } from '@statxai/job-engine';
 import { runDeterministicGates } from '../phases/evaluate.js';
 import type { BuildCandidate } from '../phases/build.js';
-import { FRONTEND_BACKEND_INPUT } from '../job-handlers/frontend-backend.js';
+import { FRONTEND_BACKEND_INPUT, isVisualRefinementSpec } from '../job-handlers/frontend-backend.js';
 
 type DeterministicGateResult = Awaited<ReturnType<typeof runDeterministicGates>>;
 
@@ -305,7 +305,16 @@ export async function validateFrontendBackendCandidate(
     await scaffoldSite(ws.siteRoot);
     await ws.writeSiteFiles(candidate.files);
 
-    const { compiled, gateRun } = await runDeterministicGates(ws.siteRoot, profile, plan);
+    const measured = await runDeterministicGates(ws.siteRoot, profile, plan);
+    const compiled = measured.compiled;
+    // A visual refinement changes how the site looks, never what it is: its
+    // page files must be exactly the approved plan's routes. The gates already
+    // refuse a missing route; this refuses an added one, which they do not ask about.
+    const conformance = isVisualRefinementSpec(job.spec) ? planConformanceFindings(candidate.files, plan) : [];
+    const gateRun =
+      conformance.length === 0
+        ? measured.gateRun
+        : { ...measured.gateRun, passed: false, findings: [...measured.gateRun.findings, ...conformance], gatesRun: [...measured.gateRun.gatesRun, 'plan-conformance'] };
 
     const binding: FrontendBackendValidationBinding = {
       projectId: job.projectId,
@@ -336,6 +345,33 @@ export async function validateFrontendBackendCandidate(
   } finally {
     await rm(validationRoot, { recursive: true, force: true });
   }
+}
+
+const PAGE_FILE = /^app\/(?:.+\/)?page\.(?:tsx|jsx|ts|js)$/;
+
+/** A page file for a route the exact plan does not contain, or a planned route with no page file of its own. */
+export function planConformanceFindings(
+  files: readonly { readonly path: string }[],
+  plan: SitePlan,
+): FrontendBackendCandidateValidation['gateRun']['findings'] {
+  const planned = new Set(plan.sitemap.pages.map((page) => routeToSourcePath(page.route)));
+  const pages = new Set(files.map((f) => f.path).filter((path) => PAGE_FILE.test(path)));
+  return [
+    ...[...pages].filter((path) => !planned.has(path)).sort().map((path) => ({
+      severity: 'P0' as const,
+      gate: 'plan-conformance',
+      location: path,
+      message: 'a visual refinement added a page for a route the approved plan does not contain',
+      acceptanceTest: 'Every page file corresponds to a route in the approved plan.',
+    })),
+    ...[...planned].filter((path) => !pages.has(path)).sort().map((path) => ({
+      severity: 'P0' as const,
+      gate: 'plan-conformance',
+      location: path,
+      message: 'a visual refinement dropped the page of a planned route',
+      acceptanceTest: 'Every route in the approved plan has its page file.',
+    })),
+  ];
 }
 
 async function ensureRoot(root: string): Promise<void> {

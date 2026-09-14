@@ -3,9 +3,9 @@
  *
  * A predecessor never implies a replan: what a successor is comes from one
  * reader over the typed contract. The one-successor slot is keyed on the
- * predecessor alone, lineage is walked structurally, and this prerequisite
- * adds identity only — no refinement orchestration, skill, tool, budget or
- * job origin, and no production path yet prepares a visual-refinement successor.
+ * predecessor alone, lineage is walked structurally, and successors are
+ * prepared only by the two harness decisions that own a reason — the replan
+ * and the visual refinement — and recovered through the same typed reader.
  */
 import { readdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -116,43 +116,32 @@ describe('one lineage, whatever the reason', () => {
   });
 });
 
-describe('Phase 5q accepts a visual refinement structurally and owns only replans', () => {
-  it('recovery proves the tip from its own stored reason, then refuses any non-replan successor as not owned', async () => {
+describe('Phase 5q owns every successor kind through the typed contract', () => {
+  it('recovery proves the tip from its own stored reason and refuses no well-formed successor kind', async () => {
     const code = await src(RECOVERY);
     const read = code.indexOf('readBuildLineage(tip)');
     const verified = code.indexOf('verifyBindingConsistency(', read);
-    const refused = code.indexOf('throw new ActiveContinuationSuccessorNotOwned(', verified);
     expect(read).toBeGreaterThan(-1);
     expect(verified).toBeGreaterThan(read);
-    expect(refused).toBeGreaterThan(verified);
-    expect(code.slice(verified, refused)).toContain("position.provenance.kind !== 'replan'");
-    expect(code).not.toMatch(/visual_refinement'\s*\)?\s*\{[\s\S]{0,400}(runJob|prepareFrontendBackendBuildBinding|terra)/);
+    expect(code).not.toContain('ActiveContinuationSuccessorNotOwned');
+    expect(code).not.toMatch(/provenance\.kind\s*!==\s*'replan'/);
+    // Recovery never builds: it evaluates what promoted and lets the run decide what comes next.
+    expect(code).not.toMatch(/prepareFrontendBackendBuildBinding\(|refineSiteVisually\(|authorizeVisualRefinement\(/);
   });
 });
 
-describe('identity only: nothing that would perform a refinement exists', () => {
-  it('no production code prepares a visual-refinement successor; the only successor caller is the replan', async () => {
+describe('successors are prepared only by the two harness decisions that own them', () => {
+  it('the replan and the visual refinement are the only successor callers, each with its own typed reason', async () => {
     const callers: string[] = [];
     for (const file of await allProductionFiles()) {
       const code = await src(file);
-      if (/kind: 'visual_refinement'/.test(code) && file !== CONTRACT) callers.push(file);
-      if (/prepareFrontendBackendBuildBinding\(/.test(code) && file !== BINDING) callers.push(`prepare:${file}`);
+      if (/prepareFrontendBackendBuildBinding\(/.test(code) && file !== BINDING) callers.push(file);
     }
-    expect(callers).toEqual(['prepare:packages/orchestrator/src/orchestrator.ts']);
+    expect(callers).toEqual(['packages/orchestrator/src/orchestrator.ts']);
     const orchestrator = await src('packages/orchestrator/src/orchestrator.ts');
-    expect(orchestrator.match(/provenance: [A-Za-z]+SuccessorProvenance\.parse\(\{ kind: '([a-z_]+)'/g)).toEqual([
+    expect(orchestrator.match(/provenance: [A-Za-z]+SuccessorProvenance\.parse\(\{\s*kind: '([a-z_]+)'/g)?.map((m) => m.replace(/\s+/g, ' '))).toEqual([
+      "provenance: VisualRefinementSuccessorProvenance.parse({ kind: 'visual_refinement'",
       "provenance: ReplanSuccessorProvenance.parse({ kind: 'replan'",
     ]);
-  });
-
-  it('no refinement skill, job origin, tool, budget or threshold was added', async () => {
-    const skills = await readdir(join(REPO, 'packages/agents/src/skills'));
-    expect(skills.filter((s) => /refine/i.test(s))).toEqual([]);
-    const job = await src('packages/contracts/src/job.ts');
-    expect(job).not.toMatch(/visual_refine/);
-    for (const file of await allProductionFiles()) {
-      const code = await src(file);
-      expect(code, file).not.toMatch(/terra-refine|\bvisualRefinements\b|maxRefinement|refinementBudget|refinementThreshold/);
-    }
   });
 });

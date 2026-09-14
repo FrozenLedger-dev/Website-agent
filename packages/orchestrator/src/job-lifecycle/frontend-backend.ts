@@ -21,7 +21,7 @@
  */
 import type { ArtifactRef, JobOrigin, JobSpec, JobState } from '@statxai/contracts';
 import type { JobDocument, StateStore } from '@statxai/state';
-import { contentHash, type ArtifactRegistry, type BuildResult } from '@statxai/workspace';
+import { BlobStore, contentHash, type ArtifactRegistry, type BuildResult } from '@statxai/workspace';
 import type { ModelRuntime } from '@statxai/agents';
 import { JobRunner, type JobEngine, type JobWorkerIdentity, type SleepFn } from '@statxai/job-engine';
 import {
@@ -200,6 +200,8 @@ export function createFrontendBackendLifecycleCoordinator(
   const handler = createTerraFrontendBackendHandler({
     registry: deps.registry,
     model: deps.model,
+    // Read-only, by exact key: what a visual refinement needs to see the screenshots its review judged.
+    blobs: new BlobStore(deps.store),
     ...(deps.say !== undefined ? { say: deps.say } : {}),
     ...(deps.advisoryWorkspacesRoot !== undefined ? { advisoryWorkspacesRoot: deps.advisoryWorkspacesRoot } : {}),
   });

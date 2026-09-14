@@ -16,6 +16,7 @@ import {
   BusinessProfile,
   SitePlan,
   ReplanSuccessorProvenance,
+  VisualRefinementSuccessorProvenance,
   type AgentTier,
   type ArtifactRef,
   type BrowserRenderAuthority,
@@ -59,6 +60,7 @@ import {
   type FrontendBackendLifecycleCoordinator,
 } from './job-lifecycle/frontend-backend.js';
 import { createFrontendBackendJobSpec } from './job-specs/frontend-backend.js';
+import { authorizeVisualRefinement } from './visual-refinement/authorize.js';
 import {
   computeRunIntentHash,
   ensureSpecificationCommitted,
@@ -661,6 +663,113 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     const mustFix = blocking(progress.openDefects);
 
     if (mustFix.length === 0) {
+      /**
+       * Before anyone judges release: may Terra visually refine the canonical
+       * build first?
+       *
+       * Asked here, and only here — nothing blocking remains, so this is the
+       * build Sol would otherwise judge — and answered by the harness alone,
+       * from the exact review of this build's exact screenshots. An authorised
+       * refinement is an ordinary successor build: Terra proposes, the lifecycle
+       * validates in isolation, accepts, fences and promotes, and the run then
+       * evaluates the new canonical build from scratch. Sol only ever sees the
+       * build refinement stopped at.
+       */
+      if (
+        frontendBackendExecutionMode === 'job_lifecycle' &&
+        canonicalBuild &&
+        lifecycleCoordinator &&
+        evaluation.screenshotSet &&
+        evaluation.visualQualityReview
+      ) {
+        const refinement = await authorizeVisualRefinement({
+          store,
+          registry,
+          workspace,
+          projectId,
+          canonicalBindingId: canonicalBuild._id,
+          canonicalPromotion: canonicalPromotion ?? { promotionId: canonicalBuild.promotionId, promotionCommitSha: canonicalBuild.promotionCommitSha },
+          screenshotSet: evaluation.screenshotSet,
+          review: evaluation.visualQualityReview,
+        });
+
+        if (refinement.kind === 'ineligible') {
+          say({ phase: 'evaluate', detail: `No visual refinement (${refinement.decision.reason}): ${refinement.decision.detail}` });
+        } else {
+          const { intent } = refinement;
+          say({
+            phase: 'build',
+            detail:
+              `${refinement.replayed ? 'Resuming' : 'Authorised'} visual refinement ${intent.refinementCycle} of build ${intent.predecessorBindingId} ` +
+              `from ${intent.visualQualityReview.name}@${intent.visualQualityReview.version} (job ${intent.jobId})`,
+          });
+
+          const successor = await prepareFrontendBackendBuildBinding(store, {
+            projectId,
+            runIntentHash: computeRunIntentHash({ projectId, profile }),
+            businessProfileRef: canonicalBuild.businessProfile,
+            sitePlanRef: canonicalBuild.sitePlan,
+            jobSpec: intent.jobSpec,
+            specificationBaseCommit: await workspace.currentCommit(),
+            lineage: {
+              predecessorBindingId: intent.predecessorBindingId,
+              provenance: VisualRefinementSuccessorProvenance.parse({
+                kind: 'visual_refinement',
+                visualQualityReview: intent.visualQualityReview,
+                screenshotSet: intent.screenshotSet,
+                refinementCycle: intent.refinementCycle,
+              }),
+            },
+          });
+          if (successor._id !== intent.successorBindingId) {
+            throw new FrontendBackendBuildNotPublishable(successor._id, `refinement intent "${intent._id}" names successor "${intent.successorBindingId}"`);
+          }
+
+          await store.projects.updateOne({ _id: projectId }, { $set: { state: 'building', updatedAt: new Date() } });
+
+          // The refinement's own harness record is what its specification commit
+          // carries: the plan is unchanged, so this is the one new fact on disk.
+          await workspace.materialiseArtifact('decisions/visual-refinement.json', {
+            intentId: intent._id,
+            predecessorBindingId: intent.predecessorBindingId,
+            successorBindingId: intent.successorBindingId,
+            refinementCycle: intent.refinementCycle,
+            visualQualityReview: intent.visualQualityReview,
+            screenshotSet: intent.screenshotSet,
+            policyVersion: intent.policyVersion,
+            sourceCommit: intent.sourceCommit,
+            source: intent.source,
+            jobId: intent.jobId,
+          });
+          const harnessRecords = (await workspace.dirtyPaths()).filter((p) => p.startsWith('decisions/'));
+          await ensureSpecificationCommitted(store, workspace, successor, progress.plan!, harnessRecords);
+
+          const refined = await lifecycleCoordinator.run(intent.jobSpec, { kind: 'visual_refine', refinementCycle: intent.refinementCycle });
+
+          if (refined.outcome !== 'promoted') {
+            say({
+              phase: 'build',
+              detail: `frontend_backend visual refinement did not complete this invocation (${refined.outcome})`,
+              level: 'fail',
+            });
+            // Exactly as an unpromoted replan rebuild: canonical authority stays on
+            // the predecessor, the slot stays spent, and nothing is refined again.
+            return { ...(await concluded(ctx(), 'blocked', undefined)), jobLifecycleOutcome: refined.outcome };
+          }
+
+          await finalizeBindingPromoted(store, successor._id, {
+            promotionId: refined.promotionId,
+            promotionCommitSha: refined.commitSha,
+          });
+          canonicalBuild = successor;
+          canonicalPromotion = { promotionId: refined.promotionId, promotionCommitSha: refined.commitSha };
+          say({ phase: 'build', detail: `frontend_backend visual refinement promoted: commit ${refined.commitSha}`, level: 'ok' });
+          progress.repairedSinceReview = [];
+          // Fresh gates, render, screenshots and review of the refined build — never the predecessor's.
+          continue;
+        }
+      }
+
       /**
        * Nothing blocking remains, so the question becomes whether to release —
        * which is two questions, asked in order. Sol judges; the harness decides.

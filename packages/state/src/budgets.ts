@@ -31,6 +31,8 @@ export const DEFAULT_BUDGET_LIMITS: Readonly<BudgetLimits> = Object.freeze({
   fullRebuilds: 1,
   replans: 2,
   failedDeployments: 2,
+  /** Terra visual refinements of the canonical build per run: a first pass and at most one more. */
+  visualRefinements: 2,
 });
 
 export const ZERO_USAGE: Readonly<BudgetUsage> = Object.freeze({
@@ -39,6 +41,7 @@ export const ZERO_USAGE: Readonly<BudgetUsage> = Object.freeze({
   fullRebuilds: 0,
   replans: 0,
   failedDeployments: 0,
+  visualRefinements: 0,
 });
 
 export async function createBudget(
@@ -143,7 +146,8 @@ export async function remaining(
   const budget = await store.budgets.findOne({ _id: projectId });
   if (!budget) return null;
   const keys = Object.keys(budget.used) as ProjectBudgetKey[];
-  return Object.fromEntries(keys.map((k) => [k, budget.limits[k] - budget.used[k]])) as Record<
+  // A key a historical budget predates has no allowance: it reads as zero remaining, never as unlimited.
+  return Object.fromEntries(keys.map((k) => [k, (budget.limits[k] ?? 0) - (budget.used[k] ?? 0)])) as Record<
     ProjectBudgetKey,
     number
   >;

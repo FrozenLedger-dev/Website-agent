@@ -58,6 +58,13 @@ export interface BudgetLimits {
   fullRebuilds: number;
   replans: number;
   failedDeployments: number;
+  /**
+   * Terra visual refinements of the canonical build. Optional because a budget
+   * written before visual refinement existed has no such key — and a guarded
+   * spend against a missing limit matches nothing, so such a project is simply
+   * never refined. No backfill.
+   */
+  visualRefinements?: number;
 }
 
 export interface BudgetUsage {
@@ -66,6 +73,8 @@ export interface BudgetUsage {
   fullRebuilds: number;
   replans: number;
   failedDeployments: number;
+  /** See {@link BudgetLimits.visualRefinements}. */
+  visualRefinements?: number;
 }
 
 export interface BudgetDocument {
@@ -357,6 +366,50 @@ export interface FrontendBackendBuildBindingDocument {
   abandonmentReason?: string;
   createdAt: Date;
   updatedAt: Date;
+}
+
+// ---------------------------------------------------------------------------
+// Visual refinement intent
+// ---------------------------------------------------------------------------
+
+/**
+ * The durable authorisation of one Terra visual refinement of one exact
+ * canonical build.
+ *
+ * `_id` is deterministic from the project and the predecessor build, and a
+ * predecessor can be refined at most once (it has one successor slot, forever),
+ * so this collection is itself the replay ledger: the record, the budget spend
+ * that authorised it and the exact source snapshot it pins are written in one
+ * transaction, before any model is invoked. A retry after any crash finds this
+ * record and reuses it — the same source, the same job, no second spend —
+ * rather than authorising again from whatever a fresh evaluation says.
+ *
+ * Immutable once written. What became of the attempt is not recorded here: the
+ * successor binding, its job and its promotion receipt already say that.
+ */
+export interface VisualRefinementIntentDocument {
+  _id: string;
+  projectId: string;
+  /** The root of the build lineage the predecessor belongs to. */
+  lineageRootBindingId: string;
+  /** The exact promoted canonical build being refined. */
+  predecessorBindingId: string;
+  /** The exact review and screenshot set that authorised it. */
+  visualQualityReview: ArtifactRef;
+  screenshotSet: ArtifactRef;
+  refinementCycle: number;
+  /** The eligibility policy the decision was made under. */
+  policyVersion: string;
+  /** The canonical commit the source was read at, and the exact snapshot. */
+  sourceCommit: string;
+  source: ArtifactRef;
+  /** The deterministic job and successor binding this intent is answered by. */
+  jobId: string;
+  jobSpec: JobSpec;
+  successorBindingId: string;
+  /** The budget spend this intent consumed: `used.visualRefinements` after it. */
+  budgetSlot: number;
+  authorizedAt: Date;
 }
 
 // ---------------------------------------------------------------------------

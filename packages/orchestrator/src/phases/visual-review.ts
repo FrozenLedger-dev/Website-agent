@@ -233,6 +233,57 @@ export async function reviewScreenshotSetVisually(
   return persist('reviewed', { frames, reviewed: reviewed.length, assessment, reviewer });
 }
 
+/** The frames a review recorded could not be reproduced byte-for-byte from the screenshot set it names. */
+export class ReviewFramesNotReproducible extends Error {
+  constructor(detail: string) {
+    super(`visual review frames cannot be reproduced exactly: ${detail}`);
+    this.name = 'ReviewFramesNotReproducible';
+  }
+}
+
+/**
+ * The exact images a recorded review judged, recut from the durable screenshots
+ * of the exact set it names — for a later reader (a refinement) that must see
+ * what the reviewer saw, never a newer or re-rendered capture.
+ *
+ * Every image is read by its exact blob key and re-hashed against the set; every
+ * frame is recut under the same policy and must match the review's recorded
+ * frame sha256, offset and size exactly. Anything else fails closed.
+ */
+export async function reproduceReviewFrames(
+  deps: Pick<VisualReviewDeps, 'registry' | 'blobs'>,
+  projectId: string,
+  review: VisualQualityReview,
+): Promise<VisualReviewImage[]> {
+  if (review.framePolicyVersion !== VISUAL_REVIEW_FRAME_POLICY_VERSION) {
+    throw new ReviewFramesNotReproducible(`frame policy ${review.framePolicyVersion} is not ${VISUAL_REVIEW_FRAME_POLICY_VERSION}`);
+  }
+  const set = ScreenshotSet.parse(await deps.registry.resolve(projectId, review.screenshotSet));
+  const images: VisualReviewImage[] = [];
+  const cutByTarget = new Map<string, ReturnType<typeof frameScreenshot>>();
+  for (const frame of review.frames) {
+    const key = `${frame.route}\0${frame.viewport}`;
+    let cut = cutByTarget.get(key);
+    const capture = set.captures.find((c) => c.route === frame.route && c.viewport.name === frame.viewport);
+    if (!capture?.image) throw new ReviewFramesNotReproducible(`${frame.route} @ ${frame.viewport} has no screenshot in ${review.screenshotSet.name}@${review.screenshotSet.version}`);
+    if (capture.image.sha256 !== frame.sourceSha256) throw new ReviewFramesNotReproducible(`${frame.route} @ ${frame.viewport} names a different screenshot`);
+    if (!cut) {
+      const bytes = await deps.blobs.get(capture.image.blob);
+      if (createHash('sha256').update(bytes).digest('hex') !== capture.image.sha256 || bytes.length !== capture.image.bytes) {
+        throw new ReviewFramesNotReproducible(`${frame.route} @ ${frame.viewport}: stored image does not match the screenshot set's sha256`);
+      }
+      cut = frameScreenshot(bytes, capture.viewport.height, frame.count);
+      cutByTarget.set(key, cut);
+    }
+    const recut = cut.find((c) => c.index === frame.index);
+    if (!recut || recut.count !== frame.count || recut.sha256 !== frame.sha256 || recut.offsetY !== frame.offsetY || recut.width !== frame.width || recut.height !== frame.height) {
+      throw new ReviewFramesNotReproducible(`${frame.route} @ ${frame.viewport} frame ${frame.index} does not recut to the recorded frame`);
+    }
+    images.push({ route: frame.route, viewport: frame.viewport, index: frame.index, count: frame.count, offsetY: frame.offsetY, sourceHeight: frame.sourceHeight, png: recut.png });
+  }
+  return images;
+}
+
 /** A compact, exact account of a visual review for Sol — named by its reference, never looked up. */
 export function summarizeVisualReview(outcome: VisualQualityReviewOutcome): string {
   const { ref, review } = outcome;

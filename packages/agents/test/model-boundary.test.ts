@@ -67,13 +67,25 @@ describe('the model runtime boundary', () => {
       const code = stripComments(await readFile(join(dir, name), 'utf8'));
 
       expect(Object.keys(MODEL_SKILL_TIERS), `${name} is not a registered skill`).toContain(skill);
-      expect(code, name).toMatch(/runtime\.invoke\(\{/);
 
+      if (skill === 'terra-refine') {
+        // The one skill that reaches the runtime through Terra's shared bounded build loop
+        // rather than its own invoke — and only ever under its own name.
+        expect(code, name).not.toMatch(/runtime\.invoke\(|ModelClient|new ModelRuntime/);
+        expect(code.match(/invokeTerraBuild\(/g), name).toHaveLength(1);
+        expect([...code.matchAll(/\bskill:\s*'([^']+)'/g)].map((m) => m[1]), name).toEqual(['terra-refine']);
+        seen.add(skill);
+        continue;
+      }
+
+      expect(code, name).toMatch(/runtime\.invoke\(\{/);
       const invokes = code.match(/runtime\.invoke\(\{/g)!.length;
-      const names = [...code.matchAll(/\bskill:\s*'([^']+)'/g)].map((m) => m[1]);
+      // Terra's shared build loop names its skill per request, defaulting to its own; only build-producing Terra skills may be named.
+      const names = [...code.matchAll(/\bskill:\s*(?:request\.skill \?\? )?'([^']+)'/g)].map((m) => m[1]);
       const tiers = [...code.matchAll(/\btier:\s*'([^']+)'/g)].map((m) => m[1]);
       expect(names, name).toEqual(Array(invokes).fill(skill));
       expect(tiers, name).toEqual(Array(invokes).fill(MODEL_SKILL_TIERS[skill as keyof typeof MODEL_SKILL_TIERS]));
+      if (skill === 'terra-build') expect(code, name).toMatch(/readonly skill\?: 'terra-build' \| 'terra-refine';/);
       seen.add(skill);
     }
 

@@ -44,6 +44,7 @@ export const MODEL_SKILL_TIERS = {
   'sol-approve': 'sol',
   'terra-build': 'terra',
   'terra-review': 'terra',
+  'terra-refine': 'terra',
   'luna-repair': 'luna',
 } as const satisfies Record<string, AgentTier>;
 

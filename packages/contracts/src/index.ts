@@ -8,3 +8,4 @@ export * from './tools.js';
 export * from './browser.js';
 export * from './visual-review.js';
 export * from './build-lineage.js';
+export * from './visual-refinement.js';

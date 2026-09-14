@@ -15,7 +15,7 @@ import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import type { GeneratedFile } from '@statxai/contracts';
-import { assertModelWritableFiles } from './site-build.js';
+import { assertModelWritableFiles, isModelSourceFile } from './site-build.js';
 
 const exec = promisify(execFile);
 
@@ -40,6 +40,28 @@ export interface DirtyEntry {
   readonly status: string;
   readonly path: string;
 }
+
+/** A source snapshot at an exact commit would exceed its bounds. Refused whole, never truncated. */
+export class SourceSnapshotTooLarge extends Error {
+  constructor(
+    readonly commit: string,
+    readonly files: number,
+    readonly bytes: number,
+  ) {
+    super(`the model source at ${commit} is ${files} files and ${bytes} bytes, beyond the snapshot bounds`);
+    this.name = 'SourceSnapshotTooLarge';
+  }
+}
+
+/** A commit identity that is not a full 40-character SHA — never resolved as a ref, a branch or an expression. */
+export class CommitIdentityInvalid extends Error {
+  constructor(readonly commit: string) {
+    super(`"${commit}" is not an exact commit SHA`);
+    this.name = 'CommitIdentityInvalid';
+  }
+}
+
+const EXACT_SHA = /^[a-f0-9]{40}$/;
 
 export class ProjectWorkspace {
   private constructor(
@@ -304,6 +326,60 @@ export class ProjectWorkspace {
       if (message.split('\n').some((line) => line.trim() === marker)) shas.push(sha);
     }
     return shas;
+  }
+
+  /**
+   * Every model-owned source file tracked at one exact commit, read from Git's
+   * object store — never from the working tree, so neither an uncommitted edit
+   * nor a later commit can change what is returned for the same SHA.
+   *
+   * The same selection {@link readSourceFiles} makes from disk
+   * (`isModelSourceFile`), sorted by site-relative path. Refused whole, before
+   * any content is read, when it would exceed `limits`.
+   */
+  async readModelSourceAtCommit(
+    commit: string,
+    limits: { readonly maxFiles: number; readonly maxBytes: number },
+  ): Promise<{ path: string; contents: string }[]> {
+    if (!EXACT_SHA.test(commit)) throw new CommitIdentityInvalid(commit);
+    const site = relative(this.root, this.siteRoot);
+    const listing = await this.git('ls-tree', '-r', '-l', '-z', '--full-tree', commit, '--', site);
+    const entries: { path: string; blob: string; size: number }[] = [];
+    for (const record of listing.split('\0')) {
+      if (record === '') continue;
+      const tab = record.indexOf('\t');
+      const [, type, blob, size] = record.slice(0, tab).split(/\s+/);
+      const repoPath = record.slice(tab + 1);
+      if (type !== 'blob' || !repoPath.startsWith(`${site}/`)) continue;
+      const path = repoPath.slice(site.length + 1);
+      if (!isModelSourceFile(path)) continue;
+      entries.push({ path, blob: blob!, size: Number(size) });
+    }
+    const bytes = entries.reduce((sum, e) => sum + e.size, 0);
+    if (entries.length > limits.maxFiles || bytes > limits.maxBytes) throw new SourceSnapshotTooLarge(commit, entries.length, bytes);
+
+    const files: { path: string; contents: string }[] = [];
+    for (const entry of entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
+      const { stdout } = await exec('git', ['-c', `safe.directory=${this.root}`, '-C', this.root, 'cat-file', 'blob', entry.blob], {
+        maxBuffer: limits.maxBytes + 1,
+        encoding: 'utf8',
+      });
+      files.push({ path: entry.path, contents: stdout });
+    }
+    return files;
+  }
+
+  /** Whether `ancestor` is `descendant` or one of its ancestors. Both must be exact SHAs. */
+  async isAncestorCommit(ancestor: string, descendant: string): Promise<boolean> {
+    if (!EXACT_SHA.test(ancestor)) throw new CommitIdentityInvalid(ancestor);
+    if (!EXACT_SHA.test(descendant)) throw new CommitIdentityInvalid(descendant);
+    try {
+      await this.git('merge-base', '--is-ancestor', ancestor, descendant);
+      return true;
+    } catch (error) {
+      if ((error as { code?: unknown }).code === 1) return false;
+      throw error;
+    }
   }
 
   /**

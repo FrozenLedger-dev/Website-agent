@@ -185,7 +185,8 @@ describe('canonical evaluation renders the exact build it evaluates', () => {
     const authority = body(orchestrator, 'const renderAuthority = (): BrowserRenderAuthority => {', '\n  };');
     expect(authority).toContain("if (frontendBackendExecutionMode !== 'job_lifecycle') return { mode: 'legacy_direct' };");
     expect(authority).toContain('buildBindingId: canonicalBuild._id,');
-    expect(orchestrator.match(/canonicalPromotion = \{/g)).toHaveLength(3);
+    // The initial promotion, the replan rebuild, the visual refinement, and 5q recovery.
+    expect(orchestrator.match(/canonicalPromotion = \{/g)).toHaveLength(4);
   });
 });
 
@@ -235,7 +236,7 @@ describe('durable screenshot evidence', () => {
     expect(site).not.toMatch(/registry\.(get|latest)\(/);
   });
 
-  it('no tool adapter reaches screenshots; no model skill reaches capture or blob storage, and only terra-review sees screenshots', async () => {
+  it('no tool adapter reaches screenshots; no model skill reaches capture or blob storage, and only terra-review and terra-refine see screenshots', async () => {
     for (const file of await productionFiles('packages/orchestrator/src/tool-gateway')) {
       expect(await src(file), file).not.toMatch(/screenshot|captureInBrowser|BlobStore|blobs/i);
     }
@@ -245,6 +246,7 @@ describe('durable screenshot evidence', () => {
       expect(code, file).not.toMatch(/captureInBrowser|BlobStore|\bblobs\b|@statxai\/workspace/);
       if (/screenshot/i.test(code)) seeing.push(file);
     }
-    expect(seeing).toEqual(['packages/agents/src/skills/terra-review.ts']);
+    // The reviewer judges screenshots; the refiner is shown the same ones. Neither can read or capture any.
+    expect(seeing.sort()).toEqual(['packages/agents/src/skills/terra-refine.ts', 'packages/agents/src/skills/terra-review.ts']);
   });
 });

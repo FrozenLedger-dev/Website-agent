@@ -31,8 +31,8 @@ import {
   readBuildLineage,
   verifyBindingConsistency,
 } from '../src/run-binding/frontend-backend.js';
-import { ActiveContinuationCorrupt, ActiveContinuationSuccessorNotOwned, resolvePostPromotionRecovery } from '../src/run-recovery/frontend-backend.js';
-import { createFrontendBackendJobSpec } from '../src/job-specs/frontend-backend.js';
+import { ActiveContinuationCorrupt, resolvePostPromotionRecovery } from '../src/run-recovery/frontend-backend.js';
+import { createFrontendBackendJobSpec, createFrontendBackendVisualRefinementJobSpec } from '../src/job-specs/frontend-backend.js';
 
 let store: StateStore;
 
@@ -62,8 +62,22 @@ const visual = (cycle: number, review = 1, set = 1): BuildSuccessorProvenance =>
 const inputFor = (projectId: string, marker: string, lineage?: { predecessorBindingId: string; provenance: BuildSuccessorProvenance }) => {
   const businessProfileRef = ref('business-profile', 1);
   const sitePlanRef = ref('site-plan', 1);
-  // The spec differs per marker, so each generation has its own deterministic identity.
-  const jobSpec = { ...createFrontendBackendJobSpec({ projectId, businessProfileRef, sitePlanRef }), objective: `Build generation ${marker}.` };
+  // The spec differs per marker, so each generation has its own deterministic identity. A visual
+  // refinement successor's spec pins exactly the review and screenshot set its lineage names.
+  const parsed = VisualRefinementSuccessorProvenance.safeParse(lineage?.provenance);
+  const provenance = parsed.success ? parsed.data : undefined;
+  const base =
+    provenance
+      ? createFrontendBackendVisualRefinementJobSpec({
+          projectId,
+          businessProfileRef,
+          sitePlanRef,
+          visualRefinementSourceRef: ref('visual-refinement-source', provenance.refinementCycle, 'c'.repeat(64)),
+          visualQualityReviewRef: { ...provenance.visualQualityReview, contentHash: provenance.visualQualityReview.contentHash ?? 'a'.repeat(64) },
+          screenshotSetRef: { ...provenance.screenshotSet, contentHash: provenance.screenshotSet.contentHash ?? 'b'.repeat(64) },
+        })
+      : createFrontendBackendJobSpec({ projectId, businessProfileRef, sitePlanRef });
+  const jobSpec = { ...base, objective: `Build generation ${marker}.` };
   return {
     projectId,
     runIntentHash: 'intent',
@@ -328,13 +342,14 @@ describe('Phase 5q reads successor kind from the typed contract', () => {
   const recover = (projectId: string) =>
     resolvePostPromotionRecovery({ store, registry: {} as ArtifactRegistry, workspacesRoot: '/nonexistent', projectId, runIntentHash: 'intent' });
 
-  it('a promoted visual-refinement tip is proven structurally and refused as not yet owned — never corrupt, never a replan', async () => {
+  it('a promoted visual-refinement tip passes the same structural proof and continues into ordinary recovery', async () => {
     const projectId = 'proj_succ_5q_visual';
-    const { b1 } = await promotedChain(projectId, visual(1));
+    await promotedChain(projectId, visual(1));
 
+    // Owned now: it gets past lineage entirely, exactly as a replan tip does.
     const error = await recover(projectId).catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(ActiveContinuationSuccessorNotOwned);
-    expect(error).toMatchObject({ bindingId: b1._id, successorKind: 'visual_refinement' });
+    expect(error).toBeInstanceOf(ActiveContinuationCorrupt);
+    expect((error as Error).message).toContain('the project document is missing');
   });
 
   it('a promoted typed replan tip passes the same proof and continues into ordinary recovery', async () => {

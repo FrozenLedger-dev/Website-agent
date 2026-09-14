@@ -446,6 +446,15 @@ export async function readBuiltFiles(siteRoot: string): Promise<BuiltFile[]> {
 const SOURCE_EXTENSIONS = /\.(tsx?|jsx?|css|mjs|json)$/i;
 
 /**
+ * A site-relative path the model owns and that is source text — exactly what
+ * {@link readSourceFiles} returns from the working tree, as a predicate, so a
+ * reader of the same files at an exact Git commit selects the same set.
+ */
+export function isModelSourceFile(path: string): boolean {
+  return isModelWritable(path) && SOURCE_EXTENSIONS.test(path);
+}
+
+/**
  * Read the source files a repair may edit.
  *
  * Distinct from {@link readBuiltFiles}: gates read the export, but a repair has
