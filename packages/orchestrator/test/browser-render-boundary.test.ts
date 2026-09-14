@@ -209,7 +209,8 @@ describe('durable screenshot evidence', () => {
     const offenders: string[] = [];
     for (const file of await allProductionFiles()) {
       const code = await src(file);
-      if (file !== EVIDENCE && /screenshot-set|SCREENSHOT_SET_ARTIFACT/.test(code)) offenders.push(file);
+      // Build-successor identity may name the artifact a ref must be; it looks nothing up.
+      if (file !== EVIDENCE && file !== 'packages/contracts/src/build-lineage.ts' && /screenshot-set|SCREENSHOT_SET_ARTIFACT/.test(code)) offenders.push(file);
       // The collection itself is touched only by the blob store, which verifies every write and read.
       if (file !== BLOBS && /\bstore\.blobs\b|collection\(['"]blobs['"]\)/.test(code) && file !== 'packages/state/src/store.ts') offenders.push(`${file} (blobs)`);
     }

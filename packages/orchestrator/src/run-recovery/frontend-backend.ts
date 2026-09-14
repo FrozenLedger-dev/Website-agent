@@ -55,6 +55,7 @@ import {
   deriveActiveLineageTip,
   findActiveLineageRoot,
   parseStoredJobSpec,
+  readBuildLineage,
   verifyBindingConsistency,
 } from '../run-binding/frontend-backend.js';
 
@@ -100,6 +101,25 @@ export class ActiveContinuationAwaitingHumanReview extends Error {
         `it is not resumed automatically`,
     );
     this.name = 'ActiveContinuationAwaitingHumanReview';
+  }
+}
+
+/**
+ * The promoted tip is a well-formed successor of a kind post-promotion recovery
+ * does not yet know how to continue. Refused explicitly — never corrupt, and
+ * never treated as though it were a replan.
+ */
+export class ActiveContinuationSuccessorNotOwned extends Error {
+  constructor(
+    readonly projectId: string,
+    readonly bindingId: string,
+    readonly successorKind: string,
+  ) {
+    super(
+      `project "${projectId}": promoted build "${bindingId}" is a ${successorKind} successor, whose continuation ` +
+        `post-promotion recovery does not own yet; it is not resumed automatically`,
+    );
+    this.name = 'ActiveContinuationSuccessorNotOwned';
   }
 }
 
@@ -237,14 +257,17 @@ export async function resolvePostPromotionRecovery(
 
   // The stored request still describes itself consistently, lineage included.
   const spec = parseStoredJobSpec(tip);
+  const position = readBuildLineage(tip);
   verifyBindingConsistency(
     tip,
     spec,
-    tip.predecessorBindingId !== undefined && tip.replanDecision
-      ? { predecessorBindingId: tip.predecessorBindingId, replanDecisionRef: tip.replanDecision }
-      : undefined,
+    position.kind === 'successor' ? { predecessorBindingId: position.predecessorBindingId, provenance: position.provenance } : undefined,
     root._id,
   );
+  // Structurally sound, but not a continuation this recovery owns yet.
+  if (position.kind === 'successor' && position.provenance.kind !== 'replan') {
+    throw new ActiveContinuationSuccessorNotOwned(projectId, tip._id, position.provenance.kind);
+  }
 
   // Durable run state this continuation reuses, never recreates.
   const projectDoc = await store.projects.findOne({ _id: projectId });

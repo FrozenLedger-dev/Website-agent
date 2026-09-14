@@ -6222,6 +6222,136 @@ test is timing-sensitive. It failed once in 18 runs with this change, passed 8 o
 
 **Not in this slice:** visual refinement, customer UI, and any browser tool.
 
+## Typed build-successor provenance — **DONE**
+
+**Why.** A build binding with a `predecessorBindingId` could only ever be a
+replan successor, so a predecessor implied a replan. A visual refinement needs
+to be a successor too, with its own exact reason, before any refinement loop can
+exist.
+
+**Gate findings.**
+
+- **Writer:** the orchestrator's replan is the only production code that prepares
+  a successor.
+- **Readers:** Phase 5k consistency (resume, abandonment, prepare convergence),
+  the active-lineage walk, Phase 5q recovery, and the duplicate-key rival lookup.
+- **Index:** the one-successor index is keyed on `{ projectId, predecessorBindingId }`
+  alone, so it is already reason-independent.
+- **Release publication:** reads only lineage root and canonical binding IDs, so
+  it is unchanged.
+
+**Contract (`contracts/build-lineage.ts`).** `BuildSuccessorProvenance` is a
+discriminated union of two strict shapes:
+
+- `replan`: the exact `replan-decision` ref;
+- `visual_refinement`: the exact `visual-quality-review` and `screenshot-set`
+  refs, plus `refinementCycle` (integer, 1–1000).
+
+Ref names are enforced. The contract is identity only: no budget, threshold or
+eligibility.
+
+**Persistence. No migration or backfill.**
+
+- A replan successor is still written as `predecessorBindingId` plus
+  `replanDecision`, exactly as before, so historical replan successors are
+  already in the new format.
+- A visual-refinement successor is written as `predecessorBindingId` plus
+  `successorProvenance`.
+- An initial build writes neither, and still takes `activeLineage: true`.
+- Every successor inherits its predecessor's `lineageRootBindingId`, whatever its
+  reason.
+
+**One reader, `readBuildLineage`.** It returns either `initial` or `successor`
+(the exact predecessor and typed provenance). These shapes are corrupt, and
+nothing is guessed:
+
+- a predecessor with no reason;
+- a reason with no predecessor;
+- both encodings at once;
+- a malformed ref, ref name or cycle.
+
+**Consistency and lineage.**
+
+- `prepareFrontendBackendBuildBinding` takes `lineage: { predecessorBindingId,
+  provenance }`. It validates the provenance before anything is read or written,
+  and refuses an invalid one with `FrontendBackendBuildSuccessorProvenanceInvalid`.
+- `verifyBindingConsistency` requires the exact predecessor, the same kind and
+  exactly the same provenance. A successor presented as an initial build is
+  corrupt.
+- `deriveActiveLineageTip` classifies the root and every member through the
+  reader; malformed provenance is `FrontendBackendBuildLineageCorrupt`.
+- One successor per predecessor holds across reasons: a replan successor blocks a
+  visual one, and the reverse (`FrontendBackendBuildLineageConflict`).
+
+**Phase 5q.** Recovery reads the tip's lineage position and proves it
+structurally with the stored provenance. A proven `visual_refinement` tip is then
+refused with `ActiveContinuationSuccessorNotOwned`: never corrupt, and never
+continued as a replan. Replan tips recover as before.
+
+**Tests.**
+
+- **`build-successor-provenance.integration.test.ts` (Mongo, 29 tests):**
+  - historical initial and replan bindings read unchanged, and nothing is written;
+  - a typed replan persists in the replan encoding;
+  - a visual successor persists exact refs and cycle, inherits the root, and
+    takes no active-lineage slot;
+  - exact replay converges; any other cycle, review, set or kind is corrupt;
+  - 9 invalid reasons are refused with nothing written;
+  - 9 contradictory stored shapes are corrupt;
+  - one slot per predecessor in both directions;
+  - mixed replan and visual chains derive one tip;
+  - the walk fails closed on malformed member provenance, a root carrying a
+    reason, and an unreachable member;
+  - 5q: a visual tip is not owned, and a replan tip passes lineage.
+- **`build-successor-provenance-boundary.test.ts` (structural, 10 tests):**
+  - the union is exhaustive and strict, and the contract imports nothing but Zod
+    and primitives;
+  - stored reason fields are read only in `readBuildLineage`;
+  - there is no predecessor-implies-replan branch;
+  - the walk and consistency go through the reader, and preparation validates
+    before insert;
+  - the index is keyed on the predecessor alone, and lineage has no time or
+    version ordering;
+  - 5q verifies before refusing;
+  - the replan is the only successor caller, with no refine skill, `JobOrigin`,
+    budget or threshold.
+- **Migrated:** the active-lineage, replan-lineage and release-publication
+  lineage tests pass `provenance: replan(...)`. The browser-render and
+  visual-review boundary tests now allow the typed identity to name
+  `screenshot-set` and `visual-quality-review` refs, and nothing more.
+
+**Mutations: 22 of 22 killed.** Each ran against the structural test plus the
+provenance integration test (and the active-lineage test for the root check).
+Sources were restored byte-identical after each.
+
+- **Reader:**
+  - legacy `replanDecision` ignored;
+  - a predecessor with no reason read as a replan;
+  - a reason with no predecessor read as initial;
+  - hybrid encodings accepted;
+  - the visual encoding accepting any kind.
+- **Preparation:**
+  - validation skipped, and ref names not enforced;
+  - a visual reason persisted in the replan encoding;
+  - a visual successor taking the active-lineage slot, or founding its own root;
+  - the rival lookup restricted to replans.
+- **Consistency:**
+  - exact provenance ignoring the cycle or screenshot set;
+  - a kind mismatch accepted;
+  - a visual successor presented as initial accepted.
+- **Lineage:**
+  - the walk skipping member validation;
+  - a root with a reason accepted;
+  - the index filtered on a reason.
+- **5q and orchestrator:**
+  - a visual tip continued as a replan, or reported as corrupt;
+  - the tip verified without its stored lineage;
+  - the orchestrator's replan writing a non-replan reason.
+
+**Not in this slice:** the visual-refinement loop, `terra-refine`, a
+`visual_refine` job origin, refinement budget or thresholds, and any production
+caller that prepares a visual-refinement successor.
+
 ## Phases 6–17
 
 Not started.

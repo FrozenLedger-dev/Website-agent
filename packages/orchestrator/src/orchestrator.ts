@@ -15,6 +15,7 @@
 import {
   BusinessProfile,
   SitePlan,
+  ReplanSuccessorProvenance,
   type AgentTier,
   type ArtifactRef,
   type BrowserRenderAuthority,
@@ -838,7 +839,8 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
           specificationBaseCommit: await workspace.currentCommit(),
           lineage: {
             predecessorBindingId: canonicalBuild._id,
-            replanDecisionRef: revised.replanDecisionRef,
+            // Parsed, not cast: the registry's ref is proven to name a replan decision.
+            provenance: ReplanSuccessorProvenance.parse({ kind: 'replan', replanDecision: revised.replanDecisionRef }),
           },
         });
 

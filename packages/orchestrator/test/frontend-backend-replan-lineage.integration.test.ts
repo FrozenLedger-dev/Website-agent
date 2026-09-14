@@ -31,7 +31,7 @@ import { join } from 'node:path';
 import type * as Agents from '@statxai/agents';
 import type * as Gates from '@statxai/gates';
 import type * as Workspace from '@statxai/workspace';
-import type { ArtifactRef, SitePlan } from '@statxai/contracts';
+import { ReplanSuccessorProvenance, type ArtifactRef, type BuildSuccessorProvenance, type SitePlan } from '@statxai/contracts';
 import { StateStore } from '@statxai/state';
 import type { FrontendBackendBuildBindingDocument } from '@statxai/state';
 import { ArtifactRegistry, ProjectWorkspace } from '@statxai/workspace';
@@ -42,6 +42,9 @@ import {
   prepareFrontendBackendBuildBinding,
 } from '../src/run-binding/frontend-backend.js';
 import { createFrontendBackendJobSpec } from '../src/job-specs/frontend-backend.js';
+
+/** A replan reason, proven against the contract exactly as production proves it. */
+const replan = (replanDecision: ArtifactRef): BuildSuccessorProvenance => ReplanSuccessorProvenance.parse({ kind: 'replan', replanDecision });
 
 interface ReviewIssue {
   id: string;
@@ -452,7 +455,7 @@ describe('lineage authority', () => {
       sitePlanRef: planRef,
       jobSpec: spec,
       specificationBaseCommit: b0.promotionCommitSha,
-      lineage: { predecessorBindingId: b0._id, replanDecisionRef: decisionRef },
+      lineage: { predecessorBindingId: b0._id, provenance: replan(decisionRef) },
     };
   }
 
@@ -502,7 +505,7 @@ describe('lineage authority', () => {
     await expect(
       prepareFrontendBackendBuildBinding(store, {
         ...input,
-        lineage: { predecessorBindingId: b0._id, replanDecisionRef: otherDecision },
+        lineage: { predecessorBindingId: b0._id, provenance: replan(otherDecision) },
       }),
     ).rejects.toBeInstanceOf(FrontendBackendBuildBindingCorrupt);
 
@@ -522,7 +525,7 @@ describe('lineage authority', () => {
     ).rejects.toBeInstanceOf(FrontendBackendBuildBindingCorrupt);
 
     const unchanged = (await store.frontendBackendBuildBindings.findOne({ _id: stored._id }))!;
-    expect(unchanged.replanDecision).toEqual(input.lineage.replanDecisionRef);
+    expect(unchanged.replanDecision).toEqual((input.lineage.provenance as { replanDecision: ArtifactRef }).replanDecision);
     expect(unchanged.predecessorBindingId).toBe(b0._id);
   });
 
@@ -541,7 +544,7 @@ describe('lineage authority', () => {
       const again = await prepareFrontendBackendBuildBinding(store2, input);
       expect(again._id).toBe(prepared._id);
       expect(again.predecessorBindingId).toBe(b0._id);
-      expect(again.replanDecision).toEqual(input.lineage.replanDecisionRef);
+      expect(again.replanDecision).toEqual((input.lineage.provenance as { replanDecision: ArtifactRef }).replanDecision);
       expect(again.sitePlan).toEqual(input.sitePlanRef);
       expect(again.jobId).toBe(input.jobSpec.jobId);
       expect(await store2.frontendBackendBuildBindings.countDocuments({ projectId })).toBe(2);

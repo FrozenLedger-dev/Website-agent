@@ -28,7 +28,15 @@
  * this phase does not implement — see `docs/upgrade-status.md`).
  */
 import type { ClientSession } from 'mongodb';
-import { JobSpec, type ArtifactRef, type BusinessProfile, type SitePlan } from '@statxai/contracts';
+import {
+  BuildSuccessorProvenance,
+  JobSpec,
+  ReplanSuccessorProvenance,
+  VisualRefinementSuccessorProvenance,
+  type ArtifactRef,
+  type BusinessProfile,
+  type SitePlan,
+} from '@statxai/contracts';
 import type {
   FrontendBackendBuildBindingDocument,
   JobDocument,
@@ -176,6 +184,17 @@ export class FrontendBackendBuildLineageCorrupt extends Error {
   ) {
     super(`frontend_backend build lineage "${lineageRootBindingId}" (project "${projectId}") is corrupt — ${detail}`);
     this.name = 'FrontendBackendBuildLineageCorrupt';
+  }
+}
+
+/** A successor was presented with a reason that does not satisfy its contract. Refused before anything is written. */
+export class FrontendBackendBuildSuccessorProvenanceInvalid extends Error {
+  constructor(
+    readonly predecessorBindingId: string,
+    detail: string,
+  ) {
+    super(`successor of frontend_backend build "${predecessorBindingId}" has invalid provenance — ${detail}`);
+    this.name = 'FrontendBackendBuildSuccessorProvenanceInvalid';
   }
 }
 
@@ -353,7 +372,7 @@ export async function deriveActiveLineageTip(
 ): Promise<FrontendBackendBuildBindingDocument> {
   const rootId = root.lineageRootBindingId ?? root._id;
 
-  if (root.predecessorBindingId !== undefined) {
+  if (lineagePositionOf(root, rootId).kind !== 'initial') {
     throw new FrontendBackendBuildLineageCorrupt(
       root.projectId,
       rootId,
@@ -386,6 +405,8 @@ export async function deriveActiveLineageTip(
     if (successors.length === 0) break;
 
     const next = successors[0]!;
+    // Whatever its reason, a successor must state exactly one, well-formed.
+    lineagePositionOf(next, rootId);
     if (next.lineageRootBindingId !== rootId) {
       throw new FrontendBackendBuildLineageCorrupt(
         root.projectId,
@@ -544,6 +565,74 @@ function sameRef(a: ArtifactRef, b: ArtifactRef): boolean {
   return true;
 }
 
+/** Where a binding stands in its lineage: an initial build, or a successor with its exact predecessor and typed reason. */
+export type BuildLineagePosition =
+  | { readonly kind: 'initial' }
+  | { readonly kind: 'successor'; readonly predecessorBindingId: string; readonly provenance: BuildSuccessorProvenance };
+
+/**
+ * The one reader of a binding's lineage fields.
+ *
+ * Two persisted encodings, one meaning, no migration:
+ *
+ * - a replan successor stores `replanDecision` — how every replan successor,
+ *   historical or new, has always been written;
+ * - a visual-refinement successor stores `successorProvenance`.
+ *
+ * An initial build stores neither and no predecessor. Everything else — a
+ * predecessor with no reason, a reason with no predecessor, both encodings at
+ * once, a malformed ref or cycle — is corrupt, and nothing is guessed: no field
+ * is preferred over another, and no reason is ever inferred from a predecessor.
+ */
+export function readBuildLineage(binding: FrontendBackendBuildBindingDocument): BuildLineagePosition {
+  const hasReplan = binding.replanDecision !== undefined;
+  const hasTyped = binding.successorProvenance !== undefined;
+
+  if (binding.predecessorBindingId === undefined) {
+    if (hasReplan || hasTyped) {
+      throw new FrontendBackendBuildBindingCorrupt(binding._id, 'an initial build records a successor reason but no predecessor');
+    }
+    return { kind: 'initial' };
+  }
+  if (hasReplan && hasTyped) {
+    throw new FrontendBackendBuildBindingCorrupt(binding._id, 'a successor records both a replan decision and a typed successor provenance');
+  }
+  if (hasReplan) {
+    const parsed = ReplanSuccessorProvenance.safeParse({ kind: 'replan', replanDecision: binding.replanDecision });
+    if (!parsed.success) throw new FrontendBackendBuildBindingCorrupt(binding._id, `replanDecision is malformed: ${issues(parsed.error)}`);
+    return { kind: 'successor', predecessorBindingId: binding.predecessorBindingId, provenance: parsed.data };
+  }
+  if (hasTyped) {
+    const parsed = VisualRefinementSuccessorProvenance.safeParse(binding.successorProvenance);
+    if (!parsed.success) throw new FrontendBackendBuildBindingCorrupt(binding._id, `successorProvenance is malformed: ${issues(parsed.error)}`);
+    return { kind: 'successor', predecessorBindingId: binding.predecessorBindingId, provenance: parsed.data };
+  }
+  throw new FrontendBackendBuildBindingCorrupt(binding._id, `a successor of "${binding.predecessorBindingId}" records no reason for replacing it`);
+}
+
+function issues(error: { issues: readonly { path: readonly PropertyKey[]; message: string }[] }): string {
+  return error.issues.map((i) => `${i.path.map(String).join('.') || '(root)'}: ${i.message}`).join('; ');
+}
+
+/** The lineage reader, reporting malformed provenance as the lineage corruption a walk is looking for. */
+function lineagePositionOf(binding: FrontendBackendBuildBindingDocument, rootId: string): BuildLineagePosition {
+  try {
+    return readBuildLineage(binding);
+  } catch (error) {
+    if (!(error instanceof FrontendBackendBuildBindingCorrupt)) throw error;
+    throw new FrontendBackendBuildLineageCorrupt(binding.projectId, rootId, error.message);
+  }
+}
+
+/** Exact equality of two successor reasons: same kind, same refs, same cycle. */
+function sameProvenance(a: BuildSuccessorProvenance, b: BuildSuccessorProvenance): boolean {
+  if (a.kind === 'replan' && b.kind === 'replan') return sameRef(a.replanDecision, b.replanDecision);
+  if (a.kind === 'visual_refinement' && b.kind === 'visual_refinement') {
+    return sameRef(a.visualQualityReview, b.visualQualityReview) && sameRef(a.screenshotSet, b.screenshotSet) && a.refinementCycle === b.refinementCycle;
+  }
+  return false;
+}
+
 /**
  * Re-prove that a binding and the spec it claims to store still agree,
  * before either is trusted for resume: `projectId`, `jobId`, `role`, the
@@ -582,18 +671,30 @@ export function verifyBindingConsistency(
   // otherwise-identical successors different builds. The stored record is
   // never edited to match the caller: exact replay converges, anything else
   // fails closed.
+  const stored = readBuildLineage(binding);
   if (lineage) {
-    if (binding.predecessorBindingId !== lineage.predecessorBindingId) {
+    if (stored.kind !== 'successor' || stored.predecessorBindingId !== lineage.predecessorBindingId) {
       throw new FrontendBackendBuildBindingCorrupt(
         binding._id,
         `binding.predecessorBindingId is ${binding.predecessorBindingId ?? '(absent)'}, not "${lineage.predecessorBindingId}"`,
       );
     }
-    if (!binding.replanDecision || !sameRef(binding.replanDecision, lineage.replanDecisionRef)) {
-      throw new FrontendBackendBuildBindingCorrupt(binding._id, 'binding.replanDecision does not match the exact replan decision presented');
+    if (stored.provenance.kind !== lineage.provenance.kind) {
+      throw new FrontendBackendBuildBindingCorrupt(
+        binding._id,
+        `binding is a ${stored.provenance.kind} successor, not the ${lineage.provenance.kind} successor presented`,
+      );
     }
-  } else if (binding.predecessorBindingId !== undefined) {
-    throw new FrontendBackendBuildBindingCorrupt(binding._id, 'binding is a replan successor but was presented as an initial build');
+    if (!sameProvenance(stored.provenance, lineage.provenance)) {
+      throw new FrontendBackendBuildBindingCorrupt(
+        binding._id,
+        stored.provenance.kind === 'replan'
+          ? 'binding.replanDecision does not match the exact replan decision presented'
+          : 'binding.successorProvenance does not match the exact visual refinement presented',
+      );
+    }
+  } else if (stored.kind === 'successor') {
+    throw new FrontendBackendBuildBindingCorrupt(binding._id, `binding is a ${stored.provenance.kind} successor but was presented as an initial build`);
   }
 
   if (binding.projectId !== spec.projectId) {
@@ -631,15 +732,14 @@ export interface PrepareBindingInput {
   /** Canonical HEAD at the moment of preparation, before the specification commit — `null` for a project's first-ever commit. */
   readonly specificationBaseCommit: string | null;
   /**
-   * The exact canonical build this one replaces, and the exact decision that
-   * authorised it (Phase 5q0). Supplied together by a replan successor and
-   * omitted together by an initial build — a successor that recorded one
-   * without the other would be precisely the unprovable state this exists to
-   * remove.
+   * The exact canonical build this one replaces (Phase 5q0), and exactly why:
+   * a replan decision, or a visual refinement. Omitted entirely by an initial
+   * build. There is no way to name a predecessor without a reason — a
+   * predecessor never implies one.
    */
   readonly lineage?: {
     readonly predecessorBindingId: string;
-    readonly replanDecisionRef: ArtifactRef;
+    readonly provenance: BuildSuccessorProvenance;
   };
 }
 
@@ -665,11 +765,17 @@ export async function prepareFrontendBackendBuildBinding(
   const jobSpecHash = computeJobSpecHash(input.jobSpec);
   const bindingId = computeBindingId({ projectId: input.projectId, runIntentHash: input.runIntentHash, jobSpecHash });
 
+  // A successor's reason is proven well-formed before anything is read or written.
+  if (input.lineage) {
+    const parsed = BuildSuccessorProvenance.safeParse(input.lineage.provenance);
+    if (!parsed.success) throw new FrontendBackendBuildSuccessorProvenanceInvalid(input.lineage.predecessorBindingId, issues(parsed.error));
+  }
+
   /**
    * Which lineage this binding joins, settled before anything is written.
    *
-   * An initial build founds its own lineage and is its own root. A replan
-   * successor inherits its predecessor's exact recorded root rather than
+   * An initial build founds its own lineage and is its own root. A successor,
+   * whatever its reason, inherits its predecessor's exact recorded root rather than
    * deriving one, which is what lets `B2` name `B0` without any reader
    * walking the chain backwards or ordering it by time.
    */
@@ -712,7 +818,10 @@ export async function prepareFrontendBackendBuildBinding(
     ...(input.lineage
       ? {
           predecessorBindingId: input.lineage.predecessorBindingId,
-          replanDecision: input.lineage.replanDecisionRef,
+          // Each reason in its one persisted encoding (see `readBuildLineage`).
+          ...(input.lineage.provenance.kind === 'replan'
+            ? { replanDecision: input.lineage.provenance.replanDecision }
+            : { successorProvenance: input.lineage.provenance }),
         }
       : { activeLineage: true as const }),
     createdAt: now,

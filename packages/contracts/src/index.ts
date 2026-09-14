@@ -7,3 +7,4 @@ export * from './decisions.js';
 export * from './tools.js';
 export * from './browser.js';
 export * from './visual-review.js';
+export * from './build-lineage.js';

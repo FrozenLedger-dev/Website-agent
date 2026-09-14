@@ -24,7 +24,7 @@ import { fileURLToPath } from 'node:url';
 import type * as Agents from '@statxai/agents';
 import type * as Gates from '@statxai/gates';
 import type * as Workspace from '@statxai/workspace';
-import type { ArtifactRef, SitePlan } from '@statxai/contracts';
+import { ReplanSuccessorProvenance, type ArtifactRef, type BuildSuccessorProvenance, type SitePlan } from '@statxai/contracts';
 import { StateStore } from '@statxai/state';
 import type { ReleaseBuildAuthority, ReleasePublicationDocument } from '@statxai/state';
 import {
@@ -55,6 +55,9 @@ import {
   recordPublicationSuccess,
   resolveDeploymentTarget,
 } from '../src/release-publication/publication.js';
+
+/** A replan reason, proven against the contract exactly as production proves it. */
+const replan = (replanDecision: ArtifactRef): BuildSuccessorProvenance => ReplanSuccessorProvenance.parse({ kind: 'replan', replanDecision });
 
 const SRC = join(dirname(fileURLToPath(import.meta.url)), '..', 'src');
 
@@ -251,7 +254,7 @@ const prepare = async (projectId: string, marker: number, predecessor?: string) 
     sitePlanRef,
     jobSpec,
     specificationBaseCommit: null,
-    ...(predecessor ? { lineage: { predecessorBindingId: predecessor, replanDecisionRef: ref('replan-decision', marker) } } : {}),
+    ...(predecessor ? { lineage: { predecessorBindingId: predecessor, provenance: replan(ref('replan-decision', marker)) } } : {}),
   });
 };
 

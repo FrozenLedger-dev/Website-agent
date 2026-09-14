@@ -34,7 +34,7 @@ import { fileURLToPath } from 'node:url';
 import type * as Agents from '@statxai/agents';
 import type * as Gates from '@statxai/gates';
 import type * as Workspace from '@statxai/workspace';
-import type { ArtifactRef, SitePlan } from '@statxai/contracts';
+import { ReplanSuccessorProvenance, type ArtifactRef, type BuildSuccessorProvenance, type SitePlan } from '@statxai/contracts';
 import { StateStore } from '@statxai/state';
 import type { FrontendBackendBuildBindingDocument } from '@statxai/state';
 import {
@@ -49,6 +49,9 @@ import {
   releaseActiveLineage,
 } from '../src/run-binding/frontend-backend.js';
 import { createFrontendBackendJobSpec } from '../src/job-specs/frontend-backend.js';
+
+/** A replan reason, proven against the contract exactly as production proves it. */
+const replan = (replanDecision: ArtifactRef): BuildSuccessorProvenance => ReplanSuccessorProvenance.parse({ kind: 'replan', replanDecision });
 
 const SRC = join(dirname(fileURLToPath(import.meta.url)), '..', 'src');
 
@@ -243,7 +246,7 @@ const ref = (name: string, version: number): ArtifactRef => ({ name, version });
 const prepare = async (
   projectId: string,
   marker: string,
-  lineage?: { predecessorBindingId: string; replanDecisionRef: ArtifactRef },
+  lineage?: { predecessorBindingId: string; provenance: BuildSuccessorProvenance },
 ): Promise<FrontendBackendBuildBindingDocument> => {
   const businessProfileRef = ref('business-profile', 1);
   const sitePlanRef = ref('site-plan', Number(marker));
@@ -293,9 +296,9 @@ describe('lineage root identity', () => {
     const b0 = await prepare(projectId, '1');
     await promote(b0._id, 1);
 
-    const b1 = await prepare(projectId, '2', { predecessorBindingId: b0._id, replanDecisionRef: ref('replan-decision', 1) });
+    const b1 = await prepare(projectId, '2', { predecessorBindingId: b0._id, provenance: replan(ref('replan-decision', 1)) });
     await promote(b1._id, 2);
-    const b2 = await prepare(projectId, '3', { predecessorBindingId: b1._id, replanDecisionRef: ref('replan-decision', 2) });
+    const b2 = await prepare(projectId, '3', { predecessorBindingId: b1._id, provenance: replan(ref('replan-decision', 2)) });
 
     // Predecessor links stay exact (Phase 5q0, unchanged) ...
     expect(b1.predecessorBindingId).toBe(b0._id);
@@ -356,7 +359,7 @@ describe('active lineage lifecycle', () => {
     const projectId = 'proj_lin_promote_successor';
     const b0 = await prepare(projectId, '1');
     await promote(b0._id, 1);
-    const b1 = await prepare(projectId, '2', { predecessorBindingId: b0._id, replanDecisionRef: ref('replan-decision', 1) });
+    const b1 = await prepare(projectId, '2', { predecessorBindingId: b0._id, provenance: replan(ref('replan-decision', 1)) });
     await promote(b1._id, 2);
 
     expect((await reload(b1._id))?.activeLineage).toBeUndefined();
@@ -510,9 +513,9 @@ describe('structural lookups', () => {
     const projectId = 'proj_lin_tip';
     const b0 = await prepare(projectId, '1');
     await promote(b0._id, 1);
-    const b1 = await prepare(projectId, '2', { predecessorBindingId: b0._id, replanDecisionRef: ref('replan-decision', 1) });
+    const b1 = await prepare(projectId, '2', { predecessorBindingId: b0._id, provenance: replan(ref('replan-decision', 1)) });
     await promote(b1._id, 2);
-    const b2 = await prepare(projectId, '3', { predecessorBindingId: b1._id, replanDecisionRef: ref('replan-decision', 2) });
+    const b2 = await prepare(projectId, '3', { predecessorBindingId: b1._id, provenance: replan(ref('replan-decision', 2)) });
 
     const root = await findActiveLineageRoot(store, projectId);
     expect(root?._id).toBe(b0._id);
@@ -530,7 +533,7 @@ describe('structural lookups', () => {
     const projectId = 'proj_lin_branch';
     const b0 = await prepare(projectId, '1');
     await promote(b0._id, 1);
-    const b1 = await prepare(projectId, '2', { predecessorBindingId: b0._id, replanDecisionRef: ref('replan-decision', 1) });
+    const b1 = await prepare(projectId, '2', { predecessorBindingId: b0._id, provenance: replan(ref('replan-decision', 1)) });
     await promote(b1._id, 2);
 
     // A branch cannot arise while Phase 5q0's one-successor index holds — that
@@ -567,7 +570,7 @@ describe('structural lookups', () => {
     const projectId = 'proj_lin_cycle';
     const b0 = await prepare(projectId, '1');
     await promote(b0._id, 1);
-    const b1 = await prepare(projectId, '2', { predecessorBindingId: b0._id, replanDecisionRef: ref('replan-decision', 1) });
+    const b1 = await prepare(projectId, '2', { predecessorBindingId: b0._id, provenance: replan(ref('replan-decision', 1)) });
 
     // b0 now points at b1, which points at b0.
     await store.frontendBackendBuildBindings.updateOne({ _id: b0._id }, { $set: { predecessorBindingId: b1._id } });
@@ -664,7 +667,7 @@ describe('legacy bindings that predate lineage authority', () => {
     await insertLegacy(projectId, 'legacy-root-c');
 
     await expect(
-      prepare(projectId, '2', { predecessorBindingId: 'legacy-root-c', replanDecisionRef: ref('replan-decision', 1) }),
+      prepare(projectId, '2', { predecessorBindingId: 'legacy-root-c', provenance: replan(ref('replan-decision', 1)) }),
     ).rejects.toBeInstanceOf(FrontendBackendBuildLineageRootUnproven);
   });
 

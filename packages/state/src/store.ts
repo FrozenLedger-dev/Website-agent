@@ -203,7 +203,9 @@ export class StateStore {
     await this.frontendBackendBuildBindings.createIndexes([
       { key: { projectId: 1 }, unique: true, partialFilterExpression: { status: 'prepared' } },
       { key: { projectId: 1, jobId: 1 } },
-      // At most one replan successor per exact predecessor (Phase 5q0).
+      // At most one successor per exact predecessor (Phase 5q0), whatever
+      // its reason: the key is the predecessor alone, so a replan successor
+      // and a visual-refinement successor compete for the same one slot.
       // Deliberately *not* filtered on `status` like the active-slot index
       // above: that one frees the project once a build promotes, which is
       // right for "may another generation start?" and wrong for lineage. A

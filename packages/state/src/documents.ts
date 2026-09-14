@@ -5,7 +5,7 @@
  * authors and cannot influence (Appendix B: "state belongs to the platform,
  * reasoning belongs to the model").
  */
-import type { ArtifactRef, AutonomyMode, JobRecord, JobSpec, ReviewOutcomeRecord, WorkerRole } from '@statxai/contracts';
+import type { ArtifactRef, AutonomyMode, JobRecord, JobSpec, ReviewOutcomeRecord, VisualRefinementSuccessorProvenance, WorkerRole } from '@statxai/contracts';
 import type { Binary } from 'mongodb';
 
 /** Project lifecycle, distinct from job lifecycle. */
@@ -275,12 +275,11 @@ export interface FrontendBackendBuildBindingDocument {
   promotionId: string | null;
   promotionCommitSha: string | null;
   /**
-   * The exact canonical build this one replaces, and the exact decision that
-   * authorised replacing it (Phase 5q0).
+   * The exact canonical build this one replaces (Phase 5q0), and — in exactly
+   * one of the two reason fields below — why it replaces it.
    *
-   * Absent together on an initial build — there is nothing to replace — and
-   * present together on a replan successor, never one without the other.
-   * That makes canonical build authority an explicit chain (`B0 -> B1 -> B2`)
+   * Absent, with no reason, on an initial build — there is nothing to replace
+   * — and present, with exactly one reason, on every successor. That makes canonical build authority an explicit chain (`B0 -> B1 -> B2`)
    * rather than something a later reader has to infer from timestamps or by
    * picking the newest promoted binding, both of which are wrong the moment
    * two generations exist for one project.
@@ -294,7 +293,20 @@ export interface FrontendBackendBuildBindingDocument {
    * Immutable once written: a successor is defined by what it replaces.
    */
   predecessorBindingId?: string;
+  /**
+   * How a replan successor records its reason — the original encoding, still
+   * written for every replan successor, so historical and new replan bindings
+   * have one identical shape and none needs migrating.
+   */
   replanDecision?: ArtifactRef;
+  /**
+   * How a visual-refinement successor records its reason: the exact review,
+   * screenshot set and cycle. Never present alongside `replanDecision`, and
+   * never on a root. Read only through the build-lineage reader, which turns
+   * either encoding into one typed `BuildSuccessorProvenance` and refuses any
+   * document that holds both, neither, or a malformed one.
+   */
+  successorProvenance?: VisualRefinementSuccessorProvenance;
   /**
    * The exact root of the build lineage this binding belongs to.
    *

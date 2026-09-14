@@ -132,11 +132,15 @@ describe('the review reads exact evidence and holds no authority', () => {
     const consumers: string[] = [];
     for (const file of await allProductionFiles()) {
       const code = await src(file);
-      expect(code, file).not.toMatch(/refineVisual|applyVisual|visualRefinement/i);
+      // The one permitted name is the typed successor identity, which records a review ref and performs nothing.
+      expect(code, file).not.toMatch(/refineVisual|applyVisual|visualRefinement(?!SuccessorProvenance)/i);
       if (/visualQualityReview|VisualQualityReviewOutcome|summarizeVisualReview/.test(code)) consumers.push(file);
     }
-    // Who touches a review: the phase that makes it, evaluation that returns it, and Sol's evidence — nothing that builds or writes.
+    // Who touches a review: the phase that makes it, evaluation that returns it, Sol's evidence, and build-successor
+    // identity that names its exact ref — nothing that builds or writes.
     expect(consumers.sort()).toEqual([
+      'packages/contracts/src/build-lineage.ts',
+      'packages/orchestrator/src/run-binding/frontend-backend.ts',
       'packages/orchestrator/src/orchestrator.ts',
       'packages/orchestrator/src/phases/adjudicate.ts',
       EVALUATE,
