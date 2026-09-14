@@ -20,7 +20,7 @@ import type { ArtifactRef, DeploymentManifest } from '@statxai/contracts';
 import type { ReleaseAuthorization } from '@statxai/policy-engine';
 import type { ReleasePublicationDocument } from '@statxai/state';
 import type { RunContext } from '../run-context.js';
-import { loadReleaseBuildAuthority, releaseActiveLineage } from '../run-binding/frontend-backend.js';
+import { assertReleaseBuildIsCurrentTip, loadReleaseBuildAuthority, releaseActiveLineage } from '../run-binding/frontend-backend.js';
 import {
   RELEASE_COMMIT_METADATA_KEY,
   RELEASE_METADATA_KEY,
@@ -88,6 +88,13 @@ export async function publishRelease(
 ): Promise<PublishResult> {
   const { deps, facts } = ctx;
   const gateway = options.gateway ?? vercelReleaseGateway;
+
+  // A job_lifecycle release publishes only the exact current canonical build —
+  // proven first, before the project is marked releasing, any receipt exists or
+  // the provider is reached, and on the local-preview path as much as the real one.
+  if (options.canonicalBuildBindingId !== undefined) {
+    await assertReleaseBuildIsCurrentTip(deps.store, facts.projectId, options.canonicalBuildBindingId);
+  }
 
   await deps.store.projects.updateOne(
     { _id: facts.projectId },

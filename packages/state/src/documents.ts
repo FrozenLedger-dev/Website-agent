@@ -22,6 +22,14 @@ export type ProjectState =
   | 'building'
   | 'validating'
   | 'awaiting_human_review'
+  /**
+   * Concluded and unreleased. The run that built the canonical build is over,
+   * no build lineage owns continuation, and exactly one current
+   * {@link CanonicalDraftDocument} names the exact promoted build the canonical
+   * tree implements. Never resumed, re-evaluated or replaced by a fresh run on
+   * its own: only an explicit claim on that draft may continue from it.
+   */
+  | 'draft'
   | 'releasing'
   | 'released'
   | 'blocked'
@@ -410,6 +418,66 @@ export interface VisualRefinementIntentDocument {
   /** The budget spend this intent consumed: `used.visualRefinements` after it. */
   budgetSlot: number;
   authorizedAt: Date;
+}
+
+// ---------------------------------------------------------------------------
+// Canonical draft authority
+// ---------------------------------------------------------------------------
+
+/**
+ * Which kind of operation holds a claim on a canonical draft. A typed category,
+ * never a person: who asked for the operation is that operation's own record.
+ */
+export type CanonicalDraftClaimKind = 'semantic_edit' | 'release';
+
+/**
+ * The exact operation holding a draft. Non-secret by construction — a kind and
+ * the operation's own deterministic id — so no session, token or credential
+ * ever becomes part of project authority.
+ */
+export interface CanonicalDraftClaimant {
+  kind: CanonicalDraftClaimKind;
+  operationId: string;
+}
+
+/**
+ * A concluded, unreleased canonical draft: the one authority over what happens
+ * next to a project whose run ended without releasing.
+ *
+ * It replaces the build lineage's `activeLineage` ownership rather than
+ * coexisting with it — both are written in one transaction, together with the
+ * project's `draft` state — and it names the exact build it owns: the lineage
+ * root the tip is re-derived from structurally, the tip itself, and that tip's
+ * one promotion. Nothing else is copied: plan, model and profile are the
+ * binding's own exact refs.
+ *
+ * `_id` is deterministic from exactly that authority, so concluding the same
+ * build again converges on the same document. A later draft of the same project
+ * is a different document; this one is never rewritten to describe another build.
+ */
+export interface CanonicalDraftDocument {
+  _id: string;
+  projectId: string;
+  lineageRootBindingId: string;
+  canonicalBindingId: string;
+  promotionId: string;
+  promotionCommitSha: string;
+  /**
+   * `available` until one exact operation claims it; a claim is durable, never
+   * expires, and moves only by its own claimant's explicit release.
+   */
+  status: 'available' | 'claimed';
+  /** Present exactly while `status` is `claimed`. */
+  claim?: CanonicalDraftClaimant;
+  /**
+   * Present only on the project's one current draft — the partial unique index
+   * on `{ projectId }` is filtered on it, the same slot shape as
+   * `activeLineage` and `ReleasePublicationDocument.active`.
+   */
+  current?: true;
+  /** Metadata only — never consulted to decide anything. */
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 // ---------------------------------------------------------------------------

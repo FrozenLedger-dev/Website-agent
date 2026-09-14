@@ -84,7 +84,9 @@ describe('a predecessor never implies a replan', () => {
 
   it('the lineage walk and Phase 5k consistency both classify through the reader', async () => {
     const code = await src(BINDING);
-    const walk = body(code, 'export async function deriveActiveLineageTip(', '\n}\n');
+    // The active walk delegates to the one exact-root walk, which does the classifying.
+    expect(body(code, 'export async function deriveActiveLineageTip(', '\n}\n')).toContain('return deriveLineageTipFromRoot(store, root, options);');
+    const walk = body(code, 'export async function deriveLineageTipFromRoot(', '\n}\n');
     expect(walk).toContain("lineagePositionOf(root, rootId).kind !== 'initial'");
     expect(walk).toMatch(/lineagePositionOf\(next, rootId\)/);
     const verify = body(code, 'export function verifyBindingConsistency(', '\n}\n');
@@ -157,8 +159,10 @@ describe('semantic-edit successors: identity only, and nothing that creates one'
     for (const file of await allProductionFiles()) {
       if (/semantic_edit|SemanticEditSuccessorProvenance/.test(await src(file))) knowers.push(file);
     }
-    // The state document only types the persisted field; it creates nothing.
-    expect(knowers.sort()).toEqual([CONTRACT, BINDING, RECOVERY, 'packages/state/src/documents.ts'].sort());
+    // The state document only types the persisted field; it creates nothing. Canonical draft
+    // authority names `semantic_edit` only as a claim category, never as a successor.
+    expect(knowers.sort()).toEqual([CONTRACT, BINDING, RECOVERY, 'packages/state/src/documents.ts', 'packages/orchestrator/src/canonical-draft/authority.ts'].sort());
+    expect(await src('packages/orchestrator/src/canonical-draft/authority.ts')).not.toMatch(/SemanticEditSuccessorProvenance|successorProvenance/);
     const binding = await src(BINDING);
     expect(binding).not.toMatch(/kind: 'semantic_edit'/);
     const orchestrator = await src('packages/orchestrator/src/orchestrator.ts');

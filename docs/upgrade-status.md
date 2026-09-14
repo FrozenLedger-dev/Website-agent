@@ -7196,6 +7196,172 @@ after each.
 under full-suite load. It passed 5 of 5 in isolation and touches no lineage-kind
 code.
 
+## Canonical draft authority — **DONE**
+
+**Why.** Applying a semantic edit stopped at its gate. `activeLineage` means an
+unfinished run owns what happens next, and it is released only at `released`,
+`blocked` or abandonment. So no durable state said "this exact promoted build is a
+finished, unreleased draft". Release also trusted any build that had once been
+promoted: a live run that evaluated B0 could publish B0 after canonical authority
+moved to B1.
+
+**Gate findings.**
+
+- **Project states:** `intake`, `intake_insufficient`, `planning`, `building`,
+  `validating`, `awaiting_human_review`, `releasing`, `released`, `blocked`,
+  `rolled_back`. They are a TypeScript union with no runtime parser, and no
+  exhaustive switch or map consumes them.
+- **Where `activeLineage` is released:**
+  - the release manifest transaction, which also sets `released`;
+  - the two blocked terminals, which also set `blocked`;
+  - abandonment, which is root-scoped.
+  Every release shares its transaction with the terminal state write.
+  `awaiting_human_review` keeps the slot.
+- **Lineage walk:** `deriveActiveLineageTip` was a purely structural walk from
+  whatever root it was handed. It never checked the slot and took no session.
+- **Release:** `loadReleaseBuildAuthority` checked only that the build was
+  promoted and carried a root. Nothing re-derived the tip, and the local-preview
+  path did not even load build authority.
+- **Phase 5q:** with no active root it returned `null`, and discovery then wiped
+  the project.
+- **Primitives:** a transaction helper with snapshot isolation, and partial unique
+  project slots (`activeLineage`, the `active` publication).
+
+**Record (`canonical_drafts`, `CanonicalDraftDocument`).**
+
+- **Fields:** `{ _id, projectId, lineageRootBindingId, canonicalBindingId,
+  promotionId, promotionCommitSha, status: 'available' | 'claimed', claim?,
+  current?: true, createdAt, updatedAt }`.
+- **Identity:** `_id` is `canonical-draft-<hash(projectId, root, binding, promotion)>`.
+- **Uniqueness:** the partial unique index `projectId_1_currentDraft` on
+  `{ current: true }` allows one current draft per project. Earlier drafts stay as
+  history outside the slot.
+- **Timestamps:** metadata only, never read to decide anything.
+
+**Project state `draft`.** The run has concluded and no lineage or release owns
+the project. Exactly one current draft names its tip.
+
+**Conclusion (`concludeCanonicalDraft`).**
+
+1. The promotion's marker commit is proven. This is immutable Git history.
+2. In one transaction, these are proven:
+   - the project, in `planning`, `building` or `validating`;
+   - the binding;
+   - the active root being the binding's root;
+   - the structural active tip being the binding;
+   - `promoted` status with the exact promotion id and commit;
+   - the committed receipt;
+   - no active publication for the project and no publication for the lineage;
+   - no current or same-id draft.
+3. In the same transaction:
+   - the draft is inserted;
+   - the project moves `state → draft`, guarded on its previous state;
+   - `activeLineage` is `$unset` on the exact root, guarded and counted.
+4. Exact replay returns the existing, re-proven draft. Anything else is refused
+   with no write.
+
+No production run calls conclusion yet. Its first caller is the semantic-edit
+lifecycle.
+
+**Proof of an existing draft (`loadCurrentCanonicalDraft`).**
+
+- **State and record together:** `draft` state and a current record come as a
+  pair. Either one alone, or two current records, is corrupt.
+- **Every read re-proves:**
+  - identity;
+  - claim consistency;
+  - no active lineage;
+  - the stored root is its own root;
+  - `deriveLineageTipFromRoot` reaches exactly the draft's build;
+  - the build carries the draft's root, exact promotion and committed receipt;
+  - no release owner.
+- **Marker:** `assertCanonicalDraftPromotionMarker` proves the Git marker.
+
+**Lineage.**
+
+- **`deriveLineageTipFromRoot(store, root, { session })`** is the one structural
+  walk. Branch, cycle, foreign-root and reachability rules are unchanged.
+- **`deriveActiveLineageTip`** now also requires `root.activeLineage === true`,
+  then delegates to it.
+
+**Claiming (`claimCanonicalDraft`, `releaseCanonicalDraftClaim`).**
+
+- **Claimant:** strictly `{ kind: 'semantic_edit' | 'release', operationId }`,
+  where `operationId` is bounded to `[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}`. No extra
+  field is allowed, so no session, token or customer identity.
+- **Claim:** in one transaction the draft is re-proven, then checked:
+  - `no_current_draft` when there is none;
+  - `stale_draft` when the id differs;
+  - `stale_tip` when the binding differs;
+  - then a CAS `updateOne` on `{ _id, current, status: 'available', canonicalBindingId }`.
+- **Outcomes:** a replay by the same claimant is idempotent. A different claimant
+  gets `claimed_by_another`, however old the claim is.
+- **Release:** only the holder can release, by CAS on `claim.kind` and
+  `claim.operationId`. Releasing an available draft is a no-op.
+- **No expiry:** there are no leases or timeouts.
+- **Side effects:** a claim builds, publishes and reactivates nothing.
+
+**Phase 5q and run start.**
+
+- **Concluded draft:** with no active root, a valid draft and its marker throw
+  `ActiveContinuationConcludedDraft`. It is concluded, not interrupted: nothing is
+  evaluated, approved, released or discovered.
+- **Corrupt state fails closed:**
+  - malformed draft authority;
+  - an active root beside a current draft;
+  - an active root with project state `draft`.
+- **Other refusals:**
+  - `assertNoActiveLineageForLegacyDirect` refuses drafts too;
+  - `prepareFrontendBackendBuildBinding` refuses a fresh root while a draft is
+    current, with `FrontendBackendCanonicalDraftOwnsProject`.
+- **Unchanged:** a project with neither owner, including `released` and `blocked`,
+  still takes the fresh path.
+
+**Release tip fence.** `publishRelease` calls `assertReleaseBuildIsCurrentTip`
+when a job-lifecycle build is named. It runs first, before:
+
+- the `releasing` state;
+- the deployment-configured branch, so local preview is fenced too;
+- any receipt, release commit or provider call;
+- the manifest.
+
+It requires the active root's structural tip to equal the build. A stale build,
+or a draft with no active root, fails with `FrontendBackendReleaseBuildNotCurrent`.
+A run owns its lineage exclusively, so nothing advances the tip between the proof
+and publication. Releasing a draft will be an explicit claim.
+
+**Compatibility.** No migration or backfill. Released, blocked and historical
+projects get no draft records. The Phase 5p receipt and provider semantics are
+unchanged.
+
+**Scope.** No semantic-edit intent, `terra-edit`, JobOrigin, source snapshot or
+customer route. Customer auth is untouched.
+
+**Tests.**
+
+- **`canonical-draft-authority.integration.test.ts` (67):**
+  - conclusion, atomicity under an injected failure, and concurrent snapshot
+    observers;
+  - replay, mismatched replay, stale or non-promoted builds, promotion, receipt
+    and marker proofs;
+  - no lineage or a foreign lineage, refused states, and release owners;
+  - the durable slot and concurrent conclusion;
+  - thirteen corrupt-draft shapes;
+  - inactive-root walks over mixed lineages, plus branch, cycle, foreign root and
+    orphan;
+  - claim CAS, replay, conflicts, age, concurrency, claimant secrets and release;
+  - 5q concluded and corrupt drafts, the fresh path, fresh-root and legacy
+    refusals;
+  - real `runProject` in both modes;
+  - release of the current tip, stale refusal before receipt, state or provider,
+    local preview, and draft release refusal.
+- **`canonical-draft-boundary.test.ts` (17):** structural. The provenance
+  boundary suite was updated for the shared walk and the claim-category mention.
+
+**Mutations: 28 of 28 killed.** Mutation 26 (5q allowing an active lineage beside
+a draft) survived at first, masked by the `draft` state check. After a narrower
+test assertion it was killed.
+
 ## Phases 6–17
 
 Not started.

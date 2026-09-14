@@ -18,6 +18,7 @@ import type {
   ReleasePublicationDocument,
   ReviewDocument,
   VisualRefinementIntentDocument,
+  CanonicalDraftDocument,
   CustomerUserDocument,
   CustomerAccountDocument,
   CustomerMembershipDocument,
@@ -130,6 +131,13 @@ export class StateStore {
    */
   get visualRefinementIntents(): Collection<VisualRefinementIntentDocument> {
     return this.db.collection<VisualRefinementIntentDocument>('visual_refinement_intents');
+  }
+  /**
+   * Concluded, unreleased canonical drafts — at most one current per project.
+   * See `CanonicalDraftDocument`.
+   */
+  get canonicalDrafts(): Collection<CanonicalDraftDocument> {
+    return this.db.collection<CanonicalDraftDocument>('canonical_drafts');
   }
   /** Customer people, by exact external identity. See `CustomerUserDocument`. */
   get customerUsers(): Collection<CustomerUserDocument> {
@@ -309,6 +317,16 @@ export class StateStore {
     // and must find the refinement already authorised rather than authorise another.
     await this.visualRefinementIntents.createIndexes([
       { key: { projectId: 1, predecessorBindingId: 1 }, unique: true },
+    ]);
+
+    // At most one current canonical draft per project — the same filtered
+    // project slot as `activeLineage` and the active release publication, so a
+    // second current draft is impossible in the database, not merely unchecked.
+    // Filtered on the literal marker rather than on `status`: a claimed draft is
+    // still the project's current draft. Earlier drafts keep their documents and
+    // simply sit outside the index.
+    await this.canonicalDrafts.createIndexes([
+      { key: { projectId: 1 }, unique: true, partialFilterExpression: { current: true }, name: 'projectId_1_currentDraft' },
     ]);
 
     // Customer identity and tenancy. Uniqueness here is the authority, not an

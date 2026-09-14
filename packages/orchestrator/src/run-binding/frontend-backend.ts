@@ -189,6 +189,22 @@ export class FrontendBackendBuildLineageCorrupt extends Error {
   }
 }
 
+/**
+ * A fresh build lineage was asked to start while the project's current
+ * canonical draft owns it. A draft is authoritative project state: a new
+ * generation never silently replaces it.
+ */
+export class FrontendBackendCanonicalDraftOwnsProject extends Error {
+  constructor(
+    readonly projectId: string,
+    readonly draftId: string,
+    readonly attemptedBindingId: string,
+  ) {
+    super(`project "${projectId}" is owned by canonical draft "${draftId}"; refusing to found build lineage "${attemptedBindingId}"`);
+    this.name = 'FrontendBackendCanonicalDraftOwnsProject';
+  }
+}
+
 /** A successor was presented with a reason that does not satisfy its contract. Refused before anything is written. */
 export class FrontendBackendBuildSuccessorProvenanceInvalid extends Error {
   constructor(
@@ -371,7 +387,29 @@ export async function findActiveLineageRoot(
 export async function deriveActiveLineageTip(
   store: StateStore,
   root: FrontendBackendBuildBindingDocument,
+  options: { readonly session?: ClientSession } = {},
 ): Promise<FrontendBackendBuildBindingDocument> {
+  // The active wrapper: the root in hand must actually hold the project's
+  // active-lineage slot. A lineage whose ownership has passed elsewhere — to a
+  // concluded draft, or to nothing — is walked with `deriveLineageTipFromRoot`.
+  if (root.activeLineage !== true) {
+    throw new FrontendBackendBuildLineageCorrupt(root.projectId, root.lineageRootBindingId ?? root._id, `root "${root._id}" does not hold the active-lineage slot`);
+  }
+  return deriveLineageTipFromRoot(store, root, options);
+}
+
+/**
+ * The same structural walk as {@link deriveActiveLineageTip}, from an exact
+ * root whether or not that root still holds the active-lineage slot — which is
+ * how a concluded draft re-proves its tip after the slot was released. Ownership
+ * is the caller's to prove; this proves only the chain.
+ */
+export async function deriveLineageTipFromRoot(
+  store: StateStore,
+  root: FrontendBackendBuildBindingDocument,
+  options: { readonly session?: ClientSession } = {},
+): Promise<FrontendBackendBuildBindingDocument> {
+  const session = options.session ? { session: options.session } : {};
   const rootId = root.lineageRootBindingId ?? root._id;
 
   if (lineagePositionOf(root, rootId).kind !== 'initial') {
@@ -394,7 +432,7 @@ export async function deriveActiveLineageTip(
 
   for (;;) {
     const successors = await store.frontendBackendBuildBindings
-      .find({ projectId: root.projectId, predecessorBindingId: tip._id })
+      .find({ projectId: root.projectId, predecessorBindingId: tip._id }, session)
       .toArray();
 
     if (successors.length > 1) {
@@ -426,10 +464,10 @@ export async function deriveActiveLineageTip(
   // Reachability, asked the other way round: anything claiming this root that
   // the walk never reached is a detached member — an orphan, or a successor
   // whose own predecessor no longer exists. Counted rather than ordered.
-  const claimed = await store.frontendBackendBuildBindings.countDocuments({
-    projectId: root.projectId,
-    lineageRootBindingId: rootId,
-  });
+  const claimed = await store.frontendBackendBuildBindings.countDocuments(
+    { projectId: root.projectId, lineageRootBindingId: rootId },
+    session,
+  );
   if (claimed !== seen.size) {
     throw new FrontendBackendBuildLineageCorrupt(
       root.projectId,
@@ -494,6 +532,41 @@ export async function loadReleaseBuildAuthority(
     canonicalBindingId: binding._id,
     promotionId: binding.promotionId,
   };
+}
+
+/**
+ * The build a release names is no longer the exact canonical authority: the
+ * project's active lineage has moved past it, or no active lineage owns the
+ * project at all. Having been promoted once is not permission to publish.
+ */
+export class FrontendBackendReleaseBuildNotCurrent extends Error {
+  constructor(
+    readonly projectId: string,
+    readonly bindingId: string,
+    detail: string,
+  ) {
+    super(`project "${projectId}": build "${bindingId}" may not be released — ${detail}`);
+    this.name = 'FrontendBackendReleaseBuildNotCurrent';
+  }
+}
+
+/**
+ * Prove a release is publishing the exact current canonical build: the project's
+ * one active lineage, walked structurally from its root, ends at exactly this
+ * binding. Asked before any release record or provider call exists.
+ *
+ * A run owns its lineage exclusively, so nothing else can advance the tip
+ * between this proof and publication. A concluded draft has released the
+ * active-lineage slot, so it fails here by construction: releasing a draft is a
+ * claim on that draft, never a run naming a build it once promoted.
+ */
+export async function assertReleaseBuildIsCurrentTip(store: StateStore, projectId: string, bindingId: string): Promise<void> {
+  const root = await findActiveLineageRoot(store, projectId);
+  if (!root) throw new FrontendBackendReleaseBuildNotCurrent(projectId, bindingId, 'no active build lineage owns the project');
+  const tip = await deriveActiveLineageTip(store, root);
+  if (tip._id !== bindingId) {
+    throw new FrontendBackendReleaseBuildNotCurrent(projectId, bindingId, `the active lineage "${root._id}" has advanced to "${tip._id}"`);
+  }
 }
 
 /**
@@ -843,6 +916,12 @@ export async function prepareFrontendBackendBuildBinding(
   if (existing) {
     verifyBindingConsistency(existing, input.jobSpec, input.lineage, lineageRootBindingId);
     return existing;
+  }
+
+  // A new root never founds a lineage over a current canonical draft.
+  if (!input.lineage) {
+    const draft = await store.canonicalDrafts.findOne({ projectId: input.projectId, current: true });
+    if (draft) throw new FrontendBackendCanonicalDraftOwnsProject(input.projectId, draft._id, bindingId);
   }
 
   const now = new Date();

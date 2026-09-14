@@ -46,6 +46,7 @@ import { ProjectWorkspace, type ArtifactRegistry } from '@statxai/workspace';
 import type { ApprovalRecord, AuthorizationRecord } from '../release.js';
 import type { RunContext } from '../run-context.js';
 import { promotionMarker } from '../job-promotion/frontend-backend.js';
+import { assertCanonicalDraftPromotionMarker, loadCurrentCanonicalDraft } from '../canonical-draft/authority.js';
 import { publishRelease, type PublishResult } from '../phases/publish.js';
 import {
   assertReceiptMatchesCanonicalBuild,
@@ -120,6 +121,25 @@ export class ActiveContinuationSuccessorNotOwned extends Error {
         `post-promotion recovery does not own yet; it is not resumed automatically`,
     );
     this.name = 'ActiveContinuationSuccessorNotOwned';
+  }
+}
+
+/**
+ * The project concluded as an unreleased canonical draft. Not interrupted work:
+ * nothing is resumed, evaluated, approved, released or started fresh over it.
+ * Continuing from a draft is an explicit claim on that exact draft.
+ */
+export class ActiveContinuationConcludedDraft extends Error {
+  constructor(
+    readonly projectId: string,
+    readonly draftId: string,
+    readonly canonicalBindingId: string,
+  ) {
+    super(
+      `project "${projectId}" concluded as canonical draft "${draftId}" of build "${canonicalBindingId}"; ` +
+        `a run does not continue or replace it without an explicit claim`,
+    );
+    this.name = 'ActiveContinuationConcludedDraft';
   }
 }
 
@@ -233,7 +253,21 @@ export async function resolvePostPromotionRecovery(
   const { store, registry, projectId } = input;
 
   const root = await findActiveLineageRoot(store, projectId);
-  if (!root) return null;
+  if (!root) {
+    // No run owns the project. A concluded draft does — proven exactly, down to
+    // its promotion's marker commit — and is reported as concluded, never as
+    // work to recover and never as room for a fresh run.
+    const draft = await loadCurrentCanonicalDraft(store, projectId);
+    if (!draft) return null;
+    await assertCanonicalDraftPromotionMarker(await ProjectWorkspace.open(projectId, input.workspacesRoot), draft);
+    throw new ActiveContinuationConcludedDraft(projectId, draft._id, draft.canonicalBindingId);
+  }
+
+  // A run owns the project, so no draft may: both at once is corruption.
+  const strayDraft = await store.canonicalDrafts.findOne({ projectId, current: true });
+  if (strayDraft) {
+    throw new ActiveContinuationCorrupt(projectId, `lineage "${root._id}" is active while canonical draft "${strayDraft._id}" is current`);
+  }
 
   const tip = await deriveActiveLineageTip(store, root);
 
@@ -279,7 +313,7 @@ export async function resolvePostPromotionRecovery(
   if (projectDoc.state === 'awaiting_human_review') {
     throw new ActiveContinuationAwaitingHumanReview(projectId, root._id);
   }
-  if (projectDoc.state === 'released' || projectDoc.state === 'blocked' || projectDoc.state === 'intake_insufficient') {
+  if (projectDoc.state === 'released' || projectDoc.state === 'blocked' || projectDoc.state === 'intake_insufficient' || projectDoc.state === 'draft') {
     throw new ActiveContinuationCorrupt(
       projectId,
       `the project is "${projectDoc.state}" yet lineage "${root._id}" still owns it`,
@@ -351,13 +385,16 @@ export async function resolvePostPromotionRecovery(
 }
 
 /**
- * Refuse a `legacy_direct` run while an unfinished `job_lifecycle` lineage owns
- * the project. A terminal project holds no active lineage, so this never blocks
- * legitimate later work.
+ * Refuse a `legacy_direct` run while an unfinished `job_lifecycle` lineage or a
+ * concluded canonical draft owns the project. A terminal project holds neither,
+ * so this never blocks legitimate later work.
  */
 export async function assertNoActiveLineageForLegacyDirect(store: StateStore, projectId: string): Promise<void> {
   const root = await findActiveLineageRoot(store, projectId);
   if (root) throw new LegacyDirectActiveLineageConflict(projectId, root._id);
+  // Nor over a concluded draft, whose discovery would erase the project it owns.
+  const draft = await loadCurrentCanonicalDraft(store, projectId);
+  if (draft) throw new ActiveContinuationConcludedDraft(projectId, draft._id, draft.canonicalBindingId);
 }
 
 // ---------------------------------------------------------------------------
