@@ -24,6 +24,9 @@ Boundaries:
 - Preserve everything about the file that was not part of the defect, including formatting
   and the shared layout.
 - No placeholder text, no external image references, no 555 phone numbers.
+- Never remove, rename, repeat or move a data-statx-* attribute, and never change the text
+  of an element carrying data-statx-field-id. They are the site's semantic identity, and the
+  platform rejects a repair that breaks them.
 
 THE PROJECT
 

@@ -37,6 +37,7 @@ import {
 } from '../src/run-recovery/frontend-backend.js';
 import { authorizeReleaseRepublication, ReleasePublicationReconciliationRequired } from '../src/release-publication/publication.js';
 import { findActiveLineageRoot } from '../src/run-binding/frontend-backend.js';
+import { fakeExport } from './support/site-model-export.js';
 
 const SRC = join(dirname(fileURLToPath(import.meta.url)), '..', 'src');
 
@@ -173,9 +174,8 @@ vi.mock('@statxai/workspace', async (importOriginal) => {
       }
       return { ok: true, durationMs: 5, output: '', outDir: '/out' };
     }),
-    readBuiltFiles: vi.fn(async () => [
-      { path: 'index.html', contents: '<!doctype html><html lang="en"><head><title>T</title></head><body><main><h1>Harrowgate Joinery</h1></main></body></html>' },
-    ]),
+    // A faithful export of the editable site model the run pinned, so the real site-model gate measures it.
+    readBuiltFiles: vi.fn(async (siteRoot: string) => fakeExport(store, siteRoot, [{ path: 'index.html', contents: '<!doctype html><html lang="en"><head><title>T</title></head><body><main><h1>Harrowgate Joinery</h1></main></body></html>' }], '<h1>Harrowgate Joinery</h1>')),
     readExportFiles: vi.fn(async () => []),
     readSourceFiles: vi.fn(async () => [{ path: 'app/page.tsx', contents: 'x' }]),
     deploymentConfigured: vi.fn(() => {
@@ -618,7 +618,8 @@ describe('an existing release is stronger authority than re-evaluation', () => {
     const after = await store.releasePublications.findOne({ _id: receipt!._id });
     expect(after!.status).toBe('committed');
     expect(result.qualityScore).toBe(92);
-    expect(result.manifest?.checks).toEqual(['build', 'claims']);
+    // Exactly the gates the original evaluation certified — the site-model gate among them.
+    expect(result.manifest?.checks).toEqual(['build', 'claims', 'site-model']);
   });
 
   it('publishing receipt: reconciliation required, and nothing is re-run or re-sent', async () => {

@@ -33,7 +33,7 @@
  */
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { VisualQualityReview, VisualRefinementSource, type ArtifactRef, type ToolId, type ToolResult, type WorkerRole } from '@statxai/contracts';
+import { VisualQualityReview, VisualRefinementSource, type ArtifactRef, type EditableSiteModel, type ToolId, type ToolResult, type WorkerRole } from '@statxai/contracts';
 import type { JobDocument } from '@statxai/state';
 import { contentHash, defaultTemplateRoot, type ArtifactRegistry, type BlobStore } from '@statxai/workspace';
 import { refineSiteVisually, type ModelRuntime, type ToolAccess } from '@statxai/agents';
@@ -44,6 +44,7 @@ import { effectiveTools, ToolGateway } from '../tool-gateway/gateway.js';
 import { createScaffoldFilesystemAdapter } from '../tool-gateway/filesystem.js';
 import { createTestRunnerAdapter } from '../tool-gateway/test-runner.js';
 import { reproduceReviewFrames } from '../phases/visual-review.js';
+import { resolveEditableSiteModel } from '../site-model/persist.js';
 
 const ROLE: WorkerRole = 'frontend_backend';
 
@@ -82,6 +83,12 @@ export class FrontendBackendInputInvalid extends Error {
 export const FRONTEND_BACKEND_INPUT = {
   businessProfile: 'businessProfile',
   sitePlan: 'sitePlan',
+  /**
+   * The exact editable site model version the build must carry the semantic
+   * identity of. Absent on specs written before the model existed, which are
+   * built and validated exactly as they always were.
+   */
+  editableSiteModel: 'editableSiteModel',
   /**
    * Present, all three together, only on a visual refinement: the exact
    * harness-read source snapshot of the build being refined, and the exact
@@ -130,7 +137,7 @@ function sameExactRef(a: ArtifactRef, b: ArtifactRef): boolean {
 }
 
 /** The production gateway for one claimed job: exactly the two tools this handler supports. */
-export function createFrontendBackendToolGateway(options: { profile: unknown; plan: unknown; advisoryWorkspacesRoot: string }): ToolGateway {
+export function createFrontendBackendToolGateway(options: { profile: unknown; plan: unknown; advisoryWorkspacesRoot: string; siteModel?: EditableSiteModel | null }): ToolGateway {
   return new ToolGateway({
     adapters: [
       createScaffoldFilesystemAdapter({ root: defaultTemplateRoot() }),
@@ -138,6 +145,7 @@ export function createFrontendBackendToolGateway(options: { profile: unknown; pl
         profile: options.profile as RunFacts['profile'],
         plan: options.plan as Parameters<typeof prepareBuildFromPlan>[1],
         workspacesRoot: options.advisoryWorkspacesRoot,
+        siteModel: options.siteModel ?? null,
       }),
     ],
   });
@@ -177,6 +185,7 @@ export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDe
     plan: Parameters<typeof prepareBuildFromPlan>[1],
     tools: ToolAccess,
     signal: AbortSignal,
+    siteModel: EditableSiteModel | null,
   ): Promise<BuildCandidate> {
     if (!deps.blobs) throw new FrontendBackendInputInvalid(`frontend_backend job "${job._id}" is a visual refinement, but this handler has no screenshot store`);
     const sourceRef = requiredRef(job, FRONTEND_BACKEND_INPUT.visualRefinementSource);
@@ -216,6 +225,7 @@ export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDe
         source: source.files,
         review: { ref: reviewRef, screenshotSet: setRef, assessment: review.assessment },
         frames,
+        ...(siteModel ? { siteModel } : {}),
       },
       { signal, tools },
     );
@@ -243,9 +253,16 @@ export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDe
       deps.registry.resolve(job.projectId, planRef),
     ]);
 
+    // The exact editable site model the job pins, if it pins one — the identity every page it builds must carry.
+    const modelRef = job.spec.inputs[FRONTEND_BACKEND_INPUT.editableSiteModel];
+    const siteModel = modelRef ? await resolveEditableSiteModel(deps.registry, job.projectId, modelRef) : null;
+    if (siteModel && (siteModel.sitePlan.name !== planRef.name || siteModel.sitePlan.version !== planRef.version)) {
+      throw new FrontendBackendInputInvalid(`frontend_backend job "${job._id}" pins an editable site model for a different site plan`);
+    }
+
     ctx.signal.throwIfAborted();
 
-    const gateway = deps.tools ?? createFrontendBackendToolGateway({ profile, plan, advisoryWorkspacesRoot });
+    const gateway = deps.tools ?? createFrontendBackendToolGateway({ profile, plan, advisoryWorkspacesRoot, siteModel });
 
     // Bound to this claimed job. Permission is re-checked by the gateway on
     // every call, against this job's own spec — never against anything the
@@ -276,11 +293,11 @@ export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDe
     // execution's authority is proven.
     let candidate: BuildCandidate;
     if (isVisualRefinementSpec(job.spec)) {
-      candidate = await prepareVisualRefinement(job, profile as RunFacts['profile'], plan as Parameters<typeof prepareBuildFromPlan>[1], toolAccess('terra-refine'), ctx.signal);
+      candidate = await prepareVisualRefinement(job, profile as RunFacts['profile'], plan as Parameters<typeof prepareBuildFromPlan>[1], toolAccess('terra-refine'), ctx.signal, siteModel);
     } else {
       const prepareContext: PrepareContext = {
         deps: { model: deps.model, say, tools: toolAccess('terra-build') },
-        facts: { profile: profile as RunFacts['profile'] },
+        facts: { profile: profile as RunFacts['profile'], ...(siteModel ? { siteModel } : {}) },
       };
       candidate = await prepareBuildFromPlan(prepareContext, plan as Parameters<typeof prepareBuildFromPlan>[1], ctx.signal);
     }

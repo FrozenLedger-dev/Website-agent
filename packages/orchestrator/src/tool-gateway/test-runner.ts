@@ -25,6 +25,7 @@ import { join } from 'node:path';
 import {
   TestRunnerInput,
   type BusinessProfile,
+  type EditableSiteModel,
   type SitePlan,
   type TestRunnerFinding,
   type TestRunnerResult,
@@ -57,6 +58,8 @@ export interface TestRunnerAdapterOptions {
   /** The claimed job's pinned inputs — the gates measure a site against these. */
   readonly profile: BusinessProfile;
   readonly plan: SitePlan;
+  /** The exact editable site model the job pins, so an advisory test measures what official validation will. */
+  readonly siteModel?: EditableSiteModel | null;
   /** Where disposable advisory workspaces are created, from trusted harness configuration. */
   readonly workspacesRoot: string;
 }
@@ -120,7 +123,7 @@ export function createTestRunnerAdapter(options: TestRunnerAdapterOptions): Tool
 
       let measured: Awaited<ReturnType<typeof runDeterministicGates>>;
       try {
-        measured = await runDeterministicGates(ws.siteRoot, options.profile, options.plan, signal);
+        measured = await runDeterministicGates(ws.siteRoot, options.profile, options.plan, signal, options.siteModel ?? null);
       } catch (error) {
         if (error instanceof SandboxUnavailable && !signal?.aborted) return empty(candidateHash, 'unavailable');
         throw error;

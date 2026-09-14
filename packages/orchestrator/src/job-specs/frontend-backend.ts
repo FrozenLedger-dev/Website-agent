@@ -51,6 +51,18 @@ export interface CreateFrontendBackendJobSpecInput {
   readonly businessProfileRef: ArtifactRef;
   /** The exact, already-authoritative `sitePlan` ref — never "latest". */
   readonly sitePlanRef: ArtifactRef;
+  /**
+   * The exact `editable-site-model` version the build must carry, with its
+   * content hash. Every new production generation pins one; a spec without it
+   * is a historical request, rebuilt exactly as it was.
+   */
+  readonly editableSiteModelRef?: ArtifactRef;
+}
+
+function pinnedModel(ref: ArtifactRef | undefined): Record<string, ArtifactRef> {
+  if (!ref) return {};
+  if (!ref.contentHash) throw new Error('a pinned editable site model ref must carry its exact content hash');
+  return { [FRONTEND_BACKEND_INPUT.editableSiteModel]: ref };
 }
 
 /**
@@ -102,6 +114,7 @@ export function createFrontendBackendJobSpec(input: CreateFrontendBackendJobSpec
     inputs: {
       [FRONTEND_BACKEND_INPUT.businessProfile]: input.businessProfileRef,
       [FRONTEND_BACKEND_INPUT.sitePlan]: input.sitePlanRef,
+      ...pinnedModel(input.editableSiteModelRef),
     },
     acceptanceCriteria: [...ACCEPTANCE_CRITERIA],
     allowedTools: [...ALLOWED_TOOLS],
@@ -159,6 +172,7 @@ export function createFrontendBackendVisualRefinementJobSpec(input: CreateFronte
       [FRONTEND_BACKEND_INPUT.visualRefinementSource]: input.visualRefinementSourceRef,
       [FRONTEND_BACKEND_INPUT.visualQualityReview]: input.visualQualityReviewRef,
       [FRONTEND_BACKEND_INPUT.screenshotSet]: input.screenshotSetRef,
+      ...pinnedModel(input.editableSiteModelRef),
     },
     acceptanceCriteria: [...REFINE_ACCEPTANCE_CRITERIA],
     allowedTools: [...ALLOWED_TOOLS],

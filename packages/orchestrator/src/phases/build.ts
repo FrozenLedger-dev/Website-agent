@@ -59,7 +59,7 @@
  * it, but nothing reaches the registry before this execution's authority is
  * proven.
  */
-import { HOME_ROUTE, routeToSourcePath, type GeneratedFile, type SitePlan } from '@statxai/contracts';
+import { HOME_ROUTE, routeToSourcePath, type EditableSiteModel, type GeneratedFile, type SitePlan } from '@statxai/contracts';
 import { buildAnchor, buildPage, buildSite, routeBuild, type ToolAccess } from '@statxai/agents';
 import { scaffoldSite } from '@statxai/workspace';
 import { permittedStrategies, authorizeRoute, type RoutingAuthorization } from '@statxai/policy-engine';
@@ -97,14 +97,18 @@ export interface PrepareContext {
      */
     readonly tools?: ToolAccess;
   };
-  readonly facts: Pick<RunFacts, 'profile'>;
+  readonly facts: Pick<RunFacts, 'profile'> & {
+    /** The exact editable site model the build must carry, when the job pins one. */
+    readonly siteModel?: EditableSiteModel;
+  };
 }
 
-/** Every Terra build call gets the same cancellation and the same tool access — none left out. */
+/** Every Terra build call gets the same cancellation, the same tool access and the same site model — none left out. */
 function terraOptions(ctx: PrepareContext, signal?: AbortSignal) {
   return {
     ...(signal !== undefined ? { signal } : {}),
     ...(ctx.deps.tools !== undefined ? { tools: ctx.deps.tools } : {}),
+    ...(ctx.facts.siteModel !== undefined ? { siteModel: ctx.facts.siteModel } : {}),
   };
 }
 

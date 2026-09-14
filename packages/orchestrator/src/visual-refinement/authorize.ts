@@ -40,6 +40,7 @@ import {
 import { findReleasePublicationForLineage } from '../release-publication/publication.js';
 import { promotionMarker } from '../job-promotion/frontend-backend.js';
 import { createFrontendBackendVisualRefinementJobSpec } from '../job-specs/frontend-backend.js';
+import { FRONTEND_BACKEND_INPUT } from '../job-handlers/frontend-backend.js';
 import type { VisualQualityReviewOutcome } from '../phases/visual-review.js';
 import { VISUAL_REFINEMENT_POLICY, decideVisualRefinement, type VisualRefinementDecision } from './policy.js';
 
@@ -238,6 +239,8 @@ export async function authorizeVisualRefinement(input: AuthorizeVisualRefinement
         visualRefinementSourceRef: sourceRef,
         visualQualityReviewRef: input.review.ref,
         screenshotSetRef: input.screenshotSet,
+        // The same exact model the refined build carries: refinement changes presentation, never semantic identity.
+        ...(build.jobSpec.inputs[FRONTEND_BACKEND_INPUT.editableSiteModel] ? { editableSiteModelRef: build.jobSpec.inputs[FRONTEND_BACKEND_INPUT.editableSiteModel] } : {}),
       });
       const doc: VisualRefinementIntentDocument = {
         _id: intentId,

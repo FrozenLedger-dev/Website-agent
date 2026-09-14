@@ -31,7 +31,7 @@ import { join } from 'node:path';
 import type * as Agents from '@statxai/agents';
 import type * as Gates from '@statxai/gates';
 import type * as Workspace from '@statxai/workspace';
-import { ReplanSuccessorProvenance, type ArtifactRef, type BuildSuccessorProvenance, type SitePlan } from '@statxai/contracts';
+import { EditableSiteModel, ReplanSuccessorProvenance, type ArtifactRef, type BuildSuccessorProvenance, type SitePlan } from '@statxai/contracts';
 import { StateStore } from '@statxai/state';
 import type { FrontendBackendBuildBindingDocument } from '@statxai/state';
 import { ArtifactRegistry, ProjectWorkspace } from '@statxai/workspace';
@@ -42,6 +42,7 @@ import {
   prepareFrontendBackendBuildBinding,
 } from '../src/run-binding/frontend-backend.js';
 import { createFrontendBackendJobSpec } from '../src/job-specs/frontend-backend.js';
+import { fakeExport } from './support/site-model-export.js';
 
 /** A replan reason, proven against the contract exactly as production proves it. */
 const replan = (replanDecision: ArtifactRef): BuildSuccessorProvenance => ReplanSuccessorProvenance.parse({ kind: 'replan', replanDecision });
@@ -174,9 +175,8 @@ vi.mock('@statxai/workspace', async (importOriginal) => {
     ...actual,
     scaffoldSite: vi.fn(actual.scaffoldSite),
     buildSite: vi.fn(async () => ({ ok: compileOk, durationMs: 5, output: compileOk ? '' : 'compile error: x', outDir: '/out' })),
-    readBuiltFiles: vi.fn(async () => [
-      { path: 'index.html', contents: '<!doctype html><html lang="en"><head><title>T</title></head><body><main><h1>Harrowgate Joinery</h1></main></body></html>' },
-    ]),
+    // A faithful export of the editable site model the run pinned, so the real site-model gate measures it.
+    readBuiltFiles: vi.fn(async (siteRoot: string) => fakeExport(store, siteRoot, [{ path: 'index.html', contents: '<!doctype html><html lang="en"><head><title>T</title></head><body><main><h1>Harrowgate Joinery</h1></main></body></html>' }], '<h1>Harrowgate Joinery</h1>')),
     readExportFiles: vi.fn(async () => []),
     readSourceFiles: vi.fn(async () => [{ path: 'app/page.tsx', contents: 'x' }]),
     deploymentConfigured: vi.fn(() => false),
@@ -599,6 +599,37 @@ describe('lineage authority', () => {
     // Absent lineage means "initial or legacy" — they stay outside the index
     // and are never adopted as successors of anything.
     expect(await store.frontendBackendBuildBindings.countDocuments({ projectId, predecessorBindingId: { $exists: true } })).toBe(0);
+  });
+});
+
+describe('a replan reconciles the editable site model explicitly', () => {
+  it('surviving pages and sections keep their IDs, a dropped route is retired, and every generation pins the exact model version made for its plan', async () => {
+    const projectId = 'proj_5q0_model_replan';
+    expectReplanCycles(2);
+    revisedPlans = [P1, P2];
+
+    expect((await runJobMode(projectId)).outcome).toBe('released');
+
+    const [b0, b1, b2] = await bindings(projectId);
+    const docs = await store.artifacts.find({ projectId, name: 'editable-site-model' }).sort({ version: 1 }).toArray();
+    expect(docs).toHaveLength(3);
+    const refs = docs.map((d) => ({ name: d.name, version: d.version, contentHash: d.contentHash }));
+    const [m0, m1, m2] = docs.map((d) => EditableSiteModel.parse(d.data));
+    expect([b0, b1, b2].map((b) => b!.jobSpec.inputs.editableSiteModel)).toEqual(refs);
+
+    // Provenance: M0 from the initial plan, each later model from its exact predecessor and exact revised plan.
+    expect(m0!.provenance).toEqual({ kind: 'site_plan', sitePlan: b0!.sitePlan });
+    expect(m1!.provenance).toEqual({ kind: 'replan', base: refs[0], sitePlan: b1!.sitePlan });
+    expect(m2!.provenance).toEqual({ kind: 'replan', base: refs[1], sitePlan: b2!.sitePlan });
+
+    // Survivors keep identity; removed routes are retired with their sections, and stay retired.
+    const page = (m: EditableSiteModel, route: string) => m.pages.find((p) => p.route === route);
+    expect(page(m1!, '/')!.pageId).toBe(page(m0!, '/')!.pageId);
+    expect(page(m2!, '/')!.sections[0]!.sectionId).toBe(page(m0!, '/')!.sections[0]!.sectionId);
+    expect(page(m1!, '/about')!.pageId).toBe(page(m0!, '/about')!.pageId);
+    expect(page(m1!, '/services')).toBeUndefined();
+    expect(m1!.identity.retired).toEqual(expect.arrayContaining([page(m0!, '/services')!.pageId, page(m0!, '/services')!.sections[0]!.sectionId]));
+    expect(m2!.identity.retired).toEqual(expect.arrayContaining([...m1!.identity.retired, page(m1!, '/about')!.pageId]));
   });
 });
 

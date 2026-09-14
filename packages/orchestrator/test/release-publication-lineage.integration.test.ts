@@ -55,6 +55,7 @@ import {
   recordPublicationSuccess,
   resolveDeploymentTarget,
 } from '../src/release-publication/publication.js';
+import { fakeExport } from './support/site-model-export.js';
 
 /** A replan reason, proven against the contract exactly as production proves it. */
 const replan = (replanDecision: ArtifactRef): BuildSuccessorProvenance => ReplanSuccessorProvenance.parse({ kind: 'replan', replanDecision });
@@ -152,9 +153,8 @@ vi.mock('@statxai/workspace', async (importOriginal) => {
     ...actual,
     scaffoldSite: vi.fn(actual.scaffoldSite),
     buildSite: vi.fn(async () => ({ ok: true, durationMs: 5, output: '', outDir: '/out' })),
-    readBuiltFiles: vi.fn(async () => [
-      { path: 'index.html', contents: '<!doctype html><html lang="en"><head><title>T</title></head><body><main><h1>Harrowgate Joinery</h1></main></body></html>' },
-    ]),
+    // A faithful export of the editable site model the run pinned, so the real site-model gate measures it.
+    readBuiltFiles: vi.fn(async (siteRoot: string) => fakeExport(store, siteRoot, [{ path: 'index.html', contents: '<!doctype html><html lang="en"><head><title>T</title></head><body><main><h1>Harrowgate Joinery</h1></main></body></html>' }], '<h1>Harrowgate Joinery</h1>')),
     readExportFiles: vi.fn(async () => []),
     readSourceFiles: vi.fn(async () => [{ path: 'app/page.tsx', contents: 'x' }]),
     // A configured deployment is what gives a release a receipt at all.

@@ -9,3 +9,4 @@ export * from './browser.js';
 export * from './visual-review.js';
 export * from './build-lineage.js';
 export * from './visual-refinement.js';
+export * from './editable-site-model.js';

@@ -124,7 +124,7 @@ describe('both generated-code build sites use the sandboxed build', () => {
   it('canonical evaluation measures the canonical site through runDeterministicGates', async () => {
     const code = await src('packages/orchestrator/src/phases/evaluate.ts');
     const evaluate = body(code, 'export async function evaluateSite(', '\nfunction firstErrors(');
-    expect(evaluate).toContain('await runDeterministicGates(deps.workspace.siteRoot, facts.profile, progress.plan)');
+    expect(evaluate).toContain('await runDeterministicGates(deps.workspace.siteRoot, facts.profile, progress.plan, undefined, siteModel)');
     expect(evaluate).not.toMatch(/compileSite\(|buildSite\(/);
   });
 
@@ -137,7 +137,7 @@ describe('both generated-code build sites use the sandboxed build', () => {
       'await mkdtemp(',
       'await scaffoldSite(ws.siteRoot);',
       'await ws.writeSiteFiles(candidate.files);',
-      'await runDeterministicGates(ws.siteRoot, profile, plan)',
+      'await runDeterministicGates(ws.siteRoot, profile, plan, undefined, siteModel)',
       'AUTHENTIC_SUCCESSFUL_VALIDATIONS.set(result',
     ].map((marker) => validate.indexOf(marker));
     expect(order.every((i) => i > -1)).toBe(true);

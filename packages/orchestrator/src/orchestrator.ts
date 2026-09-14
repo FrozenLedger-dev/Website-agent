@@ -61,6 +61,9 @@ import {
 } from './job-lifecycle/frontend-backend.js';
 import { createFrontendBackendJobSpec } from './job-specs/frontend-backend.js';
 import { authorizeVisualRefinement } from './visual-refinement/authorize.js';
+import { FRONTEND_BACKEND_INPUT } from './job-handlers/frontend-backend.js';
+import { modelFromPlan, reconcileModelWithPlan } from './site-model/materialize.js';
+import { recordEditableSiteModel, resolveEditableSiteModel } from './site-model/persist.js';
 import {
   computeRunIntentHash,
   ensureSpecificationCommitted,
@@ -509,10 +512,15 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         spec = resumedSpec!;
         binding = activeBinding;
       } else {
+        // Semantic identity first: the harness materialises the editable site model
+        // from the exact plan, and the build is asked to carry that exact version.
+        const siteModel = await recordEditableSiteModel(registry, projectId, modelFromPlan({ projectId, sitePlanRef: initialSitePlanRef, plan: initialPlan }));
+        say({ phase: 'build', detail: `Editable site model ${siteModel.ref.name}@${siteModel.ref.version} materialised from ${initialSitePlanRef.name}@${initialSitePlanRef.version}`, level: 'ok' });
         spec = createFrontendBackendJobSpec({
           projectId,
           businessProfileRef,
           sitePlanRef: initialSitePlanRef,
+          editableSiteModelRef: siteModel.ref,
         });
         binding = await prepareFrontendBackendBuildBinding(store, {
           projectId,
@@ -644,7 +652,12 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
 
   while (true) {
-    const evaluation = await evaluateSite(ctx(), { sitePlan: currentSitePlanRef, authority: renderAuthority() });
+    const evaluation = await evaluateSite(ctx(), {
+      sitePlan: currentSitePlanRef,
+      // The exact model the canonical build pinned — a build from before the model has none, and says so.
+      editableSiteModel: frontendBackendExecutionMode === 'job_lifecycle' ? (canonicalBuild?.jobSpec.inputs[FRONTEND_BACKEND_INPUT.editableSiteModel] ?? null) : null,
+      authority: renderAuthority(),
+    });
 
     if (evaluation.kind === 'review_unavailable') {
       // An unobtainable review never counts as approval, so the run stops here
@@ -934,10 +947,21 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
          * replaces it exactly — removing the routes this revision dropped —
          * only once the candidate has been accepted.
          */
+        // A true replan reconciles the exact model the predecessor carried: surviving pages and
+        // sections keep their identity, new ones get new identity, removed ones are retired.
+        const baseModelRef = canonicalBuild.jobSpec.inputs[FRONTEND_BACKEND_INPUT.editableSiteModel];
+        const successorModel = await recordEditableSiteModel(
+          registry,
+          projectId,
+          baseModelRef
+            ? reconcileModelWithPlan({ base: await resolveEditableSiteModel(registry, projectId, baseModelRef), baseRef: baseModelRef, sitePlanRef: revised.sitePlanRef, plan: revised.plan })
+            : modelFromPlan({ projectId, sitePlanRef: revised.sitePlanRef, plan: revised.plan }),
+        );
         const successorSpec = createFrontendBackendJobSpec({
           projectId,
           businessProfileRef,
           sitePlanRef: revised.sitePlanRef,
+          editableSiteModelRef: successorModel.ref,
         });
         const successor = await prepareFrontendBackendBuildBinding(store, {
           projectId,

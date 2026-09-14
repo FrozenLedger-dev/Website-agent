@@ -29,6 +29,7 @@ import { createFrontendBackendJobSpec } from '../src/job-specs/frontend-backend.
 import * as lifecycleModule from '../src/job-lifecycle/frontend-backend.js';
 import * as buildModule from '../src/phases/build.js';
 import * as evaluateModule from '../src/phases/evaluate.js';
+import { fakeExport } from './support/site-model-export.js';
 
 interface ReviewIssue {
   id: string;
@@ -162,9 +163,8 @@ vi.mock('@statxai/workspace', async (importOriginal) => {
     ...actual,
     scaffoldSite: vi.fn(actual.scaffoldSite),
     buildSite: vi.fn(async () => ({ ok: compileOk, durationMs: 5, output: compileOk ? '' : 'compile error: x', outDir: '/out' })),
-    readBuiltFiles: vi.fn(async () => [
-      { path: 'index.html', contents: '<!doctype html><html lang="en"><head><title>T</title></head><body><main><h1>Harrowgate Joinery</h1></main></body></html>' },
-    ]),
+    // A faithful export of the editable site model the run pinned, so the real site-model gate measures it.
+    readBuiltFiles: vi.fn(async (siteRoot: string) => fakeExport(store, siteRoot, [{ path: 'index.html', contents: '<!doctype html><html lang="en"><head><title>T</title></head><body><main><h1>Harrowgate Joinery</h1></main></body></html>' }], '<h1>Harrowgate Joinery</h1>')),
     readExportFiles: vi.fn(async () => []),
     readSourceFiles: vi.fn(async () => [{ path: 'app/page.tsx', contents: 'x' }]),
     deploymentConfigured: vi.fn(() => false),

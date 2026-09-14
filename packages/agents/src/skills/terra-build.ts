@@ -18,6 +18,7 @@ import {
 import type * as z from 'zod/v4';
 import type { ModelCallOptions, ModelInvocationResult, ModelRuntime } from '../runtime.js';
 import type { ModelImage } from '../providers/types.js';
+import type { EditableSiteModel } from '@statxai/contracts';
 import {
   TERRA_MAX_MODEL_TURNS,
   TERRA_MAX_RETURNED_BYTES,
@@ -330,9 +331,59 @@ ${STACK}`;
 /** The build contract every build-producing Terra skill writes against — the same stack, rules and design bar. */
 export const TERRA_BUILD_STACK = STACK;
 
-/** Per-call options for a Terra build: cancellation, and any tools the harness granted. */
+/** Per-call options for a Terra build: cancellation, any tools the harness granted, and the exact editable site model. */
 export interface TerraBuildOptions extends ModelCallOptions {
   readonly tools?: ToolAccess;
+  /** The harness-owned semantic identity the build must carry. Absent for a historical request with no model. */
+  readonly siteModel?: EditableSiteModel;
+}
+
+/**
+ * The mandatory identity contract for the pages a call writes.
+ *
+ * Every value here is the harness's: the IDs, the headings, the titles. Terra
+ * places them; it never chooses, renames or adds one. The platform checks the
+ * exported HTML of every page against the model and rejects a build that
+ * breaks any rule — this brief is the instruction, not the enforcement.
+ */
+export function semanticIdentityBrief(model: EditableSiteModel, routes: readonly string[] | 'all'): string {
+  const pages = model.pages.filter((page) => routes === 'all' || routes.includes(page.route));
+  const value = (fields: readonly { key: string; value: unknown }[], key: string) => String(fields.find((f) => f.key === key)?.value ?? '');
+  const quote = (text: string) => JSON.stringify(text);
+  const describe = pages.map((page) => {
+    const sections = page.sections
+      .filter((section) => section.visibility === 'visible')
+      .map((section, i) => {
+        const heading = section.fields.find((f) => f.key === 'heading')!;
+        const blocks = section.blocks
+          .filter((block) => block.visibility === 'visible')
+          .map((block) => `        block ${block.blockId} (${block.kind}): ${block.fields.map((f) => `${f.key} ${f.fieldId} = ${quote(JSON.stringify(f.value))}`).join('; ')}`);
+        return [`    ${i + 1}. section ${section.sectionId} — layout ${section.layout}`, `       heading ${heading.fieldId} = ${quote(String(heading.value))}`, ...blocks].join('\n');
+      });
+    return [`  ${page.route}  page ${page.pageId}`, `    title = ${quote(value(page.fields, 'title'))}`, `    description = ${quote(value(page.fields, 'description'))}`, ...sections].join('\n');
+  });
+
+  return `
+
+SEMANTIC IDENTITY — MANDATORY, CHECKED ON EVERY PAGE
+This site has a harness-owned editable model. The platform reads the exported HTML
+of every page and rejects the build if any rule below is broken.
+- The outermost element each page component returns carries data-statx-page-id="<page id>".
+- Each listed section is one element carrying data-statx-section-id="<section id>",
+  inside the page element, exactly once, in exactly the order listed.
+- Inside its section, the section heading element carries data-statx-field-id="<field id>"
+  and its text is exactly the heading given — nothing added, nothing changed.
+- A listed block is one element carrying data-statx-block-id inside its section, and each
+  of its fields an element carrying data-statx-field-id with exactly that value.
+- Each page exports metadata whose title is exactly the title given and whose description
+  is exactly the description given. app/layout.tsx sets no title template.
+- Write the IDs as literal strings in the page file (you may pass them as props to a
+  component). Never invent, rename, repeat or omit a data-statx-* attribute, and never
+  put one in app/layout.tsx.
+- Everything else in a section — supporting copy, lists, actions, graphics — is yours.
+
+PAGES AND THEIR IDENTITY
+${describe.join('\n')}`;
 }
 
 export interface TerraBuildRequest {
@@ -503,7 +554,7 @@ BUSINESS PROFILE
 ${JSON.stringify(profile, null, 2)}
 
 APPROVED PLAN
-${JSON.stringify(plan, null, 2)}`,
+${JSON.stringify(plan, null, 2)}${options.siteModel ? semanticIdentityBrief(options.siteModel, 'all') : ''}`,
     },
     options,
   );
@@ -547,7 +598,7 @@ ALL ROUTES (for navigation)
 ${plan.sitemap.pages.map((p) => `  ${p.route}  ${p.title}`).join('\n')}
 
 HOMEPAGE SPECIFICATION
-${JSON.stringify(home, null, 2)}`,
+${JSON.stringify(home, null, 2)}${options.siteModel ? semanticIdentityBrief(options.siteModel, [home.route]) : ''}`,
     },
     options,
   );
@@ -595,7 +646,7 @@ SHARED LAYOUT (app/layout.tsx — for reference, do not return it)
 ${layoutSource}
 
 REFERENCE PAGE (the homepage — for reference, do not return it)
-${anchorSource}`,
+${anchorSource}${options.siteModel ? semanticIdentityBrief(options.siteModel, [page.route]) : ''}`,
     },
     options,
   );

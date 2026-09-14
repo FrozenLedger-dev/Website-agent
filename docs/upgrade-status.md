@@ -6608,6 +6608,251 @@ byte-identical after each.
 browser tool, automatic rollback, visual release-blocking policy, and automatic
 resume of a prepared, unpromoted successor, for replans and refinements alike.
 
+## Structured editable site model — **DONE**
+
+**Why.** Future editing needs stable semantic identity. It must be able to
+say "update field X" or "move section Y" without source lines, selectors, DOM
+positions or text matching. This slice establishes that identity, binds it to
+every build, and defines the bounded operations over it. There is no editor UI.
+
+**Gate findings.**
+
+- **`SitePlan`** is planning authority. It holds the strategy and value
+  proposition, and a brand system: palette strings, typography strings, radius
+  and art direction. It holds pages with a route, title, meta description, goal
+  and primary action. Each page holds sections with a Sol-chosen `id`, a
+  `heading`, a `purpose`, a bounded `layout` and `contentBindings`. It has no
+  assets, blocks or copy beyond headings.
+  - The `route` and section `id` are stable semantic keys.
+  - `purpose`, `goal` and `contentBindings` are instructions, not editable
+    content, so they stay out of the model.
+- **`BuildOutput`** is only `files[] + notes`. Terra emits no semantic
+  metadata, and generated HTML carried no markers.
+- **Content.** Copy other than headings, titles and descriptions exists only
+  inside Terra's JSX. Visual refinement can rewrite any text.
+- **Consequence.** The model claims only what the harness can deterministically
+  prove in every build:
+  - page identity, `<title>` and meta description;
+  - section identity, order and visibility;
+  - section headings;
+  - any blocks and fields the model contains.
+  
+  All other in-section content remains implementation owned. Generated React is
+  the implementation layer, not a model AST.
+- **Export.** `data-*` attributes survive a real sandboxed `next build` static
+  export, including values passed as component props
+  (`site-model-export.integration.test.ts`).
+
+**Contract (`contracts/editable-site-model.ts`, `statxai-editable-site-model@1`).**
+
+- **Model:** `EditableSiteModel` is strict and holds `projectId`, an exact
+  `sitePlan` ref, `provenance`, `design`, `pages`, `assets` and `identity`.
+- **Identity:** opaque typed IDs `pg_ / sec_ / blk_ / fld_ / ast_` followed by 16
+  hex characters.
+- **Pages:** each has `route`, `title` and `description` fields, and ordered
+  sections.
+- **Sections:** each has `planKey`, a bounded `layout`, `visibility`, a single
+  `heading` field and `blocks`.
+- **Blocks:** blocks are `SUPPORTED_BLOCKS`, and each kind fixes its fields:
+  - `text`, `cta`, `card`, `stat`, `step`, `faq_item`;
+  - `phone`, `email`, `address`, `image`.
+- **Fields:** field types are `text`, `cta` (label plus a safe href), `phone`,
+  `email`, `address` and `asset`.
+- **Assets:** an asset slot (`assetId`) is separate from what fills it
+  (`unassigned`, or a sha256 blob with media type and size).
+- **Design tokens:** colour values (hex or colour functions, never
+  declarations), single font families, size and scale patterns, radius enum and
+  art-direction prose.
+- **Refinements:** unique IDs across all kinds, no retired ID in use, unique
+  routes and a homepage, unique plan keys per page, each block's fields exactly
+  its kind, and no dangling asset references.
+- **Markers:** `SITE_MODEL_MARKERS` defines the public attributes
+  `data-statx-{page,section,block,field,asset}-id`. IDs are sha256-derived and
+  expose nothing secret.
+
+**Identity authority (`orchestrator/src/site-model/identity.ts`).** IDs come into
+being in only two ways, both inside the harness:
+
+- **Derived:** `sha256(schema, prefix, project, parent, key)`.
+  - A page derives from its route.
+  - A section derives from its plan key on its page.
+  - A field derives from its key on its owner.
+  - Nothing positional, textual or source-derived is ever part of the key.
+- **Minted:** from the lineage's monotonic `identity.minted` counter. This is
+  used for patch-added blocks, or when a derived ID is retired or taken.
+- **Retirement:** retired IDs are carried forever in `identity.retired`, and
+  allocation skips used and retired IDs.
+
+**Materialisation and replan (`site-model/materialize.ts`).**
+
+- **`modelFromPlan`** runs in `runProject` before the first build's spec is
+  created. It is deterministic.
+- **`reconcileModelWithPlan`** is a true replan.
+  - A page survives if the revised plan still has its route. A section survives
+    if its page survives and its plan key remains.
+  - Survivors keep their IDs, blocks, visibility and field IDs. Headings, layout,
+    title and description take the revised plan's values.
+  - New objects get new IDs, never retired ones.
+  - Removed objects are retired with all their descendants.
+  - A renamed route is a removed page plus a new page, with no fuzzy matching.
+- **Unconstructible plans:** a plan that cannot be expressed as a model (a
+  non-colour value, duplicate plan keys) fails closed before any build.
+
+**Artifact (`site-model/persist.ts`).**
+
+- **Record:** `recordEditableSiteModel` validates the model and puts an
+  additive `editable-site-model` version, whose ref carries its content hash.
+- **Resolve:** `resolveEditableSiteModel` reads exactly one ref. It refuses a
+  wrong name, a missing hash, a hash mismatch, another project or an invalid
+  model.
+- **Commit:** `commitSemanticPatch` resolves the exact base, applies the patch
+  and records a new version with `semantic_patch` provenance. That provenance
+  holds the base ref, the operation and the target, and the base is never
+  rewritten.
+- **No latest lookups:** no production code reads a model by name or latest.
+
+**Semantic patches (`contracts` union, `site-model/patch.ts`).**
+
+- **Operations:** `set_field_value`, `set_asset`, `set_visibility`,
+  `move_section`, `set_section_layout`, `set_design_token`, `add_block` and
+  `remove_block`.
+- **Exact base:** every patch names an exact base `editable-site-model` ref with
+  its content hash.
+- **Purity:** `applySemanticPatch` is pure. It works on a `structuredClone`,
+  holds no store, clock or randomness, and always gives the same result for the
+  same input.
+- **Rejections (typed codes):**
+  - `base_mismatch`, `invalid_patch`, `wrong_target_type`, `unknown_target`;
+  - `stale_expectation` (the value the author saw is no longer there);
+  - `invalid_value`, `invariant_violation`.
+- **Additions:** `add_block` mints its block ID.
+- **Removals:** `remove_block` retires the block and its field IDs.
+- **Source:** patches write no source and trigger no build. Applying a model to
+  code is later work.
+
+**Build contract and render binding.**
+
+- **Job spec:** `createFrontendBackendJobSpec` and the refinement factory take
+  an optional exact `editableSiteModelRef`. New `job_lifecycle` generations
+  always pin one.
+- **Handler:** the handler resolves the model exactly, checks it describes the
+  pinned plan, and hands it to Terra. The build, anchor, page and refine prompts
+  get `semanticIdentityBrief` with exact IDs, headings, titles and rules. Luna's
+  prompt forbids touching markers.
+- **Gate:** the site-model gate (`gates/site-model-markers.ts`) runs inside
+  `runDeterministicGates` whenever a model is pinned. That covers official
+  validation, advisory test_runner and canonical evaluation. For every page it
+  checks:
+  - the route exported, and the exact `<title>` and meta description;
+  - exactly one page marker;
+  - every visible section once, inside the page, in model order, with no hidden
+    section rendered;
+  - every field and block once, inside its owner, with its exact value (a CTA as
+    `<a href>` plus its label; an asset through the asset marker);
+  - no duplicates, no IDs from another page, and no unknown IDs.
+  
+  Findings are P0 on the route's source file, so a candidate that breaks
+  identity never validates, and a canonical tree that does becomes a repairable
+  defect.
+- **Browser DOM:** the gate reads the static export the renderer serves. It does
+  not add a check inside the Playwright DOM.
+
+**Refinement, repair, replan.**
+
+- **Refinement** pins the predecessor's exact model ref, and the refine prompt
+  requires marker and text preservation. Validation enforces it: a refinement
+  that drops a marker fails. It never creates a model version.
+- **Luna repairs** are measured by the next evaluation's site-model gate.
+- **A replan** records a reconciled version pinned by the successor.
+- **Phase 5q recovery** evaluates against the tip's pinned model.
+
+**Legacy.** Specs without a model ref, meaning historical bindings and
+`legacy_direct` runs, have no site-model gate and no model. They behave exactly
+as before, and no model is fabricated for them.
+
+**Tests.**
+
+- **`editable-site-model.test.ts` (47):**
+  - typed, unique, opaque IDs that are independent of position and text;
+  - contract rejections: duplicates, routes, homepage, mistyped IDs, dangling
+    assets, block fields, retired IDs in use, CSS in tokens or sections, and
+    `javascript:` links;
+  - replan survival, retirement and no reuse;
+  - every patch operation and rejection code;
+  - determinism, and the base left unchanged;
+  - the gate's detections.
+- **`editable-site-model-artifact.integration.test.ts` (5):** exact refs, additive
+  versions, provenance, historical readability, stale patches, and ref refusal.
+- **`editable-site-model-pipeline.integration.test.ts` (8):**
+  - the model is recorded before the build, pinned in the spec, binding and job,
+    handed to Terra, and gated in validation and evaluation;
+  - `legacy_direct` is unchanged;
+  - five kinds of Terra tampering fail validation;
+  - a marker-dropping Luna repair becomes a blocking site-model defect.
+- **`site-model-export.integration.test.ts` (2):** a real Next export keeps the
+  markers and passes the gate, and fails it against a different model.
+- **`site-model-brief.test.ts` (4):** exact per-call briefs, no hidden sections,
+  a model-less build unchanged, and refinement told to preserve.
+- **`editable-site-model-boundary.test.ts` (13, structural):**
+  - distinct from `SitePlan` and `BuildOutput`;
+  - bounded tokens;
+  - IDs only in the identity module and derived from semantic keys, with no
+    hard-coded IDs and no minting in agents;
+  - the patch engine is pure and nothing applies patches to source;
+  - no console UI;
+  - exact-ref resolution only;
+  - the gate sits in the one measurement path;
+  - markers and prompts;
+  - the gateway is still filesystem and test_runner.
+- **Additions to existing suites:**
+  - visual refinement: the same model is pinned, and a refinement dropping a
+    marker fails;
+  - replan: the model chain, survivor IDs and retired routes.
+- **Migrated:**
+  - the nine runProject suites fake their export from the pinned model
+    (`test/support/site-model-export.ts`), so the real gate runs;
+  - structural call-site assertions in tool-gateway, sandbox and
+    browser-render;
+  - recovered release checks now include `site-model`.
+
+**Mutations: 20 of 20 killed.** Each ran against the model or boundary unit
+suites, plus the artifact, pipeline or refinement integration tests where
+relevant. Sources were restored byte-identical after each, and a created file was
+removed.
+
+- **Identity:**
+  - a duplicate ID accepted;
+  - an ID derived from its array index;
+  - a move regenerating the section ID;
+  - retirement dropped on removal;
+  - an asset slot re-identified when its image changes.
+- **Patches:**
+  - an unknown target accepted;
+  - a wrong target type accepted (still refused, but as `invalid_patch`, so the
+    typed code caught it);
+  - the base mutated in place;
+  - the result losing its exact base provenance;
+  - a CSS string accepted as a colour token.
+- **Authority:**
+  - the model losing its exact site-plan ref;
+  - the build resolving the model by latest;
+  - validation ignoring the pinned model, so Terra could replace IDs;
+  - refinement not pinning the model;
+  - a console editor page introduced;
+  - the handler gaining `browser_preview`.
+- **Gate:**
+  - page markers not required;
+  - section markers not required;
+  - duplicates ignored;
+  - foreign-page IDs ignored.
+  
+  A missing section marker and a duplicated section are also caught by the gate's
+  independent order and containment checks, so for those two the pipeline test
+  still refused the candidate and the unit gate tests are what killed them.
+
+**Not in this slice:** customer editor or UI, chat or click editing, applying
+patches to source, asset upload, rich text, and a Playwright-DOM marker check.
+
 ## Phases 6–17
 
 Not started.

@@ -66,7 +66,7 @@ describe('the tool boundary', () => {
       'await mkdtemp(',
       'await scaffoldSite(ws.siteRoot);',
       'await ws.writeSiteFiles(candidate.files);',
-      'await runDeterministicGates(ws.siteRoot, options.profile, options.plan, signal)',
+      'await runDeterministicGates(ws.siteRoot, options.profile, options.plan, signal, options.siteModel ?? null)',
     ].map((marker) => measure.indexOf(marker));
     expect(order.every((i) => i > -1)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
@@ -129,7 +129,7 @@ describe('the tool boundary', () => {
     // The default gateway registers exactly the scaffold filesystem and the test runner.
     const factory = handler.slice(handler.indexOf('export function createFrontendBackendToolGateway('), handler.indexOf('function requiredRef('));
     expect(factory).toMatch(/new ToolGateway\(\{\s*adapters: \[\s*createScaffoldFilesystemAdapter\(\{ root: defaultTemplateRoot\(\) \}\),\s*createTestRunnerAdapter\(\{[\s\S]*?\}\),\s*\],\s*\}\)/);
-    expect(handler).toMatch(/const gateway = deps\.tools \?\? createFrontendBackendToolGateway\(\{ profile, plan, advisoryWorkspacesRoot \}\);/);
+    expect(handler).toMatch(/const gateway = deps\.tools \?\? createFrontendBackendToolGateway\(\{ profile, plan, advisoryWorkspacesRoot, siteModel \}\);/);
     const gateway = await src('packages/orchestrator/src/tool-gateway/gateway.ts');
     expect(gateway).toMatch(/return allowed\.filter\(\(tool\) => supported\.includes\(tool\)\);/);
   });

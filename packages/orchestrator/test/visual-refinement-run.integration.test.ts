@@ -23,6 +23,8 @@ import type * as Agents from '@statxai/agents';
 import type * as Gates from '@statxai/gates';
 import type * as Workspace from '@statxai/workspace';
 import {
+  EditableSiteModel,
+  SITE_MODEL_MARKERS,
   ScreenshotSet,
   VisualQualityReview,
   VisualRefinementSource,
@@ -33,6 +35,7 @@ import { StateStore } from '@statxai/state';
 import type { FrontendBackendBuildBindingDocument } from '@statxai/state';
 import { ArtifactRegistry, ProjectWorkspace, WriteOutsideModelScope } from '@statxai/workspace';
 import { FrontendBackendBuildBindingCorrupt } from '../src/run-binding/frontend-backend.js';
+import { exportFromPageFiles, pageFilesForModel } from './support/site-model-export.js';
 
 // ---------------------------------------------------------------------------
 // Scripted collaborators
@@ -62,8 +65,8 @@ const PLAN = {
   acceptanceCriteria: ['a', 'b', 'c'],
 } as unknown as SitePlan;
 
-const pagesOf = (plan: SitePlan, marker: string) =>
-  plan.sitemap.pages.map((p) => ({ path: p.route === '/' ? 'app/page.tsx' : `app${p.route}/page.tsx`, contents: `export default function P(){return "${marker}"}` }));
+/** Every page of the exact model the build was handed, marked exactly, with a generation marker in its body. */
+const pagesOf = (model: EditableSiteModel, marker: string, tamper?: (html: string, route: string) => string) => pageFilesForModel(model, `<p>${marker}</p>`, tamper);
 
 /** A visual assessment that speaks only about targets the reviewer was shown. */
 const assessment = (overallScore: number) => ({
@@ -78,7 +81,7 @@ const assessment = (overallScore: number) => ({
 });
 
 let visualScores: number[];
-let refineBehaviour: ((n: number, plan: SitePlan) => { files: { path: string; contents: string }[] }) | null;
+let refineBehaviour: ((n: number, model: EditableSiteModel) => { files: { path: string; contents: string }[] }) | null;
 let captureFailures: Set<number>;
 const calls = { buildSite: 0, reviewVisual: 0, capture: 0, refine: [] as Agents.VisualRefinementInput[], approve: [] as unknown[], adjudicate: 0 };
 
@@ -91,9 +94,9 @@ vi.mock('@statxai/agents', async (importOriginal) => {
     ModelClient: class {},
     planSite: vi.fn(async () => ({ value: PLAN, model: 'sol', ...usage })),
     routeBuild: vi.fn(async () => ({ value: { action: 'one_shot', reason: 'small', confidence: 0.9, workstreams: null }, model: 'sol', ...usage })),
-    buildSite: vi.fn(async (_r: unknown, _p: unknown, plan: SitePlan) => {
+    buildSite: vi.fn(async (_r: unknown, _p: unknown, _plan: SitePlan, options: { siteModel: EditableSiteModel }) => {
       calls.buildSite += 1;
-      return { value: { files: pagesOf(plan, 'B0'), notes: '' }, model: 'terra', ...usage };
+      return { value: { files: pagesOf(options.siteModel, 'B0'), notes: '' }, model: 'terra', ...usage };
     }),
     reviewSite: vi.fn(async () => ({ value: { decision: 'accept', qualityScore: 91, blocking: false, issues: [], summary: 's' }, model: 'terra', ...usage })),
     reviewVisualQuality: vi.fn(async () => {
@@ -103,7 +106,7 @@ vi.mock('@statxai/agents', async (importOriginal) => {
     refineSiteVisually: vi.fn(async (_r: unknown, input: Agents.VisualRefinementInput) => {
       calls.refine.push(input);
       const n = calls.refine.length;
-      const value = refineBehaviour ? refineBehaviour(n, input.plan) : { files: pagesOf(input.plan, `refined ${n}`) };
+      const value = refineBehaviour ? refineBehaviour(n, input.siteModel!) : { files: pagesOf(input.siteModel!, `refined ${n}`) };
       return { value: { ...value, notes: 'refined' }, model: 'terra', invocationId: `refine-${n}`, skill: 'terra-refine', tier: 'terra', ...usage };
     }),
     recommendApproval: vi.fn(async (_r: unknown, evidence: unknown) => {
@@ -155,9 +158,9 @@ vi.mock('@statxai/workspace', async (importOriginal) => {
   return {
     ...actual,
     buildSite: vi.fn(async () => ({ ok: true, durationMs: 5, output: '', outDir: '/out' })),
-    readBuiltFiles: vi.fn(async () => [
-      { path: 'index.html', contents: '<!doctype html><html lang="en"><head><title>T</title></head><body><main><h1>Harrowgate Joinery</h1></main></body></html>' },
-    ]),
+    // A faithful export of the editable site model the run pinned, so the real site-model gate measures it.
+    // Exactly what the build wrote: every page file is its own exported HTML, so a refinement that breaks identity is caught.
+    readBuiltFiles: vi.fn(async (siteRoot: string) => exportFromPageFiles(siteRoot)),
     readExportFiles: vi.fn(async () => []),
     readSourceFiles: vi.fn(async () => [{ path: 'app/page.tsx', contents: 'x' }]),
     deploymentConfigured: vi.fn(() => false),
@@ -310,8 +313,8 @@ describe('two bounded passes through the ordinary lifecycle', () => {
     expect(calls.refine[1]!.review).toMatchObject({ ref: v1, screenshotSet: s1 });
     // Every model-owned source file tracked at the rendered commit — the pages Terra wrote, and the scaffold's own layout and theme.
     const pages = (i: number) => calls.refine[i]!.source.filter((f) => f.path.endsWith('page.tsx'));
-    expect(pages(0)).toEqual([{ path: 'app/page.tsx', contents: 'export default function P(){return "B0"}' }, { path: 'app/services/page.tsx', contents: 'export default function P(){return "B0"}' }]);
-    expect(pages(1)).toEqual([{ path: 'app/page.tsx', contents: 'export default function P(){return "refined 1"}' }, { path: 'app/services/page.tsx', contents: 'export default function P(){return "refined 1"}' }]);
+    expect(pages(0).map((f) => [f.path, f.contents.includes('<p>B0</p>')])).toEqual([['app/page.tsx', true], ['app/services/page.tsx', true]]);
+    expect(pages(1).map((f) => [f.path, f.contents.includes('<p>refined 1</p>')])).toEqual([['app/page.tsx', true], ['app/services/page.tsx', true]]);
     expect(calls.refine[0]!.source.map((f) => f.path)).toContain('app/layout.tsx');
     expect(calls.refine[0]!.source.every((f) => !f.path.startsWith('components/ui/') && !f.path.includes('package.json'))).toBe(true);
     expect(calls.refine[1]!.predecessor.bindingId).toBe(b1!._id);
@@ -342,7 +345,7 @@ describe('two bounded passes through the ordinary lifecycle', () => {
     expect(receipts).toHaveLength(3);
     expect(receipts.every((r) => r.status === 'committed')).toBe(true);
     expect([b1, b2].map((b) => receipts.find((r) => r._id === b!.promotionId)?.commitSha)).toEqual([b1!.promotionCommitSha, b2!.promotionCommitSha]);
-    expect(await homeOnDisk(projectId)).toBe('export default function P(){return "refined 2"}');
+    expect(await homeOnDisk(projectId)).toContain('<p>refined 2</p>');
 
     // --- Budget: exactly two, and the third pass was refused even though B2 improved and is still low.
     expect(await used(projectId)).toBe(2);
@@ -370,7 +373,7 @@ describe('two bounded passes through the ordinary lifecycle', () => {
     expect(calls.refine).toHaveLength(1);
     expect(await used(projectId)).toBe(1);
     // No rollback: B1's tree is what is canonical, and B0's promotion is history.
-    expect(await homeOnDisk(projectId)).toBe('export default function P(){return "refined 1"}');
+    expect(await homeOnDisk(projectId)).toContain('<p>refined 1</p>');
     expect(await store.promotions.countDocuments({ projectId })).toBe(2);
     const reviews = await artifactsNamed(projectId, 'visual-quality-review');
     expect(reviews).toHaveLength(2);
@@ -395,7 +398,7 @@ describe('a refinement that fails keeps its slot spent and never lands', () => {
   it('a candidate that adds a route fails official validation: blocked, B0 canonical, nothing promoted, the slot not restored', async () => {
     const projectId = 'proj_refine_validation_failed';
     visualScores = [62];
-    refineBehaviour = (n, plan) => ({ files: [...pagesOf(plan, `refined ${n}`), { path: 'app/extra/page.tsx', contents: 'export default function E(){return 1}' }] });
+    refineBehaviour = (n, model) => ({ files: [...pagesOf(model, `refined ${n}`), { path: 'app/extra/page.tsx', contents: 'export default function E(){return 1}' }] });
 
     const result = await run(projectId);
 
@@ -404,7 +407,7 @@ describe('a refinement that fails keeps its slot spent and never lands', () => {
     const [b0, b1] = await chain(projectId);
     expect(b1!.status).toBe('prepared');
     expect(await store.promotions.countDocuments({ projectId })).toBe(1);
-    expect(await homeOnDisk(projectId)).toBe('export default function P(){return "B0"}');
+    expect(await homeOnDisk(projectId)).toContain('<p>B0</p>');
     expect(await used(projectId)).toBe(1);
     expect(calls.approve).toHaveLength(0);
     expect(b0!.status).toBe('promoted');
@@ -413,11 +416,11 @@ describe('a refinement that fails keeps its slot spent and never lands', () => {
   it('a candidate path outside the model namespace is refused at the existing write boundary before anything canonical changes', async () => {
     const projectId = 'proj_refine_forbidden_path';
     visualScores = [62];
-    refineBehaviour = (n, plan) => ({ files: [...pagesOf(plan, `refined ${n}`), { path: 'package.json', contents: '{"scripts":{"build":"curl evil"}}' }] });
+    refineBehaviour = (n, model) => ({ files: [...pagesOf(model, `refined ${n}`), { path: 'package.json', contents: '{"scripts":{"build":"curl evil"}}' }] });
 
     await expect(run(projectId)).rejects.toBeInstanceOf(WriteOutsideModelScope);
     expect(await store.promotions.countDocuments({ projectId })).toBe(1);
-    expect(await homeOnDisk(projectId)).toBe('export default function P(){return "B0"}');
+    expect(await homeOnDisk(projectId)).toContain('<p>B0</p>');
     const pkg = await readFile(join((await ProjectWorkspace.open(projectId, workspacesRoot)).siteRoot, 'package.json'), 'utf8');
     expect(pkg).not.toContain('curl evil');
     expect(await used(projectId)).toBe(1);
@@ -443,6 +446,39 @@ describe('a refinement that fails keeps its slot spent and never lands', () => {
     expect(calls.refine).toHaveLength(1);
     expect(await used(projectId)).toBe(1);
     expect(await store.visualRefinementIntents.countDocuments({ projectId })).toBe(1);
+  });
+});
+
+describe('refinement changes presentation, never the editable site model', () => {
+  it('a refinement pins the exact model its predecessor carries, and its promoted build still carries every marker', async () => {
+    const projectId = 'proj_refine_keeps_model';
+    visualScores = [62, 90];
+
+    expect((await run(projectId)).outcome).toBe('released');
+    const [b0, b1] = await chain(projectId);
+    expect(b0!.jobSpec.inputs.editableSiteModel).toBeDefined();
+    expect(b1!.jobSpec.inputs.editableSiteModel).toEqual(b0!.jobSpec.inputs.editableSiteModel);
+    expect(await store.artifacts.countDocuments({ projectId, name: 'editable-site-model' })).toBe(1);
+    expect(calls.refine[0]!.siteModel).toEqual(EditableSiteModel.parse((await store.artifacts.findOne({ projectId, name: 'editable-site-model' }))!.data));
+    // B1 was validated and evaluated against that model: its evaluation certified the site-model gate.
+    const reports = await store.artifacts.find({ projectId, name: 'test-report' }).sort({ version: 1 }).toArray();
+    expect((reports[1]!.data as { gatesRun: string[]; findings: unknown[] }).gatesRun).toContain('site-model');
+  });
+
+  it('a refinement that drops a semantic marker fails official validation: blocked, B0 canonical, the slot spent', async () => {
+    const projectId = 'proj_refine_drops_marker';
+    visualScores = [62];
+    refineBehaviour = (n, model) => ({
+      files: pagesOf(model, `refined ${n}`, (html, route) => (route === '/' ? html.replace(`${SITE_MODEL_MARKERS.section}="${model.pages[0]!.sections[0]!.sectionId}"`, '') : html)),
+    });
+
+    const result = await run(projectId);
+
+    expect(result.outcome).toBe('blocked');
+    expect(result.jobLifecycleOutcome).toBe('validation_failed');
+    expect(await store.promotions.countDocuments({ projectId })).toBe(1);
+    expect(await homeOnDisk(projectId)).toContain('<p>B0</p>');
+    expect(await used(projectId)).toBe(1);
   });
 });
 

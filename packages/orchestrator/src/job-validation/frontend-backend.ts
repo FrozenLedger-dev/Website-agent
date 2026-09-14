@@ -28,6 +28,7 @@ import type { JobDocument } from '@statxai/state';
 import { ProjectWorkspace, assertModelWritableFiles, scaffoldSite, type ArtifactRegistry, type BuildResult } from '@statxai/workspace';
 import { jobOutputNamespace } from '@statxai/job-engine';
 import { runDeterministicGates } from '../phases/evaluate.js';
+import { resolveEditableSiteModel } from '../site-model/persist.js';
 import type { BuildCandidate } from '../phases/build.js';
 import { FRONTEND_BACKEND_INPUT, isVisualRefinementSpec } from '../job-handlers/frontend-backend.js';
 
@@ -91,6 +92,14 @@ export class CandidateValidationInputInvalid extends Error {
   constructor(jobId: string, key: string) {
     super(`job "${jobId}" is missing required pinned input "${key}"; cannot validate its candidate`);
     this.name = 'CandidateValidationInputInvalid';
+  }
+}
+
+/** The job pins an editable site model that does not describe the plan it pins. */
+export class CandidateValidationSiteModelMismatch extends Error {
+  constructor(jobId: string) {
+    super(`job "${jobId}" pins an editable site model for a different site plan; cannot validate its candidate`);
+    this.name = 'CandidateValidationSiteModelMismatch';
   }
 }
 
@@ -282,6 +291,13 @@ export async function validateFrontendBackendCandidate(
     deps.registry.resolve<SitePlan>(job.projectId, planRef),
   ]);
 
+  // The exact model the job pins, when it pins one: the candidate must carry exactly its identity.
+  const modelRef = job.spec.inputs[FRONTEND_BACKEND_INPUT.editableSiteModel];
+  const siteModel = modelRef ? await resolveEditableSiteModel(deps.registry, job.projectId, modelRef) : null;
+  if (siteModel && (siteModel.sitePlan.name !== planRef.name || siteModel.sitePlan.version !== planRef.version)) {
+    throw new CandidateValidationSiteModelMismatch(job._id);
+  }
+
   const parsed = CandidateShape.safeParse(rawCandidate);
   if (!parsed.success) {
     throw new CandidateValidationShapeInvalid(job._id, parsed.error.issues.map((i) => i.message).join('; '));
@@ -305,7 +321,7 @@ export async function validateFrontendBackendCandidate(
     await scaffoldSite(ws.siteRoot);
     await ws.writeSiteFiles(candidate.files);
 
-    const measured = await runDeterministicGates(ws.siteRoot, profile, plan);
+    const measured = await runDeterministicGates(ws.siteRoot, profile, plan, undefined, siteModel);
     const compiled = measured.compiled;
     // A visual refinement changes how the site looks, never what it is: its
     // page files must be exactly the approved plan's routes. The gates already

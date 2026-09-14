@@ -16,10 +16,11 @@ import {
   type BrowserRenderAuthority,
   type BrowserRenderReport,
   type BusinessProfile,
+  type EditableSiteModel,
   type SitePlan,
 } from '@statxai/contracts';
 import { reviewSite } from '@statxai/agents';
-import { isFrameworkPage, runGates } from '@statxai/gates';
+import { isFrameworkPage, runGates, siteModelMarkerFindings } from '@statxai/gates';
 import {
   BlobStore,
   buildSite as compileSite,
@@ -31,6 +32,7 @@ import {
   type BuildResult,
 } from '@statxai/workspace';
 import { reviewScreenshotSetVisually, type VisualQualityReviewOutcome } from './visual-review.js';
+import { resolveEditableSiteModel } from '../site-model/persist.js';
 import { blocking, buildFailureDefect, fromGateFinding, fromReviewIssue, mergeByFingerprint, type Defect } from '../defects.js';
 import type { RunContext } from '../run-context.js';
 
@@ -43,7 +45,18 @@ import type { RunContext } from '../run-context.js';
  * shape a failed build produces or drifting from it over time. One
  * implementation, two callers — this function knows nothing about which.
  */
-export async function runDeterministicGates(siteRoot: string, profile: BusinessProfile, plan: SitePlan, signal?: AbortSignal) {
+export async function runDeterministicGates(
+  siteRoot: string,
+  profile: BusinessProfile,
+  plan: SitePlan,
+  signal?: AbortSignal,
+  /**
+   * The exact editable site model the build must carry. When given, the
+   * site-model gate proves the export's semantic identity and values against it
+   * — for official validation, advisory tests and canonical evaluation alike.
+   */
+  siteModel?: EditableSiteModel | null,
+) {
   // Sandboxed: the build executes model-authored code, never with the harness's privileges.
   const compiled = await compileSite(siteRoot, signal !== undefined ? { signal } : {});
   // A cancelled measurement stops here — no gate runs on a build nobody is waiting for.
@@ -57,9 +70,13 @@ export async function runDeterministicGates(siteRoot: string, profile: BusinessP
   // parses — scripts, fonts, icons — instead of reporting them missing.
   const assets = compiled.ok ? (await readExportFiles(siteRoot)).map((f) => f.path) : [];
 
-  const gateRun = compiled.ok
+  const measured = compiled.ok
     ? runGates({ files, profile, plan, assets })
     : { passed: false, findings: [], gatesRun: ['build'] };
+  const identity = compiled.ok && siteModel ? siteModelMarkerFindings(siteModel, files) : [];
+  const gateRun = siteModel && compiled.ok
+    ? { passed: measured.passed && identity.length === 0, findings: [...measured.findings, ...identity], gatesRun: [...measured.gatesRun, 'site-model'] }
+    : measured;
 
   return { compiled, files, gateRun };
 }
@@ -129,10 +146,20 @@ export type EvaluationOutcome =
   | ({ kind: 'evaluated' } & Evaluation)
   | { kind: 'review_unavailable'; reason: string };
 
-/** Exactly what an evaluation measures: the plan version, and what made the tree canonical. */
+/** Exactly what an evaluation measures: the plan version, the editable site model it must carry, and what made the tree canonical. */
 export interface EvaluationSubject {
   readonly sitePlan: ArtifactRef;
+  /** The exact model the canonical build pinned, or null for a build that predates the model. */
+  readonly editableSiteModel: ArtifactRef | null;
   readonly authority: BrowserRenderAuthority;
+}
+
+/** An evaluation was handed a model that does not describe the plan it evaluates. */
+export class EvaluationSiteModelMismatch extends Error {
+  constructor(detail: string) {
+    super(`evaluation refused: ${detail}`);
+    this.name = 'EvaluationSiteModelMismatch';
+  }
 }
 
 export async function evaluateSite(ctx: RunContext, subject: EvaluationSubject): Promise<EvaluationOutcome> {
@@ -150,8 +177,14 @@ export async function evaluateSite(ctx: RunContext, subject: EvaluationSubject):
    * is nothing for the other gates or the reviewer to look at — the build
    * failure is the only finding worth reporting.
    */
+  // The exact model the canonical build carries — resolved by its pinned ref, never "the latest model".
+  const siteModel = subject.editableSiteModel ? await resolveEditableSiteModel(deps.registry, facts.projectId, subject.editableSiteModel) : null;
+  if (siteModel && (siteModel.sitePlan.name !== subject.sitePlan.name || siteModel.sitePlan.version !== subject.sitePlan.version)) {
+    throw new EvaluationSiteModelMismatch(`the editable site model describes ${siteModel.sitePlan.name}@${siteModel.sitePlan.version}, not ${subject.sitePlan.name}@${subject.sitePlan.version}`);
+  }
+
   deps.say({ phase: 'evaluate', detail: 'Compiling the site' });
-  const { compiled, files, gateRun } = await runDeterministicGates(deps.workspace.siteRoot, facts.profile, progress.plan);
+  const { compiled, files, gateRun } = await runDeterministicGates(deps.workspace.siteRoot, facts.profile, progress.plan, undefined, siteModel);
 
   if (!compiled.ok) {
     /**

@@ -17,10 +17,11 @@ import {
   routeToSourcePath,
   type ArtifactRef,
   type BusinessProfile,
+  type EditableSiteModel,
   type SitePlan,
   type VisualQualityAssessment,
 } from '@statxai/contracts';
-import { invokeTerraBuild, TERRA_BUILD_STACK, type TerraBuildOptions } from './terra-build.js';
+import { invokeTerraBuild, semanticIdentityBrief, TERRA_BUILD_STACK, type TerraBuildOptions } from './terra-build.js';
 import type { VisualReviewImage } from './terra-review.js';
 import type { ModelRuntime } from '../runtime.js';
 
@@ -46,6 +47,10 @@ HOW TO REFINE
   cards, or a centred hero for a differently centred hero, is not a refinement.
 - Work from the source you are given. It is the exact canonical source; do not rewrite from
   memory of what a site like this usually looks like.
+- Preserve semantic identity exactly: every data-statx-* attribute stays, on an element of
+  the same role, with the same value, and every element carrying data-statx-field-id keeps
+  exactly its text. Refinement changes presentation, never the site model. The platform
+  rejects a refinement that does not.
 
 WHAT YOU RETURN
 A complete build output: EVERY file of the site that should exist afterwards, including the
@@ -70,6 +75,8 @@ export interface VisualRefinementInput {
   };
   /** The exact frames that review judged, in the order it saw them. */
   readonly frames: readonly VisualReviewImage[];
+  /** The exact editable site model the refined build must still carry, when the build has one. */
+  readonly siteModel?: EditableSiteModel;
 }
 
 /**
@@ -129,7 +136,7 @@ ${JSON.stringify(input.plan, null, 2)}
 CURRENT SOURCE (${input.source.length} files — the exact canonical build)
 ${input.source.map((f) => `=== FILE: ${f.path} ===\n${f.contents}`).join('\n\n')}
 
-The ${input.frames.length} images that follow are the screenshots the review judged.`,
+The ${input.frames.length} images that follow are the screenshots the review judged.${input.siteModel ? semanticIdentityBrief(input.siteModel, 'all') : ''}`,
       images: input.frames.map((frame, i) => ({
         label: `IMAGE ${i + 1}: ${frame.route} @ ${frame.viewport} — frame ${frame.index} of ${frame.count}, from y=${frame.offsetY}px of a ${frame.sourceHeight}px page`,
         mediaType: 'image/png' as const,

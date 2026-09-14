@@ -179,7 +179,7 @@ describe('canonical evaluation renders the exact build it evaluates', () => {
 
     const orchestrator = await src('packages/orchestrator/src/orchestrator.ts');
     expect(orchestrator.match(/await evaluateSite\(/g)).toHaveLength(1);
-    expect(orchestrator).toContain('await evaluateSite(ctx(), { sitePlan: currentSitePlanRef, authority: renderAuthority() })');
+    expect(orchestrator).toMatch(/await evaluateSite\(ctx\(\), \{\s*sitePlan: currentSitePlanRef,[\s\S]{0,300}editableSiteModel: [^\n]*canonicalBuild\?\.jobSpec\.inputs\[FRONTEND_BACKEND_INPUT\.editableSiteModel\][^\n]*,\s*authority: renderAuthority\(\),\s*\}\)/);
     expect(orchestrator).toContain('let currentSitePlanRef: ArtifactRef = initialSitePlanRef;');
     expect(orchestrator).toMatch(/progress\.plan = revised\.plan;\s*currentSitePlanRef = revised\.sitePlanRef;/);
     const authority = body(orchestrator, 'const renderAuthority = (): BrowserRenderAuthority => {', '\n  };');
