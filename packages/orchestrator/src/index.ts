@@ -26,6 +26,8 @@ export * from './tool-gateway/filesystem.js';
 export * from './release-publication/publication.js';
 export * from './canonical-draft/authority.js';
 export * from './semantic-edit/apply.js';
+export * from './semantic-edit/execution.js';
+export * from './semantic-edit/worker.js';
 // The publish phase's own surface — the deployment gateway an operator tool or
 // a test substitutes, and the options `publishRelease` now takes.
 export {

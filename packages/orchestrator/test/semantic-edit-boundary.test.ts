@@ -39,7 +39,10 @@ const imports = (code: string) => [...code.matchAll(/from '([^']+)'/g)].map((m) 
 describe('an edit begins from a draft handoff', () => {
   it('proves the exact available draft, build and base model, then claims and hands off the draft in the same transaction as the model, source and intent', async () => {
     const apply = await src(APPLY);
-    const fn = body(apply, 'export async function applySemanticEdit(', '\n}\n');
+    // One preparation path: submission returns after it; the synchronous form continues after the same one.
+    expect(body(apply, 'export async function submitSemanticEdit(', '\n}\n')).toMatch(/const \{ intent, replayed \} = await prepareSemanticEdit\(input\);\s*return resultOf\(intent, replayed\);/);
+    expect(body(apply, 'export async function applySemanticEdit(', '\n}\n')).toMatch(/const \{ intent, replayed \} = await prepareSemanticEdit\(input\);\s*return continueSemanticEdit\(input, intent, replayed, \{\}\);/);
+    const fn = body(apply, 'async function prepareSemanticEdit(', '\n}\n');
     const order = [
       'applySemanticPatch({ baseRef: input.baseEditableSiteModel, base, patch: input.patch })',
       'const existing = await store.semanticEditIntents.findOne({ _id: intentId });',
@@ -54,7 +57,7 @@ describe('an edit begins from a draft handoff', () => {
       'await recordEditableSiteModel(registry, projectId, result, session);',
       'await registry.put(projectId, SEMANTIC_EDIT_SOURCE_ARTIFACT, source, session);',
       'await store.semanticEditIntents.insertOne(doc, { session });',
-      'return continueSemanticEdit(input, intent, !won);',
+      'return { intent, replayed: !won };',
     ];
     let at = -1;
     for (const step of order) {

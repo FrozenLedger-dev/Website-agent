@@ -911,6 +911,46 @@ export class JobEngine {
   }
 
   /**
+   * Reclaim one exact job whose execution lease has expired — the job a caller
+   * already owns by durable authority, never any job that happens to be stale.
+   *
+   * Only a `running` job whose lease has actually expired (`expiresAt <= now`,
+   * the exact complement of `hasActiveLease`) on its current attempt is touched.
+   * With attempts remaining it returns to `ready`, and the next claim is a new
+   * attempt — so every token the dead execution held (`attempt`, lease) is stale
+   * for submit, heartbeat and fail. On its final attempt it is `failed`, because
+   * an execution that died is still an attempt spent: reclaiming never grants an
+   * extra one. Returns the reclaimed job, or `null` when there was nothing to
+   * reclaim (not running, or its lease is still alive).
+   */
+  async reclaimExpiredJobLease(jobId: string, actor: string, now: Date = new Date()): Promise<JobDocument | null> {
+    return this.store.withTransaction(async (session) => {
+      const job = await this.store.jobs.findOne({ _id: jobId, state: 'running', 'lease.expiresAt': { $lte: now } }, { session });
+      if (!job) return null;
+      const exhausted = job.attempt >= job.maxAttempts;
+      const updated = await this.store.jobs.findOneAndUpdate(
+        { _id: jobId, state: 'running', attempt: job.attempt, 'lease.expiresAt': { $lte: now } },
+        {
+          $set: exhausted
+            ? { state: 'failed', lease: null, failure: { message: 'the execution lease expired on the final attempt', at: now, policyViolation: false }, updatedAt: now }
+            : { state: 'ready', lease: null, updatedAt: now },
+        },
+        { session, returnDocument: 'after' },
+      );
+      if (!updated) return null;
+      await this.audit(session, {
+        projectId: job.projectId,
+        jobId,
+        kind: 'job_transition',
+        actor,
+        detail: { from: 'running', to: updated.state, reason: 'lease_expired', attempt: job.attempt, heldBy: job.lease?.holder ?? null },
+        at: now,
+      });
+      return updated;
+    });
+  }
+
+  /**
    * Extend a lease that is still alive, on the exact attempt that claimed it.
    *
    * A lease can only be extended from a lease. Without the expiry condition a

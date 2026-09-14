@@ -339,6 +339,8 @@ export class StateStore {
     // cannot both exist even if something got past the draft's claim.
     await this.semanticEditIntents.createIndexes([
       { key: { projectId: 1, sourceDraftId: 1 }, unique: true, name: 'projectId_1_sourceDraftId_1' },
+      // Work discovery for semantic-edit workers: scheduling order only, never authority.
+      { key: { status: 1, createdAt: 1 }, name: 'status_1_createdAt_1' },
     ]);
 
     // Customer identity and tenancy. Uniqueness here is the authority, not an

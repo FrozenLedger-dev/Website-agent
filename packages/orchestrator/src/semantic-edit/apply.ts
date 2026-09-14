@@ -224,14 +224,35 @@ function isDuplicateKeyError(error: unknown): boolean {
 }
 
 /**
- * Apply one exact semantic patch to the project's exact current draft, and take
- * the result through the normal build lifecycle to a new draft.
+ * Durably submit one exact semantic edit, and return — without building.
  *
- * Refusals are typed and happen before anything is written. Once the edit is
- * authorised, the same call — or any later exact replay — drives it forward
- * from its durable state and returns where it stands.
+ * Everything the edit needs to be continued by any process, later, is written
+ * by the time this resolves: the draft claimed and handed to the edit, the
+ * result model, the exact source snapshot and the intent with its fixed job and
+ * successor. Nothing process-local survives or is needed. Refusals are typed and
+ * happen before anything is written; an exact replay returns the same intent.
+ *
+ * This is the request handoff: a caller that must answer quickly submits, and a
+ * semantic-edit worker continues the edit from its intent.
+ */
+export async function submitSemanticEdit(input: ApplySemanticEditInput): Promise<SemanticEditResult> {
+  const { intent, replayed } = await prepareSemanticEdit(input);
+  return resultOf(intent, replayed);
+}
+
+/**
+ * Apply one exact semantic patch to the project's exact current draft, and take
+ * the result through the normal build lifecycle to a new draft — in this call.
+ *
+ * Exactly {@link submitSemanticEdit} followed by the one continuation a worker
+ * runs; there is no second implementation of either half.
  */
 export async function applySemanticEdit(input: ApplySemanticEditInput): Promise<SemanticEditResult> {
+  const { intent, replayed } = await prepareSemanticEdit(input);
+  return continueSemanticEdit(input, intent, replayed, {});
+}
+
+async function prepareSemanticEdit(input: ApplySemanticEditInput): Promise<{ intent: SemanticEditIntentDocument; replayed: boolean }> {
   const { store, projectId } = input;
   const registry = new ArtifactRegistry(store);
   const refuse = (reason: SemanticEditRefusal, detail: string, code?: SemanticPatchRejection) => new SemanticEditRefused(projectId, reason, detail, code);
@@ -267,7 +288,7 @@ export async function applySemanticEdit(input: ApplySemanticEditInput): Promise<
 
   // Replay: this exact edit already has its intent, whatever became of the draft since.
   const existing = await store.semanticEditIntents.findOne({ _id: intentId });
-  if (existing) return continueSemanticEdit(input, assertIntentDescribes(existing, { projectId, sourceDraftId: input.expectedDraftId, predecessorBindingId: input.expectedCanonicalBindingId, baseEditableSiteModel: input.baseEditableSiteModel, patchDigest }), true);
+  if (existing) return { intent: assertIntentDescribes(existing, { projectId, sourceDraftId: input.expectedDraftId, predecessorBindingId: input.expectedCanonicalBindingId, baseEditableSiteModel: input.baseEditableSiteModel, patchDigest }), replayed: true };
 
   // The exact available draft, its exact build, and that build's exact model.
   const authority = await resolveCanonicalDraftAuthority(store, projectId);
@@ -380,7 +401,7 @@ export async function applySemanticEdit(input: ApplySemanticEditInput): Promise<
     if (!winner) throw refuse('draft_claimed', 'a concurrent edit of this draft won');
     intent = winner;
   }
-  return continueSemanticEdit(input, intent, !won);
+  return { intent, replayed: !won };
 }
 
 /**
@@ -394,7 +415,42 @@ export async function resumeSemanticEdit(input: SemanticEditDeps & { readonly pr
   if (authority?.state !== 'handed_off' || authority.draft.claim?.kind !== 'semantic_edit') return null;
   const intent = await store.semanticEditIntents.findOne({ _id: authority.draft.claim.operationId, projectId });
   if (!intent) throw new SemanticEditAuthorityCorrupt(projectId, `draft "${authority.draft._id}" is handed to semantic edit "${authority.draft.claim.operationId}", which has no intent`);
-  return continueSemanticEdit(input, intent, true);
+  return continueSemanticEdit(input, intent, true, {});
+}
+
+/** How a worker runs a continuation: its execution lease fences every durable write, and its signal stops it between steps. */
+export interface SemanticEditExecution {
+  /** The intent's current execution lease token. Every intent write this continuation makes requires it still to be current. */
+  readonly leaseToken?: string;
+  /** Aborted when the worker loses its execution lease or shuts down. */
+  readonly signal?: AbortSignal;
+  /** The job worker identity this execution claims the edit's job under. */
+  readonly jobWorkerId?: string;
+  readonly jobLeaseMs?: number;
+  readonly jobHeartbeatEveryMs?: number;
+}
+
+/** The continuation's execution lease is no longer this execution's: another worker owns the edit now. Nothing further was written. */
+export class SemanticEditExecutionLeaseLost extends Error {
+  constructor(readonly intentId: string) {
+    super(`semantic edit "${intentId}": this execution no longer holds its execution lease`);
+    this.name = 'SemanticEditExecutionLeaseLost';
+  }
+}
+
+/**
+ * Continue one exact semantic edit by its intent id — the worker's entrypoint.
+ * The intent is read by exact id; everything it names is re-proven by the
+ * continuation itself. Returns `null` when no such intent exists.
+ */
+export async function resumeSemanticEditIntent(
+  deps: SemanticEditDeps,
+  target: { readonly projectId: string; readonly intentId: string },
+  execution: SemanticEditExecution,
+): Promise<SemanticEditResult | null> {
+  const intent = await deps.store.semanticEditIntents.findOne({ _id: target.intentId, projectId: target.projectId });
+  if (!intent) return null;
+  return continueSemanticEdit(deps, intent, true, execution);
 }
 
 function assertIntentDescribes(intent: SemanticEditIntentDocument, identity: SemanticEditIdentity): SemanticEditIntentDocument {
@@ -424,17 +480,22 @@ async function advanceIntent(
   from: SemanticEditIntentStatus,
   to: SemanticEditIntentStatus,
   set: Partial<SemanticEditIntentDocument>,
+  execution: SemanticEditExecution,
 ): Promise<SemanticEditIntentDocument> {
   const now = new Date();
-  const moved = await store.semanticEditIntents.updateOne({ _id: intent._id, projectId: intent.projectId, status: from }, { $set: { ...set, status: to, updatedAt: now } });
+  const fence = execution.leaseToken !== undefined ? { 'execution.token': execution.leaseToken } : {};
+  const moved = await store.semanticEditIntents.updateOne({ _id: intent._id, projectId: intent.projectId, status: from, ...fence }, { $set: { ...set, status: to, updatedAt: now } });
   if (moved.matchedCount === 1) return { ...intent, ...set, status: to, updatedAt: now };
-  // A concurrent replay of this same edit got there first: its durable record is the one to continue from.
   const current = await store.semanticEditIntents.findOne({ _id: intent._id, projectId: intent.projectId });
+  // A worker that lost its lease writes nothing more, whatever the status says.
+  if (execution.leaseToken !== undefined && current?.execution?.token !== execution.leaseToken) throw new SemanticEditExecutionLeaseLost(intent._id);
+  // A concurrent replay of this same edit got there first: its durable record is the one to continue from.
   if (current && STATUS_ORDER.indexOf(current.status) >= STATUS_ORDER.indexOf(to)) return current;
   throw new SemanticEditAuthorityCorrupt(intent.projectId, `semantic edit "${intent._id}" is no longer "${from}"`);
 }
 
-async function continueSemanticEdit(deps: SemanticEditDeps, loaded: SemanticEditIntentDocument, replayed: boolean): Promise<SemanticEditResult> {
+async function continueSemanticEdit(deps: SemanticEditDeps, loaded: SemanticEditIntentDocument, replayed: boolean, execution: SemanticEditExecution): Promise<SemanticEditResult> {
+  const signal = execution.signal;
   const { store } = deps;
   const { projectId } = loaded;
   const registry = new ArtifactRegistry(store);
@@ -444,6 +505,7 @@ async function continueSemanticEdit(deps: SemanticEditDeps, loaded: SemanticEdit
   let intent = loaded;
 
   if (intent.status === 'completed') return resultOf(intent, replayed);
+  signal?.throwIfAborted();
   // This operation's one model runtime: every Terra call it makes, building or reviewing, crosses it.
   const model = new ModelRuntime(deps.modelProvider !== undefined ? { provider: deps.modelProvider } : {});
 
@@ -461,6 +523,7 @@ async function continueSemanticEdit(deps: SemanticEditDeps, loaded: SemanticEdit
   const plan = SitePlan.parse(await registry.resolve(projectId, predecessor.sitePlan));
 
   if (intent.status === 'building') {
+    signal?.throwIfAborted();
     const successor = await prepareFrontendBackendBuildBinding(store, {
       projectId,
       runIntentHash: predecessor.runIntentHash,
@@ -497,14 +560,18 @@ async function continueSemanticEdit(deps: SemanticEditDeps, loaded: SemanticEdit
         registry,
         engine: new JobEngine(store),
         model,
-        workerIdentity: { workerId: `semantic-edit:${projectId}:frontend-backend`, tier: 'terra' },
+        workerIdentity: { workerId: execution.jobWorkerId ?? `semantic-edit:${projectId}:frontend-backend`, tier: 'terra' },
+        ...(execution.jobLeaseMs !== undefined ? { leaseMs: execution.jobLeaseMs } : {}),
+        ...(execution.jobHeartbeatEveryMs !== undefined ? { heartbeatEveryMs: execution.jobHeartbeatEveryMs } : {}),
         workspacesRoot: deps.workspacesRoot,
         validationWorkspacesRoot: deps.validationWorkspacesRoot,
         ...(deps.advisoryWorkspacesRoot !== undefined ? { advisoryWorkspacesRoot: deps.advisoryWorkspacesRoot } : {}),
         say,
       });
       say({ phase: 'build', detail: `Implementing semantic edit ${intent._id} via job_lifecycle (job ${intent.jobId})` });
+      signal?.throwIfAborted();
       const built = await coordinator.run(intent.jobSpec, { kind: 'semantic_edit', intentId: intent._id });
+      signal?.throwIfAborted();
       if (built.outcome !== 'promoted') {
         say({ phase: 'build', detail: `semantic edit ${intent._id} did not promote this invocation (${built.outcome})`, level: 'fail' });
         return resultOf(intent, replayed, { lifecycleOutcome: built.outcome });
@@ -512,7 +579,7 @@ async function continueSemanticEdit(deps: SemanticEditDeps, loaded: SemanticEdit
       await finalizeBindingPromoted(store, successor._id, { promotionId: built.promotionId, promotionCommitSha: built.commitSha });
       promoted = { promotionId: built.promotionId, promotionCommitSha: built.commitSha };
     }
-    intent = await advanceIntent(store, intent, 'building', 'promoted', { promotion: promoted });
+    intent = await advanceIntent(store, intent, 'building', 'promoted', { promotion: promoted }, execution);
     if (intent.status === 'completed') return resultOf(intent, true);
   }
 
@@ -534,6 +601,7 @@ async function continueSemanticEdit(deps: SemanticEditDeps, loaded: SemanticEdit
   if (marked.length !== 1 || marked[0] !== promotion.promotionCommitSha) throw corrupt(`canonical history does not carry exactly one commit for promotion "${promotion.promotionId}"`);
 
   if (intent.status === 'promoted') {
+    signal?.throwIfAborted();
     // Fresh gates, render, screenshots and review of exactly this successor — never the predecessor's, and nothing after them.
     const projectDoc = await store.projects.findOne({ _id: projectId });
     const budgetDoc = await store.budgets.findOne({ _id: projectId });
@@ -569,7 +637,7 @@ async function continueSemanticEdit(deps: SemanticEditDeps, loaded: SemanticEdit
         gatesPassed: evaluation.compiled.ok && evaluation.gateRun.passed,
         qualityScore: evaluation.qualityScore,
       },
-    });
+    }, execution);
     if (intent.status === 'completed') return resultOf(intent, true);
   }
 
@@ -579,6 +647,7 @@ async function continueSemanticEdit(deps: SemanticEditDeps, loaded: SemanticEdit
     if (set.subject?.authority?.buildBindingId !== successor._id) throw corrupt(`the recorded screenshot set was not rendered from successor "${successor._id}"`);
   }
 
+  signal?.throwIfAborted();
   // One transaction: the successor concluded as the new draft, the handed-off draft superseded, the lineage released, this edit completed.
   const evaluatedIntent = intent;
   const { draft } = await concludeCanonicalDraft({
@@ -593,12 +662,14 @@ async function continueSemanticEdit(deps: SemanticEditDeps, loaded: SemanticEdit
     supersede: { draftId: intent.sourceDraftId, claimant },
     completeInTransaction: async (session, concluded, alreadyConcluded) => {
       const done = await store.semanticEditIntents.updateOne(
-        { _id: evaluatedIntent._id, projectId, status: 'evaluated' },
+        { _id: evaluatedIntent._id, projectId, status: 'evaluated', ...(execution.leaseToken !== undefined ? { 'execution.token': execution.leaseToken } : {}) },
         { $set: { status: 'completed', resultDraftId: concluded._id, updatedAt: new Date() } },
         { session },
       );
       if (done.matchedCount === 1) return;
       const current = await store.semanticEditIntents.findOne({ _id: evaluatedIntent._id }, { session });
+      // A worker that lost its lease concludes nothing: the transaction aborts with the draft untouched.
+      if (execution.leaseToken !== undefined && current?.status !== 'completed' && current?.execution?.token !== execution.leaseToken) throw new SemanticEditExecutionLeaseLost(evaluatedIntent._id);
       if (!alreadyConcluded || current?.status !== 'completed' || current.resultDraftId !== concluded._id) {
         throw corrupt(`semantic edit "${evaluatedIntent._id}" could not be completed with draft "${concluded._id}"`);
       }

@@ -516,6 +516,30 @@ export interface CanonicalDraftDocument {
  */
 export type SemanticEditIntentStatus = 'building' | 'promoted' | 'evaluated' | 'completed';
 
+/** One worker's lease on executing one semantic edit. */
+export interface SemanticEditExecutionLease {
+  /** Opaque, per claim. */
+  token: string;
+  /** Which worker process holds it — for operators, never for authority. */
+  owner: string;
+  claimedAt: Date;
+  heartbeatAt: Date;
+  expiresAt: Date;
+}
+
+/** Why a semantic edit stopped being continued automatically. */
+export type SemanticEditFailureReason =
+  /** The candidate failed official validation; it is not rebuilt automatically. */
+  | 'validation_failed'
+  /** The build job exhausted its attempts, or the lifecycle stopped it for good. */
+  | 'build_failed'
+  /** Evaluation could not complete after bounded attempts. */
+  | 'evaluation_unavailable'
+  /** Continuation kept failing unexpectedly after bounded attempts. */
+  | 'execution_failed'
+  /** Durable authority contradicts itself; an operator must look. */
+  | 'authority_corrupt';
+
 /**
  * The durable authority for one semantic edit of one exact canonical draft.
  *
@@ -561,6 +585,22 @@ export interface SemanticEditIntentDocument {
   };
   /** Set at `completed`: the draft this edit concluded. */
   resultDraftId?: string;
+  /**
+   * Which worker is executing this edit right now — liveness only, never
+   * authority. The edit's authority is the draft's claim, which never expires;
+   * this lease does, and when it has, another worker may continue exactly this
+   * edit. Every durable write a worker's continuation makes is fenced on `token`.
+   */
+  execution?: SemanticEditExecutionLease;
+  /** Continuations that ended in an unexpected error, counted by the workers that ran them. Bounded. */
+  executionFailures?: number;
+  /**
+   * Set when this edit will not be continued automatically again: a known,
+   * deterministic or exhausted outcome. The draft stays claimed by the edit —
+   * nothing hands it to another edit — and the reason is for operators and a
+   * customer-safe status, never a provider message.
+   */
+  disposition?: { kind: 'failed'; reason: SemanticEditFailureReason; at: Date };
   createdAt: Date;
   updatedAt: Date;
 }

@@ -7733,6 +7733,117 @@ provider. No customer preview route, editor or edit worker.
 recovery choosing the latest snapshot — are killed structurally, because in those
 scenarios the latest snapshot is also the exact one.
 
+## Durable semantic-edit worker — **DONE**
+
+**Why.** `applySemanticEdit` authorised an edit and ran the whole build lifecycle
+in one call. A request cannot wait for Terra, validation, promotion and
+evaluation, and a process that dies mid-call must not strand the edit.
+
+**Split.**
+
+- **`submitSemanticEdit`:** the preparation transaction only — handoff, M1, the
+  source snapshot and the intent with its job spec and successor binding id. It
+  returns `building` and never calls Terra. Replay returns the same intent with no
+  second M1 or source snapshot.
+- **`applySemanticEdit`:** the same preparation followed by the one continuation.
+  There is no second implementation of either half.
+- **`resumeSemanticEditIntent(deps, { projectId, intentId }, execution)`:** the
+  worker's entrypoint. It reads the intent by exact id; the continuation re-proves
+  everything the intent names.
+
+**Two kinds of ownership.**
+
+- **Semantic authority:** the draft claim `{ kind: 'semantic_edit', operationId }`.
+  It never expires, and nothing in the worker reads, releases or re-derives it.
+- **Execution lease (`intent.execution`):** `token`, `owner`, `claimedAt`,
+  `heartbeatAt`, `expiresAt`. Liveness only.
+  - **Claim:** atomic, the oldest runnable intent, or one exact id.
+  - **Runnable:** `building | promoted | evaluated`, no `disposition`, and no
+    lease or an expired one. A live lease is never taken.
+  - **Heartbeat, release, disposition:** each is a CAS on the exact token.
+  - **Continuation fence:** every intent write (`advanceIntent`, the conclusion
+    hook) also requires the token. A worker that lost its lease throws
+    `SemanticEditExecutionLeaseLost` at its first write and changes nothing.
+
+**Job leases.** `JobEngine.reclaimExpiredJobLease(jobId, actor)` reclaims one exact
+job, only when `running` on an expired lease.
+
+- **Result:** `ready` on the same id and attempt, or `failed` when that was the
+  final attempt. Both are audited with `reason: 'lease_expired'`.
+- **Stale tokens:** the dead attempt's heartbeat, submission and failure are
+  rejected by the existing holder, attempt and expiry fences.
+- **Worker use:** the worker reclaims only the intent's own `jobId`, and never
+  calls the broad reaper.
+
+**Worker (`SemanticEditWorker`, `scripts/semantic-edit-worker.ts`).**
+
+- **Process:** a standalone Node process (`pnpm worker:semantic-edit`), not Next
+  and not a request promise. It polls `semantic_edit_intents`; there is no second
+  queue. It holds no customer identity and makes no latest lookups or release
+  calls.
+- **Limits:** `concurrency` 1 (1–16), `pollMs` 5000, `leaseMs` 120000,
+  `heartbeatMs` 30000 (at most half the lease), `maxExecutionFailures` 3. Invalid
+  configuration refuses to start.
+- **Losing the lease:** a failed heartbeat aborts the execution between steps.
+- **Shutdown:** SIGTERM/SIGINT stops claiming, aborts running work and waits at
+  most the grace period. Draft claims are never released; unreleased leases
+  expire.
+- **Settling:**
+  - completed → release the lease;
+  - lifecycle `validation_failed` → disposition `validation_failed`;
+  - `failed | blocked | superseded | repair_requested | draft` → `build_failed`;
+  - evaluation unavailable → counted, then `evaluation_unavailable` at the bound;
+  - an unexpected error → counted, then `execution_failed` at the bound;
+  - corrupt authority → `authority_corrupt`;
+  - otherwise → release the lease and retry later.
+- **After a failure:** a dispositioned edit is never claimed again, and its draft
+  stays claimed.
+- **Logs:** one JSON line per event, with ids only and no tokens.
+
+**Status (`readSemanticEditExecutionStatus`).**
+
+- **Lookup:** exact project and intent.
+- **States:** `queued | running | finishing | completed | failed`.
+- **Public failures:** `validation_failed | build_failed | temporarily_unavailable
+  | needs_attention`.
+- **Never exposed:** tokens, job ids or provider text.
+
+**Unchanged.** Customer routes and editor, release and publication, cron, and the
+draft authority model.
+
+**Tests.**
+
+- **`semantic-edit-worker.integration.test.ts` (16):**
+  - durable submission and replay;
+  - a worker on a separate connection;
+  - lease exclusivity and token fencing;
+  - two workers executing once;
+  - the concurrency cap;
+  - dead-worker job reclaim on the same job (attempt 2);
+  - a live job lease never stolen;
+  - a mid-build lease loss that writes nothing;
+  - validation, model and infrastructure bounds;
+  - the crash matrix (before job claim, after acceptance, after evaluation,
+    after completion);
+  - polling and shutdown.
+- **`semantic-edit-worker-process.integration.test.ts` (2):** the real process
+  starts, connects, polls and exits 0 on SIGTERM; invalid configuration exits 1.
+- **`reclaim-job-lease.integration.test.ts` (5):** the engine reclaim and its
+  stale-token fences.
+- **`semantic-edit-worker.test.ts` (17):** limits plus structural boundaries.
+- **Pin updated:** `semantic-edit-boundary.test.ts`, for the preparation split.
+
+**Mutations: 25 of 25 killed** (the 24 targets, with the job-lease target split
+into engine and worker).
+
+- **Killed only structurally:**
+  - the worker skipping its own job-lease expiry check (the engine still refuses);
+  - latest model or snapshot lookups;
+  - release or customer-auth imports;
+  - fire-and-forget continuation after submit.
+- **Stale-token test tightened:** it now asserts the refused call left the intent
+  un-promoted and un-evaluated.
+
 ## Phases 6–17
 
 Not started.
