@@ -102,7 +102,8 @@ describe('tools stay exactly what a build has', () => {
     for (const file of await allProductionFiles()) {
       if (/readModelSourceAtCommit\(/.test(await src(file)) && file !== 'packages/workspace/src/project-workspace.ts') readers.push(file);
     }
-    expect(readers).toEqual([AUTHORIZE]);
+    // The semantic-edit application reads the same way, at its own proven commit.
+    expect(readers.sort()).toEqual([AUTHORIZE, 'packages/orchestrator/src/semantic-edit/apply.ts'].sort());
     const authorize = await src(AUTHORIZE);
     const head = authorize.indexOf('const head = await workspace.currentCommit();');
     const ancestor = authorize.indexOf('await workspace.isAncestorCommit(build.promotionCommitSha, sourceCommit)');
@@ -181,7 +182,7 @@ describe('only the existing lifecycle validates, accepts and promotes', () => {
     expect(prepare).toContain('await reproduceReviewFrames({ registry: deps.registry, blobs: deps.blobs }, job.projectId, review)');
     expect(prepare.match(/deps\.registry\.\w+\(/g)).toEqual(['deps.registry.resolve(', 'deps.registry.resolve(']);
     const validation = await src('packages/orchestrator/src/job-validation/frontend-backend.ts');
-    expect(validation).toContain('const conformance = isVisualRefinementSpec(job.spec) ? planConformanceFindings(candidate.files, plan) : [];');
+    expect(validation).toContain('const conformance = isVisualRefinementSpec(job.spec) || isSemanticEditSpec(job.spec) ? planConformanceFindings(candidate.files, plan) : [];');
     expect(validation.indexOf('assertModelWritableFiles(candidate.files);')).toBeLessThan(validation.indexOf('await ws.writeSiteFiles(candidate.files);'));
   });
 });
@@ -213,11 +214,12 @@ describe('no latest lookups for refinement authority', () => {
 });
 
 describe('Phase 5q owns the promoted refinement without replaying it', () => {
-  it('recovery owns replans and visual refinements, refuses only a semantic edit, and never builds or refines', async () => {
+  it('recovery owns replans and visual refinements, hands a semantic edit to its own continuation, and never builds or refines', async () => {
     const recovery = await src('packages/orchestrator/src/run-recovery/frontend-backend.ts');
     expect(recovery).not.toMatch(/refineSiteVisually|authorizeVisualRefinement|lifecycleCoordinator|prepareFrontendBackendBuildBinding/);
     expect(recovery).not.toMatch(/provenance\.kind\s*(!==|===)\s*'(replan|visual_refinement)'/);
-    expect(recovery.match(/throw new ActiveContinuationSuccessorNotOwned\(/g)).toHaveLength(1);
+    expect(recovery).not.toMatch(/ActiveContinuationSuccessorNotOwned/);
+    expect(recovery.match(/throw new ActiveContinuationSemanticEditOwned\(/g)).toHaveLength(2);
     const contract = await src('packages/contracts/src/job.ts');
     expect(contract).toContain("z.strictObject({ kind: z.literal('visual_refine'), refinementCycle: z.number().int().min(1).max(1_000) }),");
   });

@@ -392,7 +392,7 @@ export interface TerraBuildRequest {
   readonly maxTokens: number;
   readonly effort: 'high' | 'xhigh';
   /** Which Terra skill this is. Defaults to `terra-build`; a build-producing Terra skill only. */
-  readonly skill?: 'terra-build' | 'terra-refine';
+  readonly skill?: 'terra-build' | 'terra-refine' | 'terra-edit';
   /** Defaults to the build system prompt. */
   readonly system?: string;
   /**

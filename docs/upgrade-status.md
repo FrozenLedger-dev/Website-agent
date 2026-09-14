@@ -7362,6 +7362,143 @@ customer route. Customer auth is untouched.
 a draft) survived at first, masked by the `draft` state check. After a narrower
 test assertion it was killed.
 
+## Semantic patches applied through the build lifecycle — **DONE**
+
+**Why.** A customer edit must turn draft D0 (build B0, model M0) into a new draft
+through the same authority every build has. Terra proposes source; the harness
+owns every decision.
+
+**Gate findings.**
+
+- **Claim state:** `claimCanonicalDraft` left the project `draft` with no active
+  lineage. That is not enough to own a build.
+- **Owners:** Phase 5q and run start treated any current draft beside an active
+  lineage as corrupt.
+- **Conclusion:** it refused whenever a current draft existed.
+- **Chosen design:** reactivate the draft's own lineage root, never a new root.
+  This keeps one lineage, the exact predecessor, the one successor slot, and
+  `concludeCanonicalDraft`'s existing proof.
+- **Prepared successors:** `runProject` cannot resume one, because
+  `verifyBindingConsistency` is called without lineage. The edit's own exact
+  replay can, through the same `prepareFrontendBackendBuildBinding` and lifecycle
+  coordinator Phase 5k uses. No second recovery path.
+- **Dead workers:** nothing in production calls `reclaimExpiredLeases`. A job
+  whose worker died mid-attempt stays `in_progress` for an edit exactly as for a
+  run's build.
+
+**Draft handoff (`handOffCanonicalDraft`, in the caller's transaction).**
+
+- **Writes:** a CAS claim by `{ kind: 'semantic_edit', operationId: intentId }`;
+  then `activeLineage` on the draft's own root, only while no lineage holds it;
+  then the project from `draft` to `building`. Each write is conditional and
+  counted.
+- **Handed-off state:** `resolveCanonicalDraftAuthority` reports it as
+  `handed_off` and proves all of:
+  - the draft is claimed by a building operation;
+  - its own root is active;
+  - the project is `building` or `validating`;
+  - the draft build is still promoted by its promotion;
+  - the tip is that build or its one successor;
+  - no release owner exists.
+- **Refusals:** anything else is corrupt. `releaseCanonicalDraftClaim` refuses a
+  handed-off draft.
+
+**Conclusion with supersession.** `concludeCanonicalDraft({ supersede, completeInTransaction })`:
+
+- **Allowed only when:** the current draft is exactly the handed-off D0, claimed by
+  exactly that claimant, on this lineage, with the new tip exactly one generation
+  on.
+- **One transaction:**
+  - D0 loses `current` and gains `supersededByDraftId`, keeping its claim as history;
+  - D1 is inserted current and available;
+  - the project becomes `draft`;
+  - the lineage is released;
+  - the operation completes.
+- **Replay:** re-proves supersession and calls completion idempotently.
+
+**Intent (`semantic_edit_intents`).**
+
+- **Identity:** `semantic-edit-<hash(project, draft, predecessor, base model, patch digest)>`.
+- **Uniqueness:** unique on `{ projectId, sourceDraftId }`, so one edit per draft, ever.
+- **Records:** the draft, root, predecessor, M0 and M1, the patch and its digest,
+  the source commit and snapshot, the job spec and id, and the successor id.
+- **Actor:** an optional `requestedBy.customerUserId`, for audit only.
+- **Status:** `building → promoted → evaluated → completed`, each by CAS. A replay
+  that lost a race continues from the durable record.
+
+**Application (`applySemanticEdit`, `resumeSemanticEdit`).**
+
+1. **Patch first.** The patch is proven against exactly M0 with the pure
+   `applySemanticPatch`, which yields typed patch refusals.
+2. **Replay check.** An existing intent is reused.
+3. **Authority.** It proves:
+   - the concluded available draft;
+   - the expected draft and build;
+   - the base model equal to B0's pinned ref.
+4. **Source.** It proves:
+   - the promotion marker;
+   - no uncommitted non-harness work;
+   - HEAD descends from the promotion;
+   - source read with `readModelSourceAtCommit` under the refinement bounds, never truncated.
+5. **One transaction:** handoff, M1, source snapshot, intent.
+6. **Build.** Continuation prepares B1 as a `semantic_edit` successor (M0→M1),
+   commits the specification, and runs the existing lifecycle coordinator with
+   origin `{ kind: 'semantic_edit', intentId }`. It records promotion only after
+   `promoted`.
+7. **Evaluation.** B1 is evaluated afresh: gates, render, screenshots and review
+   bound to B1. Evidence refs are recorded before conclusion.
+8. **Conclusion.** It concludes D1 with supersession.
+
+A stop before promotion leaves claim, lineage and job durable; replay resumes that
+job. Nothing refines, adjudicates, approves, releases or deploys.
+
+**Terra.**
+
+- **Skill:** `terra-edit`, tier terra, through Terra's bounded build loop
+  (filesystem and test_runner only, same turn, read and test bounds).
+- **Handler:** `prepareSemanticEdit` resolves the exact snapshot (hash, digest,
+  both models, patch) and proves M1 is the patch applied to M0.
+- **Validation:** the plan-conformance gate and the site-model gate against the
+  pinned M1 are unchanged.
+
+**Phase 5q and run start.**
+
+- **Phase 5q:** an active lineage beside a handed-off draft throws
+  `ActiveContinuationSemanticEditOwned`, naming the intent. Its continuation is
+  `resumeSemanticEdit`. A semantic-edit tip without a handoff is corrupt.
+  `ActiveContinuationSuccessorNotOwned` is gone.
+- **Run start:** `runProject` refuses any current draft, concluded or handed off,
+  before resume, recovery or discovery.
+
+**Scope.** No customer route, editor, preview, domain, lead or publish work.
+
+**Tests.**
+
+- **`semantic-edit-application.integration.test.ts` (22):**
+  - the whole edit;
+  - completed replay;
+  - sequential M0→M1→M2;
+  - stale draft, build and base, and five patch refusals;
+  - active, parked, released, blocked, release-owned and claimed projects;
+  - uncommitted work, divergent HEAD, oversize source, and a Luna repair as source;
+  - concurrent edits;
+  - four validation stops and a forbidden path;
+  - a model failure resumed on the same job;
+  - crash after promotion, recovered through 5q and `resumeSemanticEdit`;
+  - crash before conclusion;
+  - a missing intent.
+- **`canonical-draft-authority.integration.test.ts`:** handoff and supersession cases.
+- **`semantic-edit-identity.test.ts` (8):** unit tests of identity.
+- **`semantic-edit-boundary.test.ts` (13):** structural.
+- **`terra-edit.test.ts` (5):** the skill.
+- **Structural pins updated** that asserted semantic editing did not exist yet.
+
+**Mutations: 39 of 40 killed.**
+
+- **Equivalent survivor:** "replay rebuilds after promotion" cannot re-run Terra,
+  because the coordinator never re-executes an accepted, fenced job.
+- **Tightened after a first survival:** four tests (7, 13, 18, 21).
+
 ## Phases 6–17
 
 Not started.

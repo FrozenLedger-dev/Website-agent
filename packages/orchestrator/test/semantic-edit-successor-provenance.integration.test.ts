@@ -34,7 +34,7 @@ import {
   readBuildLineage,
   verifyBindingConsistency,
 } from '../src/run-binding/frontend-backend.js';
-import { ActiveContinuationCorrupt, ActiveContinuationSuccessorNotOwned, resolvePostPromotionRecovery } from '../src/run-recovery/frontend-backend.js';
+import { ActiveContinuationCorrupt, resolvePostPromotionRecovery } from '../src/run-recovery/frontend-backend.js';
 import { createFrontendBackendJobSpec, createFrontendBackendVisualRefinementJobSpec } from '../src/job-specs/frontend-backend.js';
 
 let store: StateStore;
@@ -308,13 +308,12 @@ describe('Phase 5q', () => {
   }
   const recover = (projectId: string) => resolvePostPromotionRecovery({ store, registry: {} as ArtifactRegistry, workspacesRoot: '/nonexistent', projectId, runIntentHash: 'intent' }).catch((e: unknown) => e);
 
-  it('a promoted semantic-edit tip is proven structurally, then refused explicitly as not yet owned — never corrupt, never another kind', async () => {
+  it('a promoted semantic-edit tip with no draft handed to its edit is proven structurally, then fails closed — never continued as another kind', async () => {
     const b1 = await promotedChain('proj_sem_5q_edit', edit(1, 2), 2);
     const error = await recover('proj_sem_5q_edit');
-    expect(error).toBeInstanceOf(ActiveContinuationSuccessorNotOwned);
-    expect(error).not.toBeInstanceOf(ActiveContinuationCorrupt);
+    expect(error).toBeInstanceOf(ActiveContinuationCorrupt);
     expect(error).not.toBeInstanceOf(FrontendBackendBuildLineageCorrupt);
-    expect(error).toMatchObject({ bindingId: b1._id, successorKind: 'semantic_edit' });
+    expect((error as Error).message).toContain(`semantic edit build "${b1._id}" is the active tip, but no canonical draft is handed to its edit`);
   });
 
   it.each([

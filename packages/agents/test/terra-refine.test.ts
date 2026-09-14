@@ -96,7 +96,7 @@ describe('terra-refine is its own Terra skill', () => {
   it('is registered at tier terra, distinct from terra-build and terra-review', () => {
     expect(MODEL_SKILL_TIERS['terra-refine']).toBe('terra');
     expect(MODEL_SKILL_TIERS['terra-review']).toBe('terra');
-    expect(Object.keys(MODEL_SKILL_TIERS).filter((s) => s.startsWith('terra-')).sort()).toEqual(['terra-build', 'terra-refine', 'terra-review']);
+    expect(Object.keys(MODEL_SKILL_TIERS).filter((s) => s.startsWith('terra-')).sort()).toEqual(['terra-build', 'terra-edit', 'terra-refine', 'terra-review']);
   });
 
   it('crosses the model runtime once, as terra-refine, with one usage event, and returns the strict BuildOutput', async () => {

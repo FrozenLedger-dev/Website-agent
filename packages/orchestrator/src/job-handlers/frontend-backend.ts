@@ -33,10 +33,10 @@
  */
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { VisualQualityReview, VisualRefinementSource, type ArtifactRef, type EditableSiteModel, type ToolId, type ToolResult, type WorkerRole } from '@statxai/contracts';
+import { SemanticEditSource, VisualQualityReview, VisualRefinementSource, type ArtifactRef, type EditableSiteModel, type ToolId, type ToolResult, type WorkerRole } from '@statxai/contracts';
 import type { JobDocument } from '@statxai/state';
 import { contentHash, defaultTemplateRoot, type ArtifactRegistry, type BlobStore } from '@statxai/workspace';
-import { refineSiteVisually, type ModelRuntime, type ToolAccess } from '@statxai/agents';
+import { editSiteSemantically, refineSiteVisually, type ModelRuntime, type ToolAccess } from '@statxai/agents';
 import { jobOutputNamespace, type JobHandler, type JobHandlerResult } from '@statxai/job-engine';
 import { prepareBuildFromPlan, type BuildCandidate, type PrepareContext } from '../phases/build.js';
 import type { Progress, RunFacts } from '../run-context.js';
@@ -98,11 +98,24 @@ export const FRONTEND_BACKEND_INPUT = {
   visualRefinementSource: 'visualRefinementSource',
   visualQualityReview: 'visualQualityReview',
   screenshotSet: 'screenshotSet',
+  /**
+   * Present, both together, only on a semantic edit: the exact harness-read
+   * source snapshot (which pins the patch) and the exact model the predecessor
+   * build carries. `editableSiteModel` is then the result model the edit must
+   * implement. Their presence is what makes a job a semantic edit.
+   */
+  semanticEditSource: 'semanticEditSource',
+  baseEditableSiteModel: 'baseEditableSiteModel',
 } as const;
 
 /** Whether a job spec is a visual refinement — decided by its pinned inputs alone. */
 export function isVisualRefinementSpec(spec: { readonly inputs: Readonly<Record<string, unknown>> }): boolean {
   return spec.inputs[FRONTEND_BACKEND_INPUT.visualRefinementSource] !== undefined;
+}
+
+/** Whether a job spec is a semantic edit — decided by its pinned inputs alone. */
+export function isSemanticEditSpec(spec: { readonly inputs: Readonly<Record<string, unknown>> }): boolean {
+  return spec.inputs[FRONTEND_BACKEND_INPUT.semanticEditSource] !== undefined;
 }
 
 /** The one staged output this handler ever produces, by label. */
@@ -233,6 +246,59 @@ export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDe
     return { routeDecisions: [], files: refined.value.files };
   }
 
+  /**
+   * A semantic edit's generation half: the exact pinned source snapshot, the
+   * exact base and result models — each resolved by exact ref and proven to
+   * name the others — and one bounded `terra-edit` proposal. Writes nothing.
+   */
+  async function prepareSemanticEdit(
+    job: JobDocument,
+    profile: RunFacts['profile'],
+    plan: Parameters<typeof prepareBuildFromPlan>[1],
+    tools: ToolAccess,
+    signal: AbortSignal,
+    siteModel: EditableSiteModel | null,
+  ): Promise<BuildCandidate> {
+    const refuse = (detail: string) => new FrontendBackendInputInvalid(`semantic edit job "${job._id}": ${detail}`);
+    const sourceRef = requiredRef(job, FRONTEND_BACKEND_INPUT.semanticEditSource);
+    const baseRef = requiredRef(job, FRONTEND_BACKEND_INPUT.baseEditableSiteModel);
+    const resultRef = requiredRef(job, FRONTEND_BACKEND_INPUT.editableSiteModel);
+    if (!siteModel) throw refuse('no result model is pinned');
+
+    const rawSource = await deps.registry.resolve(job.projectId, sourceRef);
+    const source = SemanticEditSource.parse(rawSource);
+    if (sourceRef.contentHash === undefined || contentHash(rawSource) !== sourceRef.contentHash) throw refuse('the source snapshot does not match its pinned content hash');
+    if (source.projectId !== job.projectId) throw refuse('the source snapshot belongs to another project');
+    if (contentHash(source.files) !== source.filesDigest) throw refuse('the source snapshot files do not match their digest');
+    if (!sameExactRef(source.baseEditableSiteModel, baseRef) || source.baseEditableSiteModel.contentHash !== baseRef.contentHash) throw refuse('the source snapshot names a different base model than the job pins');
+    if (!sameExactRef(source.editableSiteModel, resultRef) || source.editableSiteModel.contentHash !== resultRef.contentHash) throw refuse('the source snapshot names a different result model than the job pins');
+    if (!sameExactRef(source.patch.baseModel, baseRef)) throw refuse('the patch was written against a different base model');
+
+    const baseModel = await resolveEditableSiteModel(deps.registry, job.projectId, baseRef);
+    const provenance = siteModel.provenance;
+    if (provenance.kind !== 'semantic_patch' || !sameExactRef(provenance.base, baseRef) || provenance.base.contentHash !== baseRef.contentHash || provenance.operation !== source.patch.operation.op) {
+      throw refuse('the result model is not the pinned patch applied to the pinned base');
+    }
+
+    signal.throwIfAborted();
+    say({ phase: 'build', detail: `Terra is implementing semantic edit ${source.intentId} of build ${source.predecessorBindingId}` });
+    const edited = await editSiteSemantically(
+      deps.model,
+      {
+        profile,
+        plan,
+        predecessor: { bindingId: source.predecessorBindingId, sourceCommit: source.sourceCommit },
+        source: source.files,
+        baseModel,
+        model: siteModel,
+        patch: source.patch,
+      },
+      { signal, tools },
+    );
+    // No route decision: an edit is not routed, and says so rather than inventing one.
+    return { routeDecisions: [], files: edited.value.files };
+  }
+
   return async (job, ctx): Promise<JobHandlerResult> => {
     if (job.role !== ROLE) {
       throw new FrontendBackendRoleMismatch(job.role);
@@ -268,7 +334,7 @@ export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDe
     // every call, against this job's own spec — never against anything the
     // model says. The same grant for a build and a refinement; only the skill
     // named in the evidence differs.
-    const toolAccess = (skill: 'terra-build' | 'terra-refine'): ToolAccess => ({
+    const toolAccess = (skill: 'terra-build' | 'terra-refine' | 'terra-edit'): ToolAccess => ({
       grantedTools: effectiveTools(job.spec.allowedTools, FRONTEND_BACKEND_SUPPORTED_TOOLS),
       execute: (request, signal) =>
         gateway.execute<ToolResult>({
@@ -292,7 +358,12 @@ export function createTerraFrontendBackendHandler(deps: FrontendBackendHandlerDe
     // so there is nothing here that could materialise into it before this
     // execution's authority is proven.
     let candidate: BuildCandidate;
-    if (isVisualRefinementSpec(job.spec)) {
+    if (isSemanticEditSpec(job.spec) && isVisualRefinementSpec(job.spec)) {
+      throw new FrontendBackendInputInvalid(`frontend_backend job "${job._id}" pins both semantic edit and visual refinement inputs`);
+    }
+    if (isSemanticEditSpec(job.spec)) {
+      candidate = await prepareSemanticEdit(job, profile as RunFacts['profile'], plan as Parameters<typeof prepareBuildFromPlan>[1], toolAccess('terra-edit'), ctx.signal, siteModel);
+    } else if (isVisualRefinementSpec(job.spec)) {
       candidate = await prepareVisualRefinement(job, profile as RunFacts['profile'], plan as Parameters<typeof prepareBuildFromPlan>[1], toolAccess('terra-refine'), ctx.signal, siteModel);
     } else {
       const prepareContext: PrepareContext = {

@@ -42,6 +42,7 @@ import {
 import { concluded, withoutDelivery, type RunResult } from './phases/conclude.js';
 import {
   assertNoActiveLineageForLegacyDirect,
+  assertNoCanonicalDraftOwnsRun,
   publishRecoveredRelease,
   rehydrateRecoveredRelease,
   resolvePostPromotionRecovery,
@@ -279,6 +280,9 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       discovery = { ok: false, outcome: 'intake_insufficient' };
     } else {
       const runIntentHash = computeRunIntentHash({ projectId, profile: validated.profile });
+      // A canonical draft — concluded, or handed to a semantic edit building from
+      // it — owns the project outright; no run resumes, recovers or discovers over it.
+      await assertNoCanonicalDraftOwnsRun(store, projectId);
       const existingBinding = await findActivePreparedBinding(store, projectId);
 
       if (existingBinding && existingBinding.runIntentHash !== runIntentHash) {

@@ -46,7 +46,7 @@ import { ProjectWorkspace, type ArtifactRegistry } from '@statxai/workspace';
 import type { ApprovalRecord, AuthorizationRecord } from '../release.js';
 import type { RunContext } from '../run-context.js';
 import { promotionMarker } from '../job-promotion/frontend-backend.js';
-import { assertCanonicalDraftPromotionMarker, loadCurrentCanonicalDraft } from '../canonical-draft/authority.js';
+import { CanonicalDraftAuthorityCorrupt, assertCanonicalDraftPromotionMarker, loadCurrentCanonicalDraft, resolveCanonicalDraftAuthority } from '../canonical-draft/authority.js';
 import { publishRelease, type PublishResult } from '../phases/publish.js';
 import {
   assertReceiptMatchesCanonicalBuild,
@@ -106,21 +106,22 @@ export class ActiveContinuationAwaitingHumanReview extends Error {
 }
 
 /**
- * The promoted tip is a well-formed successor of a kind post-promotion recovery
- * does not yet know how to continue. Refused explicitly — never corrupt, and
- * never treated as though it were another kind.
+ * The active lineage belongs to a semantic edit building from the project's
+ * handed-off canonical draft. Its continuation is that edit's own — resumed from
+ * its durable intent through `resumeSemanticEdit`, which evaluates and concludes
+ * exactly its successor — never a run's evaluation, approval or release.
  */
-export class ActiveContinuationSuccessorNotOwned extends Error {
+export class ActiveContinuationSemanticEditOwned extends Error {
   constructor(
     readonly projectId: string,
-    readonly bindingId: string,
-    readonly successorKind: string,
+    readonly draftId: string,
+    readonly intentId: string,
   ) {
     super(
-      `project "${projectId}": promoted build "${bindingId}" is a ${successorKind} successor, whose continuation ` +
-        `post-promotion recovery does not own yet; it is not resumed automatically`,
+      `project "${projectId}": canonical draft "${draftId}" is handed to semantic edit "${intentId}", ` +
+        `which owns its build lineage; a run does not continue it`,
     );
-    this.name = 'ActiveContinuationSuccessorNotOwned';
+    this.name = 'ActiveContinuationSemanticEditOwned';
   }
 }
 
@@ -263,9 +264,19 @@ export async function resolvePostPromotionRecovery(
     throw new ActiveContinuationConcludedDraft(projectId, draft._id, draft.canonicalBindingId);
   }
 
-  // A run owns the project, so no draft may: both at once is corruption.
+  // An active lineage beside a current draft is either that draft handed to its
+  // semantic edit — whose continuation is the edit's own — or corruption.
   const strayDraft = await store.canonicalDrafts.findOne({ projectId, current: true });
   if (strayDraft) {
+    const owner = await resolveCanonicalDraftAuthority(store, projectId).catch((error: unknown) => {
+      if (error instanceof CanonicalDraftAuthorityCorrupt) {
+        throw new ActiveContinuationCorrupt(projectId, `lineage "${root._id}" is active while canonical draft "${strayDraft._id}" is current (${error.message})`);
+      }
+      throw error;
+    });
+    if (owner?.state === 'handed_off' && owner.draft.claim?.kind === 'semantic_edit') {
+      throw new ActiveContinuationSemanticEditOwned(projectId, owner.draft._id, owner.draft.claim.operationId);
+    }
     throw new ActiveContinuationCorrupt(projectId, `lineage "${root._id}" is active while canonical draft "${strayDraft._id}" is current`);
   }
 
@@ -300,11 +311,11 @@ export async function resolvePostPromotionRecovery(
   );
   // A promoted replan or visual refinement is a continuation this recovery owns:
   // evaluated afresh, with whether to refine again decided from its own typed
-  // provenance. A semantic edit is structurally sound lineage, but continuing one
-  // is the semantic-edit lifecycle's, which does not exist yet: refused explicitly,
-  // never corrupt, and never continued as though it were another kind.
+  // provenance. A semantic edit always builds from a handed-off draft, which was
+  // recognised above; a semantic-edit tip with no such draft has lost the
+  // authority that owns it, and is never continued as a run's build.
   if (position.kind === 'successor' && position.provenance.kind === 'semantic_edit') {
-    throw new ActiveContinuationSuccessorNotOwned(projectId, tip._id, position.provenance.kind);
+    throw new ActiveContinuationCorrupt(projectId, `semantic edit build "${tip._id}" is the active tip, but no canonical draft is handed to its edit`);
   }
 
   // Durable run state this continuation reuses, never recreates.
@@ -389,6 +400,17 @@ export async function resolvePostPromotionRecovery(
  * concluded canonical draft owns the project. A terminal project holds neither,
  * so this never blocks legitimate later work.
  */
+/**
+ * Refuse a `job_lifecycle` run over a project a canonical draft owns — concluded,
+ * or handed to a semantic edit — before anything resumes, recovers or
+ * discovers. Neither is a run's to continue.
+ */
+export async function assertNoCanonicalDraftOwnsRun(store: StateStore, projectId: string): Promise<void> {
+  const owner = await resolveCanonicalDraftAuthority(store, projectId);
+  if (owner?.state === 'concluded') throw new ActiveContinuationConcludedDraft(projectId, owner.draft._id, owner.draft.canonicalBindingId);
+  if (owner?.state === 'handed_off') throw new ActiveContinuationSemanticEditOwned(projectId, owner.draft._id, owner.draft.claim!.operationId);
+}
+
 export async function assertNoActiveLineageForLegacyDirect(store: StateStore, projectId: string): Promise<void> {
   const root = await findActiveLineageRoot(store, projectId);
   if (root) throw new LegacyDirectActiveLineageConflict(projectId, root._id);

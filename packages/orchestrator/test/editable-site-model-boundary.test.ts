@@ -124,7 +124,9 @@ describe('semantic patches are pure, exact and source-free', () => {
       const code = await src(file);
       if (/applySemanticPatch\(|commitSemanticPatch\(/.test(code) && ![PATCH, PERSIST].includes(file)) appliers.push(file);
     }
-    expect(appliers).toEqual([]);
+    // The semantic-edit application proves a patch against its exact base; source reaches the tree only through the lifecycle.
+    expect(appliers).toEqual(['packages/orchestrator/src/semantic-edit/apply.ts']);
+    expect(await src('packages/orchestrator/src/semantic-edit/apply.ts')).not.toMatch(/writeSiteFiles|\.commit\(|promoteAccepted|acceptValidated/);
     const persist = await src(PERSIST);
     expect(persist).not.toMatch(/ProjectWorkspace|writeSiteFiles|commit\(|lifecycle|runProject|deploy/);
   });
@@ -155,7 +157,7 @@ describe('builds and evaluations measure an exact pinned model', () => {
   it('no production code resolves a model by name or "latest"; every read is the exact, hash-checked ref', async () => {
     for (const file of await allProductionFiles()) {
       // The build-lineage contract may name the artifact a ref must be; it resolves nothing.
-      if (file === CONTRACT || file === PERSIST || file === 'packages/contracts/src/build-lineage.ts') continue;
+      if (file === CONTRACT || file === PERSIST || file === 'packages/contracts/src/build-lineage.ts' || file === 'packages/contracts/src/semantic-edit.ts') continue;
       const code = await src(file);
       expect(code, file).not.toMatch(/EDITABLE_SITE_MODEL_ARTIFACT|'editable-site-model'/);
     }
@@ -171,6 +173,7 @@ describe('builds and evaluations measure an exact pinned model', () => {
       'packages/orchestrator/src/job-validation/frontend-backend.ts',
       'packages/orchestrator/src/orchestrator.ts',
       'packages/orchestrator/src/phases/evaluate.ts',
+      'packages/orchestrator/src/semantic-edit/apply.ts',
     ].sort());
   });
 

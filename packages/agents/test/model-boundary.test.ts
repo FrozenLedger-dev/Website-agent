@@ -68,12 +68,12 @@ describe('the model runtime boundary', () => {
 
       expect(Object.keys(MODEL_SKILL_TIERS), `${name} is not a registered skill`).toContain(skill);
 
-      if (skill === 'terra-refine') {
-        // The one skill that reaches the runtime through Terra's shared bounded build loop
-        // rather than its own invoke — and only ever under its own name.
+      if (skill === 'terra-refine' || skill === 'terra-edit') {
+        // The skills that reach the runtime through Terra's shared bounded build loop
+        // rather than their own invoke — and only ever under their own name.
         expect(code, name).not.toMatch(/runtime\.invoke\(|ModelClient|new ModelRuntime/);
         expect(code.match(/invokeTerraBuild\(/g), name).toHaveLength(1);
-        expect([...code.matchAll(/\bskill:\s*'([^']+)'/g)].map((m) => m[1]), name).toEqual(['terra-refine']);
+        expect([...code.matchAll(/\bskill:\s*'([^']+)'/g)].map((m) => m[1]), name).toEqual([skill]);
         seen.add(skill);
         continue;
       }
@@ -85,7 +85,7 @@ describe('the model runtime boundary', () => {
       const tiers = [...code.matchAll(/\btier:\s*'([^']+)'/g)].map((m) => m[1]);
       expect(names, name).toEqual(Array(invokes).fill(skill));
       expect(tiers, name).toEqual(Array(invokes).fill(MODEL_SKILL_TIERS[skill as keyof typeof MODEL_SKILL_TIERS]));
-      if (skill === 'terra-build') expect(code, name).toMatch(/readonly skill\?: 'terra-build' \| 'terra-refine';/);
+      if (skill === 'terra-build') expect(code, name).toMatch(/readonly skill\?: 'terra-build' \| 'terra-refine' \| 'terra-edit';/);
       seen.add(skill);
     }
 
@@ -100,7 +100,8 @@ describe('the model runtime boundary', () => {
       expect(code, relative(REPO, file)).not.toMatch(/\.track\(|\btrack\s*:/);
       if (/new ModelRuntime\(/.test(code)) constructions.push(relative(REPO, file));
     }
-    expect(constructions).toEqual(['packages/orchestrator/src/orchestrator.ts']);
+    // A run constructs one, and so does a semantic edit — its own operation over a draft, never inside a run.
+    expect(constructions.sort()).toEqual(['packages/orchestrator/src/orchestrator.ts', 'packages/orchestrator/src/semantic-edit/apply.ts']);
   });
 
   it('the runtime holds no control-plane authority', async () => {

@@ -104,6 +104,7 @@ describe('skill and tier authority', () => {
       'terra-build': 'terra',
       'terra-review': 'terra',
       'terra-refine': 'terra',
+      'terra-edit': 'terra',
       'luna-repair': 'luna',
     });
   });

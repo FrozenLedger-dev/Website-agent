@@ -116,9 +116,9 @@ describe('the tool boundary', () => {
     expect(suppliers).toEqual(['packages/orchestrator/src/job-handlers/frontend-backend.ts']);
     // A visual refinement runs through the same coordinator, handler and grant: its spec is the factory's, untouched.
     expect(orchestrator).toMatch(/lifecycleCoordinator\.run\(intent\.jobSpec, \{ kind: 'visual_refine', refinementCycle: intent\.refinementCycle \}\)/);
-    expect(spec.match(/allowedTools: \[\.\.\.ALLOWED_TOOLS\],/g)).toHaveLength(2);
+    expect(spec.match(/allowedTools: \[\.\.\.ALLOWED_TOOLS\],/g)).toHaveLength(3);
     const handler = await src('packages/orchestrator/src/job-handlers/frontend-backend.ts');
-    expect(handler.match(/toolAccess\('terra-(build|refine)'\)/g)?.sort()).toEqual(["toolAccess('terra-build')", "toolAccess('terra-refine')"]);
+    expect(handler.match(/toolAccess\('terra-(build|refine|edit)'\)/g)?.sort()).toEqual(["toolAccess('terra-build')", "toolAccess('terra-edit')", "toolAccess('terra-refine')"]);
   });
 
   it('the handler takes permission from the claimed job, intersected with what it supports', async () => {

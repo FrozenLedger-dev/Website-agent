@@ -5,7 +5,7 @@
  * authors and cannot influence (Appendix B: "state belongs to the platform,
  * reasoning belongs to the model").
  */
-import type { ArtifactRef, AutonomyMode, JobRecord, JobSpec, ReviewOutcomeRecord, SemanticEditSuccessorProvenance, VisualRefinementSuccessorProvenance, WorkerRole } from '@statxai/contracts';
+import type { ArtifactRef, AutonomyMode, JobRecord, JobSpec, ReviewOutcomeRecord, SemanticEditSuccessorProvenance, SemanticPatch, VisualRefinementSuccessorProvenance, WorkerRole } from '@statxai/contracts';
 import type { Binary } from 'mongodb';
 
 /** Project lifecycle, distinct from job lifecycle. */
@@ -475,7 +475,75 @@ export interface CanonicalDraftDocument {
    * `activeLineage` and `ReleasePublicationDocument.active`.
    */
   current?: true;
+  /**
+   * Set exactly when this draft stops being current because the operation that
+   * claimed it concluded the next draft — written in that same transaction.
+   * The claim is kept as it was: history of who took this draft forward.
+   */
+  supersededByDraftId?: string;
   /** Metadata only — never consulted to decide anything. */
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/**
+ * Where one semantic edit stands. Forward only:
+ *
+ *   building  — the draft is claimed, its lineage handed to this edit, the
+ *               result model and source snapshot recorded, the job fixed;
+ *   promoted  — the successor build promoted;
+ *   evaluated — that exact build was freshly evaluated, evidence recorded;
+ *   completed — the successor concluded as the new current draft.
+ *
+ * A lifecycle stop (validation failure, a retry, a model failure) is not a
+ * status: the edit stays `building`, its claim and job durable, and replaying
+ * the same edit resumes exactly that job.
+ */
+export type SemanticEditIntentStatus = 'building' | 'promoted' | 'evaluated' | 'completed';
+
+/**
+ * The durable authority for one semantic edit of one exact canonical draft.
+ *
+ * `_id` is deterministic from the draft, its build, the base model and the
+ * patch, so the same edit always resolves to the same intent, model version,
+ * source snapshot, job and successor. At most one edit per draft, ever — the
+ * draft's claim and a unique index say so together.
+ */
+export interface SemanticEditIntentDocument {
+  _id: string;
+  projectId: string;
+  /** The exact draft claimed, its lineage and the build it owns. */
+  sourceDraftId: string;
+  lineageRootBindingId: string;
+  predecessorBindingId: string;
+  /** The model the predecessor build carries, and the model this edit implements. */
+  baseEditableSiteModel: ArtifactRef;
+  editableSiteModel: ArtifactRef;
+  /** The exact patch, and its content digest (part of the intent's identity). */
+  patch: SemanticPatch;
+  patchDigest: string;
+  /** The canonical commit the source was read at, and the exact snapshot. */
+  sourceCommit: string;
+  source: ArtifactRef;
+  /** The deterministic job and successor binding this intent is answered by. */
+  jobId: string;
+  jobSpec: JobSpec;
+  successorBindingId: string;
+  /** Audit only, when a trusted caller supplied it — never authority, never a session or token. */
+  requestedBy?: { customerUserId: string };
+  status: SemanticEditIntentStatus;
+  /** Set from `promoted`. */
+  promotion?: { promotionId: string; promotionCommitSha: string };
+  /** Set from `evaluated`: the exact evidence the successor build's fresh evaluation wrote. */
+  evaluation?: {
+    testReport: ArtifactRef;
+    screenshotSet: ArtifactRef | null;
+    visualQualityReview: ArtifactRef | null;
+    gatesPassed: boolean;
+    qualityScore: number;
+  };
+  /** Set at `completed`: the draft this edit concluded. */
+  resultDraftId?: string;
   createdAt: Date;
   updatedAt: Date;
 }

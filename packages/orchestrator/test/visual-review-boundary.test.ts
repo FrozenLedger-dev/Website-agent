@@ -160,6 +160,8 @@ describe('the review reads exact evidence and holds no authority', () => {
       'packages/orchestrator/src/phases/release.ts',
       PHASE,
       'packages/orchestrator/src/release.ts',
+      // Records the exact review ref its successor's fresh evaluation wrote, as evidence only.
+      'packages/orchestrator/src/semantic-edit/apply.ts',
     ].sort());
     for (const file of consumers.filter((f) => f !== 'packages/orchestrator/src/orchestrator.ts')) {
       expect(await src(file), file).not.toMatch(/writeSiteFiles\(|buildSite\(|buildFromPlan\(|repairSite\(/);

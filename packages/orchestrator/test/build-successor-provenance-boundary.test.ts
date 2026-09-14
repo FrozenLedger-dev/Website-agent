@@ -122,11 +122,14 @@ describe('one lineage, whatever the reason', () => {
 });
 
 describe('Phase 5q owns every successor kind through the typed contract', () => {
-  it('recovery proves the tip from its own stored reason, then refuses exactly a semantic edit as not yet owned — never as corrupt or another kind', async () => {
+  it('recovery proves the tip from its own stored reason; a semantic edit is owned by its handed-off draft, and a semantic-edit tip without one fails closed — never another kind', async () => {
     const code = await src(RECOVERY);
+    const handedOff = code.indexOf('throw new ActiveContinuationSemanticEditOwned(projectId, owner.draft._id, owner.draft.claim.operationId);');
     const read = code.indexOf('readBuildLineage(tip)');
     const verified = code.indexOf('verifyBindingConsistency(', read);
-    const refused = code.indexOf('throw new ActiveContinuationSuccessorNotOwned(projectId, tip._id, position.provenance.kind);', verified);
+    const refused = code.indexOf('throw new ActiveContinuationCorrupt(projectId, `semantic edit build "${tip._id}" is the active tip, but no canonical draft is handed to its edit`);', verified);
+    expect(handedOff).toBeGreaterThan(-1);
+    expect(handedOff).toBeLessThan(read);
     expect(read).toBeGreaterThan(-1);
     expect(verified).toBeGreaterThan(read);
     expect(refused).toBeGreaterThan(verified);
@@ -137,14 +140,18 @@ describe('Phase 5q owns every successor kind through the typed contract', () => 
   });
 });
 
-describe('successors are prepared only by the two harness decisions that own them', () => {
-  it('the replan and the visual refinement are the only successor callers, each with its own typed reason', async () => {
+describe('successors are prepared only by the three harness decisions that own them', () => {
+  it('the replan, the visual refinement and the semantic edit are the only successor callers, each with its own typed reason', async () => {
     const callers: string[] = [];
     for (const file of await allProductionFiles()) {
       const code = await src(file);
       if (/prepareFrontendBackendBuildBinding\(/.test(code) && file !== BINDING) callers.push(file);
     }
-    expect(callers).toEqual(['packages/orchestrator/src/orchestrator.ts']);
+    expect(callers.sort()).toEqual(['packages/orchestrator/src/orchestrator.ts', 'packages/orchestrator/src/semantic-edit/apply.ts']);
+    const edit = await src('packages/orchestrator/src/semantic-edit/apply.ts');
+    expect(edit.match(/prepareFrontendBackendBuildBinding\(/g)).toHaveLength(1);
+    expect(edit).toMatch(/const provenance = SemanticEditSuccessorProvenance\.parse\(\{ kind: 'semantic_edit', baseEditableSiteModel: intent\.baseEditableSiteModel, editableSiteModel: intent\.editableSiteModel \}\);/);
+    expect(edit).toMatch(/lineage: \{ predecessorBindingId: predecessor\._id, provenance \}/);
     const orchestrator = await src('packages/orchestrator/src/orchestrator.ts');
     expect(orchestrator.match(/provenance: [A-Za-z]+SuccessorProvenance\.parse\(\{\s*kind: '([a-z_]+)'/g)?.map((m) => m.replace(/\s+/g, ' '))).toEqual([
       "provenance: VisualRefinementSuccessorProvenance.parse({ kind: 'visual_refinement'",
@@ -153,15 +160,16 @@ describe('successors are prepared only by the two harness decisions that own the
   });
 });
 
-describe('semantic-edit successors: identity only, and nothing that creates one', () => {
-  it('only the contract, the lineage reader and recovery know the semantic_edit kind — no production code creates one', async () => {
+describe('semantic-edit successors: created only by the semantic-edit application', () => {
+  it('only the contracts, the lineage reader, recovery, draft authority and the semantic-edit application know the semantic_edit kind — and only the application creates one', async () => {
     const knowers: string[] = [];
     for (const file of await allProductionFiles()) {
       if (/semantic_edit|SemanticEditSuccessorProvenance/.test(await src(file))) knowers.push(file);
     }
     // The state document only types the persisted field; it creates nothing. Canonical draft
     // authority names `semantic_edit` only as a claim category, never as a successor.
-    expect(knowers.sort()).toEqual([CONTRACT, BINDING, RECOVERY, 'packages/state/src/documents.ts', 'packages/orchestrator/src/canonical-draft/authority.ts'].sort());
+    // The job contract names the edit's origin; the application is the one place a semantic-edit successor is made.
+    expect(knowers.sort()).toEqual([CONTRACT, BINDING, RECOVERY, 'packages/state/src/documents.ts', 'packages/orchestrator/src/canonical-draft/authority.ts', 'packages/contracts/src/job.ts', 'packages/orchestrator/src/semantic-edit/apply.ts', 'packages/state/src/store.ts'].sort());
     expect(await src('packages/orchestrator/src/canonical-draft/authority.ts')).not.toMatch(/SemanticEditSuccessorProvenance|successorProvenance/);
     const binding = await src(BINDING);
     expect(binding).not.toMatch(/kind: 'semantic_edit'/);
@@ -188,10 +196,11 @@ describe('semantic-edit successors: identity only, and nothing that creates one'
     expect(shape).not.toMatch(/customer|session|account|email|patch|operation|source|commit|At\b|time/i);
   });
 
-  it('no semantic-edit job origin, job spec, skill or customer editor route exists yet', async () => {
-    expect(await src('packages/contracts/src/job.ts')).not.toMatch(/semantic/i);
-    expect(await src('packages/orchestrator/src/job-specs/frontend-backend.ts')).not.toMatch(/semantic/i);
-    expect(await src('packages/agents/src/runtime.ts')).not.toMatch(/semantic|edit/i);
+  it('the semantic edit has its own job origin, job spec and skill — and still no customer editor route exists', async () => {
+    const job = await src('packages/contracts/src/job.ts');
+    expect(job).toContain("z.strictObject({ kind: z.literal('semantic_edit'), intentId: z.string().regex(/^semantic-edit-[a-f0-9]{64}$/) }),");
+    expect(await src('packages/orchestrator/src/job-specs/frontend-backend.ts')).toContain('export function createFrontendBackendSemanticEditJobSpec(');
+    expect(await src('packages/agents/src/runtime.ts')).toContain("'terra-edit': 'terra',");
     const routes: string[] = [];
     const walk = async (dir: string): Promise<void> => {
       for (const entry of await readdir(join(REPO, dir), { withFileTypes: true }).catch(() => [])) {

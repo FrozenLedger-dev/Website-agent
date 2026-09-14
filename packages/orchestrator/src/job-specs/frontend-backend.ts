@@ -180,3 +180,62 @@ export function createFrontendBackendVisualRefinementJobSpec(input: CreateFronte
   };
   return { ...identity, jobId: computeJobId(identity) };
 }
+
+const EDIT_OBJECTIVE = 'Implement the exact semantic edit of the canonical build within the approved plan.';
+const EDIT_ACCEPTANCE_CRITERIA = Object.freeze([
+  'site files written from the approved plan',
+  'every planned route kept, and no route added',
+  'the exact result editable site model carried',
+]);
+
+export interface CreateFrontendBackendSemanticEditJobSpecInput {
+  readonly projectId: string;
+  readonly businessProfileRef: ArtifactRef;
+  readonly sitePlanRef: ArtifactRef;
+  /**
+   * The exact harness-written source snapshot. Its content — the intent, the
+   * claimed draft, the predecessor build, its promotion and source commit, both
+   * models, the patch and every source file — is pinned by the ref's content
+   * hash, which is part of the job's identity.
+   */
+  readonly semanticEditSourceRef: ArtifactRef;
+  /** The model the predecessor build carries. */
+  readonly baseEditableSiteModelRef: ArtifactRef;
+  /** The model this edit must implement. */
+  readonly editableSiteModelRef: ArtifactRef;
+}
+
+/**
+ * The one deterministic `JobSpec` for one exact semantic edit.
+ *
+ * The same identity primitive as every other `frontend_backend` spec, with a
+ * distinct objective and two more pinned inputs — so it never collides with an
+ * initial build, a replan, a refinement or another edit: every edit pins a
+ * different source snapshot (a different intent, draft and patch) and result
+ * model. The same intent always yields the same spec.
+ */
+export function createFrontendBackendSemanticEditJobSpec(input: CreateFrontendBackendSemanticEditJobSpecInput): JobSpec {
+  for (const [label, ref] of [
+    ['semanticEditSourceRef', input.semanticEditSourceRef],
+    ['baseEditableSiteModelRef', input.baseEditableSiteModelRef],
+    ['editableSiteModelRef', input.editableSiteModelRef],
+  ] as const) {
+    if (!ref.contentHash) throw new Error(`createFrontendBackendSemanticEditJobSpec: ${label} must carry its exact content hash`);
+  }
+  const identity: FrontendBackendJobIdentity = {
+    projectId: input.projectId,
+    role: ROLE,
+    objective: EDIT_OBJECTIVE,
+    inputs: {
+      [FRONTEND_BACKEND_INPUT.businessProfile]: input.businessProfileRef,
+      [FRONTEND_BACKEND_INPUT.sitePlan]: input.sitePlanRef,
+      [FRONTEND_BACKEND_INPUT.semanticEditSource]: input.semanticEditSourceRef,
+      [FRONTEND_BACKEND_INPUT.baseEditableSiteModel]: input.baseEditableSiteModelRef,
+      [FRONTEND_BACKEND_INPUT.editableSiteModel]: input.editableSiteModelRef,
+    },
+    acceptanceCriteria: [...EDIT_ACCEPTANCE_CRITERIA],
+    allowedTools: [...ALLOWED_TOOLS],
+    output: [...OUTPUT],
+  };
+  return { ...identity, jobId: computeJobId(identity) };
+}

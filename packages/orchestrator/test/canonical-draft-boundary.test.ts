@@ -70,7 +70,10 @@ describe('draft authority is its own owner', () => {
       expect(code, file).not.toMatch(/canonicalDrafts\.(insertOne|updateOne|updateMany|replaceOne|deleteOne|deleteMany|findOneAndUpdate|bulkWrite)/);
     }
     const authority = await src(AUTHORITY);
-    expect(authority.match(/state: 'draft'/g)).toHaveLength(1);
+    // One write of `draft` (conclusion); the handoff only ever matches on it.
+    expect(authority.match(/\$set: \{ state: 'draft'/g)).toHaveLength(1);
+    expect(authority.match(/state: 'draft'/g)).toHaveLength(2);
+    expect(authority).toContain("{ _id: projectId, state: 'draft' }, { $set: { state: 'building', updatedAt: now } }");
     expect(authority.match(/canonicalDrafts\.insertOne/g)).toHaveLength(1);
   });
 
@@ -129,8 +132,9 @@ describe('draft authority is its own owner', () => {
 
   it('a claim is a compare-and-set on the exact draft, build and availability — and a release on the exact holder', async () => {
     const authority = await src(AUTHORITY);
-    const claim = body(authority, 'export async function claimCanonicalDraft', '\n}\n');
-    expect(claim).toMatch(/parseCanonicalDraftClaimant\(input\.claimant\)/);
+    const claim = body(authority, 'async function claimInSession', '\n}\n');
+    expect(body(authority, 'export async function claimCanonicalDraft', '\n}\n')).toMatch(/parseCanonicalDraftClaimant\(input\.claimant\)/);
+    expect(body(authority, 'export async function handOffCanonicalDraft', '\n}\n')).toMatch(/parseCanonicalDraftClaimant\(input\.claimant\)[\s\S]*claimInSession\(store, input, claimant, session\)/);
     expect(claim).toMatch(/\{ _id: draft\._id, projectId, current: true, status: 'available', canonicalBindingId: input\.expectedCanonicalBindingId \}/);
     expect(claim).toMatch(/if \(result\.matchedCount !== 1\) throw new CanonicalDraftClaimConflict/);
     const current = body(authority, 'async function currentForClaim', '\n}\n');
@@ -220,16 +224,11 @@ describe('release publishes only the current tip', () => {
 });
 
 describe('scope', () => {
-  it('semantic editing is still not implemented', async () => {
-    const job = await src('packages/contracts/src/job.ts');
-    expect(body(job, 'export const JobOrigin', 'export type JobOrigin')).not.toMatch(/semantic_edit|semantic-edit/);
-    for (const file of await allProductionFiles()) {
-      const code = await src(file);
-      expect(code, file).not.toMatch(/terra-edit|SemanticEditIntent|semanticEditIntents|applySemanticEdit/);
-    }
-    // The only semantic_edit a draft knows is a claim category.
+  it('draft authority knows semantic editing only as the one kind of operation that builds from a draft', async () => {
     const authority = await src(AUTHORITY);
-    expect(authority.match(/semantic_edit/g)).toHaveLength(1);
+    expect(authority.match(/semantic_edit/g)).toHaveLength(2);
+    expect(authority).toContain("const HANDOFF_KINDS: ReadonlySet<CanonicalDraftClaimant['kind']> = new Set<CanonicalDraftClaimant['kind']>(['semantic_edit']);");
+    expect(authority).not.toMatch(/terra-edit|semanticEditIntents|applySemanticEdit|coordinator|evaluateSite/);
   });
 
   it('customer authentication neither reaches draft or build authority nor gains an edit route', async () => {

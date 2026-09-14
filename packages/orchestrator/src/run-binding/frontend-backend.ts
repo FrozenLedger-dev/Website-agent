@@ -827,6 +827,19 @@ export function verifyBindingConsistency(
       throw new FrontendBackendBuildBindingCorrupt(binding._id, 'a semantic edit successor\'s spec does not pin exactly the editable site model it implements');
     }
   }
+
+  // An edit job and a semantic-edit successor are the same fact, told twice: a spec that pins edit
+  // inputs pins exactly the base model the lineage names, and no other binding's spec pins them at all.
+  const specEditSource = spec.inputs[FRONTEND_BACKEND_INPUT.semanticEditSource];
+  const specBaseModel = spec.inputs[FRONTEND_BACKEND_INPUT.baseEditableSiteModel];
+  if (specEditSource || specBaseModel) {
+    if (stored.kind !== 'successor' || stored.provenance.kind !== 'semantic_edit') {
+      throw new FrontendBackendBuildBindingCorrupt(binding._id, 'spec pins semantic edit inputs, but the binding is not a semantic edit successor');
+    }
+    if (!specEditSource || !specBaseModel || !sameRef(specBaseModel, stored.provenance.baseEditableSiteModel) || specBaseModel.contentHash !== stored.provenance.baseEditableSiteModel.contentHash) {
+      throw new FrontendBackendBuildBindingCorrupt(binding._id, 'spec semantic edit inputs do not match the stored semantic edit provenance');
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

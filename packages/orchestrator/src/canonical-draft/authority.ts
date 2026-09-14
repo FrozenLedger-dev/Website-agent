@@ -20,6 +20,12 @@
  * Claiming a draft reserves it for exactly one operation, by compare-and-set.
  * A claim does nothing else — no build, no publication, no lineage — and never
  * expires: only its own claimant releases it.
+ *
+ * An operation that builds from the draft (a semantic edit) takes more than a
+ * claim: in the same transaction the draft's own lineage root takes the active
+ * slot back, and the project leaves `draft`. That handed-off draft stays current
+ * and claimed while its operation runs, and is superseded — never rewritten —
+ * when that operation concludes the next draft.
  */
 import type { ClientSession } from 'mongodb';
 import type { CanonicalDraftClaimant, CanonicalDraftDocument, FrontendBackendBuildBindingDocument, ProjectState, StateStore } from '@statxai/state';
@@ -66,7 +72,9 @@ export type CanonicalDraftClaimConflictReason =
   /** The current draft owns a different build than the claimant expected. */
   | 'stale_tip'
   /** Another operation holds the draft. */
-  | 'claimed_by_another';
+  | 'claimed_by_another'
+  /** The draft is handed to its operation's build lineage; it is released by that operation concluding, not by hand. */
+  | 'handed_off';
 
 /** A claim, or its release, was refused because the draft is not in the exact expected state. */
 export class CanonicalDraftClaimConflict extends Error {
@@ -77,6 +85,18 @@ export class CanonicalDraftClaimConflict extends Error {
   ) {
     super(`project "${projectId}": canonical draft claim refused (${reason}) — ${detail}`);
     this.name = 'CanonicalDraftClaimConflict';
+  }
+}
+
+/** The current draft is handed to an operation that is still building from it — neither concluded nor corrupt. */
+export class CanonicalDraftInOperation extends Error {
+  constructor(
+    readonly projectId: string,
+    readonly draftId: string,
+    readonly claimant: CanonicalDraftClaimant,
+  ) {
+    super(`project "${projectId}": canonical draft "${draftId}" is handed to ${claimant.kind} operation "${claimant.operationId}"`);
+    this.name = 'CanonicalDraftInOperation';
   }
 }
 
@@ -222,27 +242,97 @@ async function proveDraft(store: StateStore, draft: CanonicalDraftDocument, opti
   if (owner) throw corrupt(`${owner} owns the project alongside draft "${draft._id}"`);
 }
 
+/** Operations that build from a draft, and so take its lineage back while they run. */
+const HANDOFF_KINDS: ReadonlySet<CanonicalDraftClaimant['kind']> = new Set<CanonicalDraftClaimant['kind']>(['semantic_edit']);
+/** The project states an operation building from a draft moves through. */
+const HANDOFF_STATES: ReadonlySet<ProjectState> = new Set<ProjectState>(['building', 'validating']);
+
 /**
- * The project's current canonical draft, fully re-proven — or `null` when the
- * project is not a concluded draft and has no current draft record.
- *
- * `draft` state and a current draft record are one fact: either without the
- * other, or more than one current record, fails closed.
+ * Re-prove a draft handed to its operation: claimed by an operation that builds,
+ * its own root holding the active slot again, the project in that operation's
+ * build states, the draft's build still promoted by exactly its promotion, and
+ * the lineage ending either at that build or at its one successor. No release
+ * owns anything. Returns the structural tip.
  */
-export async function loadCurrentCanonicalDraft(store: StateStore, projectId: string, options: Session = {}): Promise<CanonicalDraftDocument | null> {
+async function proveHandedOffDraft(store: StateStore, draft: CanonicalDraftDocument, options: Session): Promise<FrontendBackendBuildBindingDocument> {
+  const { projectId } = draft;
+  const corrupt = (detail: string) => new CanonicalDraftAuthorityCorrupt(projectId, detail);
+
+  if (draft._id !== canonicalDraftId(draft)) throw corrupt(`draft "${draft._id}" does not carry the identity of the build it names`);
+  let claimant: CanonicalDraftClaimant;
+  try {
+    claimant = parseCanonicalDraftClaimant(draft.claim);
+  } catch (error) {
+    throw corrupt(`handed-off draft "${draft._id}" records no valid claimant (${(error as Error).message})`);
+  }
+  if (draft.status !== 'claimed' || !HANDOFF_KINDS.has(claimant.kind)) throw corrupt(`draft "${draft._id}" is not handed to a building operation`);
+
+  const root = await store.frontendBackendBuildBindings.findOne({ projectId, activeLineage: true }, sessionOf(options));
+  if (!root) throw corrupt(`draft "${draft._id}" is handed off but no lineage is active`);
+  if (root._id !== draft.lineageRootBindingId || root.lineageRootBindingId !== root._id) {
+    throw corrupt(`the active lineage "${root._id}" is not draft "${draft._id}"'s own lineage "${draft.lineageRootBindingId}"`);
+  }
+  const tip = await tipFrom(() => deriveActiveLineageTip(store, root, options), corrupt);
+
+  const build = tip._id === draft.canonicalBindingId ? tip : await store.frontendBackendBuildBindings.findOne({ _id: draft.canonicalBindingId, projectId }, sessionOf(options));
+  if (!build) throw corrupt(`draft build "${draft.canonicalBindingId}" is missing`);
+  if (build.lineageRootBindingId !== draft.lineageRootBindingId) throw corrupt(`build "${build._id}" belongs to lineage "${build.lineageRootBindingId ?? '(none)'}"`);
+  await provePromotion(store, build, draft, options, corrupt);
+  if (tip._id !== build._id && tip.predecessorBindingId !== build._id) {
+    throw corrupt(`lineage "${root._id}" ends at "${tip._id}", which is neither draft build "${build._id}" nor its one successor`);
+  }
+
+  const owner = await releaseOwner(store, projectId, root._id, options);
+  if (owner) throw corrupt(`${owner} owns the project alongside draft "${draft._id}"`);
+  return tip;
+}
+
+/** Who a project's current draft answers to, fully re-proven. */
+export type CanonicalDraftAuthority =
+  /** Concluded: the project is `draft` and no lineage is active. Available, or claimed by an operation that has not started building. */
+  | { readonly state: 'concluded'; readonly draft: CanonicalDraftDocument }
+  /** Handed to the claiming operation, whose build lineage is active; `tip` is that lineage's structural tip. */
+  | { readonly state: 'handed_off'; readonly draft: CanonicalDraftDocument; readonly tip: FrontendBackendBuildBindingDocument };
+
+/**
+ * The project's current canonical draft and who it answers to — or `null` when
+ * the project has no current draft.
+ *
+ * `draft` state means a concluded draft; a building state with a claimed current
+ * draft means a handed-off one. Anything else — a draft in any other state, a
+ * `draft` project with no record, more than one current record — fails closed.
+ */
+export async function resolveCanonicalDraftAuthority(store: StateStore, projectId: string, options: Session = {}): Promise<CanonicalDraftAuthority | null> {
   const corrupt = (detail: string) => new CanonicalDraftAuthorityCorrupt(projectId, detail);
   // Sequential: operations sharing one transaction session must not run concurrently.
   const project = await store.projects.findOne({ _id: projectId }, sessionOf(options));
   const drafts = await store.canonicalDrafts.find({ projectId, current: true }, sessionOf(options)).limit(2).toArray();
   if (drafts.length > 1) throw corrupt('more than one current draft');
   const draft = drafts[0];
-  if (project?.state !== 'draft') {
-    if (draft) throw corrupt(`draft "${draft._id}" is current but the project is ${project ? `"${project.state}"` : 'missing'}`);
+  if (!draft) {
+    if (project?.state === 'draft') throw corrupt('the project is a concluded draft with no current draft record');
     return null;
   }
-  if (!draft) throw corrupt('the project is a concluded draft with no current draft record');
-  await proveDraft(store, draft, options);
-  return draft;
+  if (project?.state === 'draft') {
+    await proveDraft(store, draft, options);
+    return { state: 'concluded', draft };
+  }
+  if (project && HANDOFF_STATES.has(project.state) && draft.status === 'claimed') {
+    const tip = await proveHandedOffDraft(store, draft, options);
+    return { state: 'handed_off', draft, tip };
+  }
+  throw corrupt(`draft "${draft._id}" is current but the project is ${project ? `"${project.state}"` : 'missing'}`);
+}
+
+/**
+ * The project's current concluded canonical draft, fully re-proven — or `null`
+ * when the project has no current draft. A draft handed to a running operation
+ * is not concluded, and is reported as exactly that.
+ */
+export async function loadCurrentCanonicalDraft(store: StateStore, projectId: string, options: Session = {}): Promise<CanonicalDraftDocument | null> {
+  const authority = await resolveCanonicalDraftAuthority(store, projectId, options);
+  if (authority?.state === 'handed_off') throw new CanonicalDraftInOperation(projectId, authority.draft._id, authority.draft.claim!);
+  return authority?.draft ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +350,19 @@ export interface ConcludeCanonicalDraftInput {
   readonly canonicalBindingId: string;
   /** The promotion the run holds for it. */
   readonly promotion: { readonly promotionId: string | null; readonly promotionCommitSha: string | null };
+  /**
+   * When the concluding lineage is an operation building from a handed-off
+   * draft: that exact draft and its exact claimant. The new draft replaces it
+   * as current in the same transaction; its build must be the one successor of
+   * the superseded draft's build.
+   */
+  readonly supersede?: { readonly draftId: string; readonly claimant: CanonicalDraftClaimant };
+  /**
+   * The concluding operation's own completion, written inside the same
+   * transaction — and called again, with `replayed`, when an exact replay finds
+   * the draft already concluded. Must itself be exact and idempotent.
+   */
+  readonly completeInTransaction?: (session: ClientSession, draft: CanonicalDraftDocument, replayed: boolean) => Promise<void>;
 }
 
 export interface CanonicalDraftConclusion {
@@ -306,6 +409,13 @@ export async function concludeCanonicalDraft(input: ConcludeCanonicalDraftInput)
       if (!current || current._id !== draftId || current.promotionCommitSha !== promotionCommitSha) {
         throw refuse(`the project is already the concluded draft "${current?._id ?? '(none)'}", not a draft of build "${canonicalBindingId}"`);
       }
+      if (input.supersede) {
+        const previous = await store.canonicalDrafts.findOne({ _id: input.supersede.draftId, projectId }, { session });
+        if (!previous || previous.supersededByDraftId !== draftId || !sameClaimant(previous.claim, input.supersede.claimant)) {
+          throw refuse(`draft "${draftId}" was not concluded by superseding "${input.supersede.draftId}"`);
+        }
+      }
+      await input.completeInTransaction?.(session, current, true);
       return { draft: current, replayed: true };
     }
     if (!CONCLUDABLE.has(project.state)) throw refuse(`the project is "${project.state}"`);
@@ -319,10 +429,35 @@ export async function concludeCanonicalDraft(input: ConcludeCanonicalDraftInput)
 
     const owner = await releaseOwner(store, projectId, root._id, { session });
     if (owner) throw refuse(`${owner} already owns continuation`);
-    const existing = await store.canonicalDrafts.findOne({ $or: [{ projectId, current: true }, { _id: draftId }] }, { session });
-    if (existing) throw refuse(`draft "${existing._id}" already exists while a lineage is active`);
-
+    if (await store.canonicalDrafts.findOne({ _id: draftId }, { session })) throw refuse(`draft "${draftId}" already exists while a lineage is active`);
+    const existing = await store.canonicalDrafts.findOne({ projectId, current: true }, { session });
     const now = new Date();
+
+    if (input.supersede) {
+      // Only the exact handed-off draft, by its exact claimant, one generation back.
+      const claimant = parseCanonicalDraftClaimant(input.supersede.claimant);
+      const authority = await resolveCanonicalDraftAuthority(store, projectId, { session });
+      if (
+        !existing ||
+        authority?.state !== 'handed_off' ||
+        authority.draft._id !== existing._id ||
+        existing._id !== input.supersede.draftId ||
+        !sameClaimant(existing.claim, claimant) ||
+        existing.lineageRootBindingId !== root._id ||
+        tip.predecessorBindingId !== existing.canonicalBindingId
+      ) {
+        throw refuse(`build "${canonicalBindingId}" does not conclude the draft "${input.supersede.draftId}" handed to ${claimant.kind} operation "${claimant.operationId}"`);
+      }
+      const superseded = await store.canonicalDrafts.updateOne(
+        { _id: existing._id, projectId, current: true, status: 'claimed', 'claim.kind': claimant.kind, 'claim.operationId': claimant.operationId },
+        { $unset: { current: '' }, $set: { supersededByDraftId: draftId, updatedAt: now } },
+        { session },
+      );
+      if (superseded.matchedCount !== 1) throw refuse(`draft "${existing._id}" changed during conclusion`);
+    } else if (existing) {
+      throw refuse(`draft "${existing._id}" already exists while a lineage is active`);
+    }
+
     const draft: CanonicalDraftDocument = { _id: draftId, ...identity, promotionCommitSha, status: 'available', current: true, createdAt: now, updatedAt: now };
     await store.canonicalDrafts.insertOne(draft, { session });
 
@@ -335,6 +470,7 @@ export async function concludeCanonicalDraft(input: ConcludeCanonicalDraftInput)
     );
     if (released.matchedCount !== 1) throw refuse(`lineage "${root._id}" released its active slot during conclusion`);
 
+    await input.completeInTransaction?.(session, draft, false);
     return { draft, replayed: false };
   });
 }
@@ -359,15 +495,36 @@ export interface CanonicalDraftClaim {
   readonly replayed: boolean;
 }
 
-async function currentForClaim(store: StateStore, input: Omit<ClaimCanonicalDraftInput, 'claimant'>, session: ClientSession): Promise<CanonicalDraftDocument> {
+async function currentForClaim(store: StateStore, input: Omit<ClaimCanonicalDraftInput, 'claimant'>, session: ClientSession): Promise<CanonicalDraftAuthority> {
   const { projectId } = input;
-  const draft = await loadCurrentCanonicalDraft(store, projectId, { session });
-  if (!draft) throw new CanonicalDraftClaimConflict(projectId, 'no_current_draft', 'the project has no current canonical draft');
+  const authority = await resolveCanonicalDraftAuthority(store, projectId, { session });
+  if (!authority) throw new CanonicalDraftClaimConflict(projectId, 'no_current_draft', 'the project has no current canonical draft');
+  const { draft } = authority;
   if (draft._id !== input.expectedDraftId) throw new CanonicalDraftClaimConflict(projectId, 'stale_draft', `the current draft is "${draft._id}", not "${input.expectedDraftId}"`);
   if (draft.canonicalBindingId !== input.expectedCanonicalBindingId) {
     throw new CanonicalDraftClaimConflict(projectId, 'stale_tip', `draft "${draft._id}" owns build "${draft.canonicalBindingId}", not "${input.expectedCanonicalBindingId}"`);
   }
-  return draft;
+  return authority;
+}
+
+/** The claim itself, inside the caller's transaction: exact draft, exact build, available — or this very claimant already. */
+async function claimInSession(store: StateStore, input: ClaimCanonicalDraftInput, claimant: CanonicalDraftClaimant, session: ClientSession): Promise<CanonicalDraftClaim & { readonly authority: CanonicalDraftAuthority }> {
+  const { projectId } = input;
+  const authority = await currentForClaim(store, input, session);
+  const { draft } = authority;
+  if (draft.status === 'claimed') {
+    if (sameClaimant(draft.claim, claimant)) return { draft, replayed: true, authority };
+    throw new CanonicalDraftClaimConflict(projectId, 'claimed_by_another', `draft "${draft._id}" is held by another ${draft.claim?.kind ?? ''} operation`.trim());
+  }
+
+  const now = new Date();
+  const result = await store.canonicalDrafts.updateOne(
+    { _id: draft._id, projectId, current: true, status: 'available', canonicalBindingId: input.expectedCanonicalBindingId },
+    { $set: { status: 'claimed', claim: { kind: claimant.kind, operationId: claimant.operationId }, updatedAt: now } },
+    { session },
+  );
+  if (result.matchedCount !== 1) throw new CanonicalDraftClaimConflict(projectId, 'claimed_by_another', `draft "${draft._id}" was claimed concurrently`);
+  return { draft: { ...draft, status: 'claimed', claim: claimant, updatedAt: now }, replayed: false, authority };
 }
 
 /**
@@ -376,25 +533,44 @@ async function currentForClaim(store: StateStore, input: Omit<ClaimCanonicalDraf
  * gets its claim back; any other claimant is refused. Nothing else happens.
  */
 export async function claimCanonicalDraft(input: ClaimCanonicalDraftInput): Promise<CanonicalDraftClaim> {
+  const claimant = parseCanonicalDraftClaimant(input.claimant);
+  return input.store.withTransaction(async (session) => {
+    const { draft, replayed } = await claimInSession(input.store, input, claimant, session);
+    return { draft, replayed };
+  });
+}
+
+/**
+ * Claim the exact current draft for an operation that builds from it, and hand
+ * that operation the draft's own lineage — inside the caller's transaction, so
+ * whatever the operation records alongside (its intent, its inputs) is one
+ * atomic fact with the claim.
+ *
+ * Writes, each conditional and counted: the claim; the draft's own root taking
+ * the active-lineage slot back (never a new root, and never while another
+ * lineage holds it); the project leaving `draft` for `building`. There is never
+ * a moment with the draft claimed and nothing owning continuation, or with a
+ * run able to discover over it. The same claimant replaying after the handoff
+ * gets it back unchanged.
+ */
+export async function handOffCanonicalDraft(input: ClaimCanonicalDraftInput, session: ClientSession): Promise<CanonicalDraftClaim> {
   const { store, projectId } = input;
   const claimant = parseCanonicalDraftClaimant(input.claimant);
+  if (!HANDOFF_KINDS.has(claimant.kind)) throw new CanonicalDraftClaimantInvalid(`a ${claimant.kind} operation does not build from a draft`);
 
-  return store.withTransaction(async (session) => {
-    const draft = await currentForClaim(store, input, session);
-    if (draft.status === 'claimed') {
-      if (sameClaimant(draft.claim, claimant)) return { draft, replayed: true };
-      throw new CanonicalDraftClaimConflict(projectId, 'claimed_by_another', `draft "${draft._id}" is held by another ${draft.claim?.kind ?? ''} operation`.trim());
-    }
+  const { draft, replayed, authority } = await claimInSession(store, input, claimant, session);
+  if (authority.state === 'handed_off') return { draft, replayed: true };
 
-    const now = new Date();
-    const result = await store.canonicalDrafts.updateOne(
-      { _id: draft._id, projectId, current: true, status: 'available', canonicalBindingId: input.expectedCanonicalBindingId },
-      { $set: { status: 'claimed', claim: { kind: claimant.kind, operationId: claimant.operationId }, updatedAt: now } },
-      { session },
-    );
-    if (result.matchedCount !== 1) throw new CanonicalDraftClaimConflict(projectId, 'claimed_by_another', `draft "${draft._id}" was claimed concurrently`);
-    return { draft: { ...draft, status: 'claimed', claim: claimant, updatedAt: now }, replayed: false };
-  });
+  const now = new Date();
+  const reactivated = await store.frontendBackendBuildBindings.updateOne(
+    { _id: draft.lineageRootBindingId, projectId, lineageRootBindingId: draft.lineageRootBindingId, activeLineage: { $exists: false } },
+    { $set: { activeLineage: true, updatedAt: now } },
+    { session },
+  );
+  if (reactivated.matchedCount !== 1) throw new CanonicalDraftClaimConflict(projectId, 'handed_off', `lineage "${draft.lineageRootBindingId}" could not take the active slot back`);
+  const moved = await store.projects.updateOne({ _id: projectId, state: 'draft' }, { $set: { state: 'building', updatedAt: now } }, { session });
+  if (moved.matchedCount !== 1) throw new CanonicalDraftClaimConflict(projectId, 'handed_off', 'the project left draft during the handoff');
+  return { draft, replayed };
 }
 
 /**
@@ -406,7 +582,11 @@ export async function releaseCanonicalDraftClaim(input: ClaimCanonicalDraftInput
   const claimant = parseCanonicalDraftClaimant(input.claimant);
 
   return store.withTransaction(async (session) => {
-    const draft = await currentForClaim(store, input, session);
+    const authority = await currentForClaim(store, input, session);
+    const { draft } = authority;
+    if (authority.state === 'handed_off') {
+      throw new CanonicalDraftClaimConflict(projectId, 'handed_off', `draft "${draft._id}" is handed to its operation's build lineage and is released only by that operation concluding`);
+    }
     if (draft.status === 'available') return { draft, replayed: true };
     if (!sameClaimant(draft.claim, claimant)) {
       throw new CanonicalDraftClaimConflict(projectId, 'claimed_by_another', `draft "${draft._id}" is held by another operation`);

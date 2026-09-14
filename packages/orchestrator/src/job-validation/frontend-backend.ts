@@ -30,7 +30,7 @@ import { jobOutputNamespace } from '@statxai/job-engine';
 import { runDeterministicGates } from '../phases/evaluate.js';
 import { resolveEditableSiteModel } from '../site-model/persist.js';
 import type { BuildCandidate } from '../phases/build.js';
-import { FRONTEND_BACKEND_INPUT, isVisualRefinementSpec } from '../job-handlers/frontend-backend.js';
+import { FRONTEND_BACKEND_INPUT, isSemanticEditSpec, isVisualRefinementSpec } from '../job-handlers/frontend-backend.js';
 
 type DeterministicGateResult = Awaited<ReturnType<typeof runDeterministicGates>>;
 
@@ -323,10 +323,11 @@ export async function validateFrontendBackendCandidate(
 
     const measured = await runDeterministicGates(ws.siteRoot, profile, plan, undefined, siteModel);
     const compiled = measured.compiled;
-    // A visual refinement changes how the site looks, never what it is: its
-    // page files must be exactly the approved plan's routes. The gates already
-    // refuse a missing route; this refuses an added one, which they do not ask about.
-    const conformance = isVisualRefinementSpec(job.spec) ? planConformanceFindings(candidate.files, plan) : [];
+    // A visual refinement changes how the site looks, never what it is, and a
+    // semantic edit changes the model, never the plan: either way its page files
+    // must be exactly the approved plan's routes. The gates already refuse a
+    // missing route; this refuses an added one, which they do not ask about.
+    const conformance = isVisualRefinementSpec(job.spec) || isSemanticEditSpec(job.spec) ? planConformanceFindings(candidate.files, plan) : [];
     const gateRun =
       conformance.length === 0
         ? measured.gateRun

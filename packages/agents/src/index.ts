@@ -9,5 +9,6 @@ export * from './skills/sol-route.js';
 export * from './skills/terra-build.js';
 export * from './skills/terra-review.js';
 export * from './skills/terra-refine.js';
+export * from './skills/terra-edit.js';
 export * from './skills/luna-repair.js';
 export * from './pricing.js';

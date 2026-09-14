@@ -142,6 +142,12 @@ export const JobOrigin = z.discriminatedUnion('kind', [
    * harness from an exact visual quality review. Not a replan: the plan is unchanged.
    */
   z.strictObject({ kind: z.literal('visual_refine'), refinementCycle: z.number().int().min(1).max(1_000) }),
+  /**
+   * The implementation of one exact semantic edit of a claimed canonical draft:
+   * the durable intent it answers, and nothing else. Not a replan and not a
+   * visual refinement — the plan is unchanged and the model is what changed.
+   */
+  z.strictObject({ kind: z.literal('semantic_edit'), intentId: z.string().regex(/^semantic-edit-[a-f0-9]{64}$/) }),
 ]);
 export type JobOrigin = z.infer<typeof JobOrigin>;
 

@@ -19,6 +19,7 @@ import type {
   ReviewDocument,
   VisualRefinementIntentDocument,
   CanonicalDraftDocument,
+  SemanticEditIntentDocument,
   CustomerUserDocument,
   CustomerAccountDocument,
   CustomerMembershipDocument,
@@ -138,6 +139,10 @@ export class StateStore {
    */
   get canonicalDrafts(): Collection<CanonicalDraftDocument> {
     return this.db.collection<CanonicalDraftDocument>('canonical_drafts');
+  }
+  /** Durable semantic edits — at most one per canonical draft. See `SemanticEditIntentDocument`. */
+  get semanticEditIntents(): Collection<SemanticEditIntentDocument> {
+    return this.db.collection<SemanticEditIntentDocument>('semantic_edit_intents');
   }
   /** Customer people, by exact external identity. See `CustomerUserDocument`. */
   get customerUsers(): Collection<CustomerUserDocument> {
@@ -327,6 +332,13 @@ export class StateStore {
     // simply sit outside the index.
     await this.canonicalDrafts.createIndexes([
       { key: { projectId: 1 }, unique: true, partialFilterExpression: { current: true }, name: 'projectId_1_currentDraft' },
+    ]);
+
+    // At most one semantic edit per exact canonical draft, ever — keyed on the
+    // draft alone, never on the patch, so two different edits of the same draft
+    // cannot both exist even if something got past the draft's claim.
+    await this.semanticEditIntents.createIndexes([
+      { key: { projectId: 1, sourceDraftId: 1 }, unique: true, name: 'projectId_1_sourceDraftId_1' },
     ]);
 
     // Customer identity and tenancy. Uniqueness here is the authority, not an

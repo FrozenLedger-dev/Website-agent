@@ -108,6 +108,8 @@ export interface Evaluation {
    * it adds no defect and blocks nothing yet.
    */
   browserRender: BrowserRenderReport | null;
+  /** The exact `test-report` artifact this evaluation wrote — its deterministic gate results. */
+  testReport: ArtifactRef;
   /**
    * The exact `screenshot-set` artifact this evaluation wrote — every capture of
    * the rendered build, bound to its subject — or null when nothing was
@@ -276,7 +278,7 @@ export async function evaluateSite(ctx: RunContext, subject: EvaluationSubject):
     });
   }
 
-  await deps.registry.put(facts.projectId, 'test-report', {
+  const testReport = await deps.registry.put(facts.projectId, 'test-report', {
     passed: compiled.ok && gateRun.passed,
     ranAt: new Date().toISOString(),
     findings: gateRun.findings,
@@ -370,6 +372,7 @@ export async function evaluateSite(ctx: RunContext, subject: EvaluationSubject):
     compiled,
     gateRun,
     browserRender,
+    testReport,
     screenshotSet: screenshots?.ref ?? null,
     visualQualityReview,
     sources,

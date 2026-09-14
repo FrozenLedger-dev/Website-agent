@@ -7,6 +7,7 @@
  * against its content hash — never "the latest model".
  */
 import { EDITABLE_SITE_MODEL_ARTIFACT, EditableSiteModel, type ArtifactRef, type SemanticPatch } from '@statxai/contracts';
+import type { ClientSession } from 'mongodb';
 import type { ArtifactRegistry } from '@statxai/workspace';
 import { applySemanticPatch } from './patch.js';
 
@@ -23,10 +24,12 @@ export async function recordEditableSiteModel(
   registry: ArtifactRegistry,
   projectId: string,
   model: EditableSiteModel,
+  /** Record inside the caller's transaction, when the version belongs to a larger atomic decision. */
+  session?: ClientSession,
 ): Promise<{ readonly ref: ArtifactRef; readonly model: EditableSiteModel }> {
   const valid = EditableSiteModel.parse(model);
   if (valid.projectId !== projectId) throw new Error(`editable site model for "${valid.projectId}" cannot be recorded under "${projectId}"`);
-  const ref = await registry.put(projectId, EDITABLE_SITE_MODEL_ARTIFACT, valid);
+  const ref = await registry.put(projectId, EDITABLE_SITE_MODEL_ARTIFACT, valid, session);
   return { ref, model: valid };
 }
 

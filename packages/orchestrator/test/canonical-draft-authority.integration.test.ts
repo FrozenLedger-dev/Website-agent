@@ -37,7 +37,10 @@ import {
   CanonicalDraftConclusionRefused,
   assertCanonicalDraftPromotionMarker,
   canonicalDraftId,
+  CanonicalDraftInOperation,
   claimCanonicalDraft,
+  handOffCanonicalDraft,
+  resolveCanonicalDraftAuthority,
   concludeCanonicalDraft,
   loadCurrentCanonicalDraft,
   releaseCanonicalDraftClaim,
@@ -896,5 +899,95 @@ describe('release tip fence', () => {
     expect(calls).toEqual([]);
     expect(await store.releasePublications.countDocuments({ projectId: p.projectId })).toBe(0);
     expect((await loadCurrentCanonicalDraft(store, p.projectId))?._id).toBe(draft._id);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Handoff to a building operation, and supersession
+// ---------------------------------------------------------------------------
+
+describe('a draft handed to its operation', () => {
+  const E = { kind: 'semantic_edit' as const, operationId: `semantic-edit-${'a'.repeat(64)}` };
+  const F = { kind: 'semantic_edit' as const, operationId: `semantic-edit-${'b'.repeat(64)}` };
+
+  async function handedOff() {
+    const { p, b0 } = await withPromotedRoot();
+    const { draft } = await conclude(p, b0);
+    const handOff = (claimant: typeof E) => store.withTransaction((session) => handOffCanonicalDraft({ store, projectId: p.projectId, expectedDraftId: draft._id, expectedCanonicalBindingId: b0._id, claimant }, session));
+    return { p, b0, draft, handOff };
+  }
+
+  it('claims, reactivates the same root and leaves draft in one step — replayable by its claimant, refused to anyone else', async () => {
+    const { p, b0, draft, handOff } = await handedOff();
+    const bindings = await store.frontendBackendBuildBindings.countDocuments({ projectId: p.projectId });
+
+    expect((await handOff(E)).replayed).toBe(false);
+    expect(await store.canonicalDrafts.findOne({ _id: draft._id })).toMatchObject({ current: true, status: 'claimed', claim: E });
+    expect((await activeRootOf(p.projectId))?._id).toBe(b0._id);
+    expect(await stateOf(p.projectId)).toBe('building');
+    expect(await store.frontendBackendBuildBindings.countDocuments({ projectId: p.projectId })).toBe(bindings);
+    expect(await resolveCanonicalDraftAuthority(store, p.projectId)).toMatchObject({ state: 'handed_off', draft: { _id: draft._id }, tip: { _id: b0._id } });
+    await expect(loadCurrentCanonicalDraft(store, p.projectId)).rejects.toBeInstanceOf(CanonicalDraftInOperation);
+
+    expect((await handOff(E)).replayed).toBe(true);
+    await expect(handOff(F)).rejects.toMatchObject({ reason: 'claimed_by_another' });
+    await expect(claimCanonicalDraft({ store, projectId: p.projectId, expectedDraftId: draft._id, expectedCanonicalBindingId: b0._id, claimant: { kind: 'release', operationId: 'release-1' } })).rejects.toMatchObject({ reason: 'claimed_by_another' });
+    await expect(releaseCanonicalDraftClaim({ store, projectId: p.projectId, expectedDraftId: draft._id, expectedCanonicalBindingId: b0._id, claimant: E })).rejects.toMatchObject({ reason: 'handed_off' });
+    await expect(resolvePostPromotionRecovery({ store, registry, workspacesRoot, projectId: p.projectId, runIntentHash: 'intent' })).rejects.toMatchObject({ name: 'ActiveContinuationSemanticEditOwned', intentId: E.operationId });
+  });
+
+  it('only an operation that builds may take a handoff, and a fresh root is still refused', async () => {
+    const { p, handOff } = await handedOff();
+    await expect(handOff({ kind: 'release', operationId: 'release-1' } as never)).rejects.toBeInstanceOf(CanonicalDraftClaimantInvalid);
+    expect(await stateOf(p.projectId)).toBe('draft');
+    await handOff(E);
+    await expect(p.prepare('fresh')).rejects.toBeInstanceOf(FrontendBackendCanonicalDraftOwnsProject);
+  });
+
+  it.each([
+    ['a lineage tip two generations on', 'two'],
+    ['a root that is not the draft root', 'root'],
+    ['a claimed draft left in `draft` state with an active lineage', 'state'],
+  ] as const)('rejects %s', async (_label, shape) => {
+    const { p, b0, draft, handOff } = await handedOff();
+    await handOff(E);
+    if (shape === 'two') {
+      const b1 = await p.promote(await p.prepare('1', { predecessorBindingId: b0._id, provenance: replan(1) }));
+      await p.prepare('2', { predecessorBindingId: b1._id, provenance: replan(2) });
+    } else if (shape === 'root') {
+      await rewriteDraft((await store.canonicalDrafts.findOne({ _id: draft._id }))!, { lineageRootBindingId: 'frontend-backend-build-other' });
+    } else {
+      await store.projects.updateOne({ _id: p.projectId }, { $set: { state: 'draft' } });
+    }
+    await expect(resolveCanonicalDraftAuthority(store, p.projectId)).rejects.toBeInstanceOf(CanonicalDraftAuthorityCorrupt);
+  });
+
+  it('the next draft supersedes exactly the handed-off draft, by exactly its claimant — atomically, and replayably', async () => {
+    const { p, b0, draft, handOff } = await handedOff();
+    await handOff(E);
+    const b1 = await p.promote(await p.prepare('1', { predecessorBindingId: b0._id, provenance: replan(1) }));
+    const next = (over: Partial<Parameters<typeof concludeCanonicalDraft>[0]> = {}) =>
+      concludeCanonicalDraft({ store, workspace: p.ws, projectId: p.projectId, canonicalBindingId: b1._id, promotion: { promotionId: b1.promotionId, promotionCommitSha: b1.promotionCommitSha }, supersede: { draftId: draft._id, claimant: E }, ...over });
+
+    await expect(conclude(p, b1)).rejects.toThrow(/already exists while a lineage is active/);
+    await expect(next({ supersede: { draftId: draft._id, claimant: F } })).rejects.toBeInstanceOf(CanonicalDraftConclusionRefused);
+    await expect(next({ supersede: { draftId: 'canonical-draft-other', claimant: E } })).rejects.toBeInstanceOf(CanonicalDraftConclusionRefused);
+    await expect(next({ completeInTransaction: async () => { throw new Error('injected: completion failed'); } })).rejects.toThrow('injected');
+    expect(await store.canonicalDrafts.findOne({ _id: draft._id })).toMatchObject({ current: true, status: 'claimed' });
+    expect((await activeRootOf(p.projectId))?._id).toBe(b0._id);
+
+    const completions: boolean[] = [];
+    const { draft: d1 } = await next({ completeInTransaction: async (_s, _d, replayed) => void completions.push(replayed) });
+    expect(d1).toMatchObject({ current: true, status: 'available', canonicalBindingId: b1._id });
+    const d0 = (await store.canonicalDrafts.findOne({ _id: draft._id }))!;
+    expect(d0).toMatchObject({ status: 'claimed', claim: E, supersededByDraftId: d1._id });
+    expect(d0).not.toHaveProperty('current');
+    expect(await stateOf(p.projectId)).toBe('draft');
+    expect(await activeRootOf(p.projectId)).toBeNull();
+
+    const again = await next({ completeInTransaction: async (_s, _d, replayed) => void completions.push(replayed) });
+    expect(again).toMatchObject({ replayed: true, draft: { _id: d1._id } });
+    expect(completions).toEqual([false, true]);
+    expect(await store.canonicalDrafts.countDocuments({ projectId: p.projectId, current: true })).toBe(1);
   });
 });
