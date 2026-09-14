@@ -527,6 +527,7 @@ describe('recovery refuses without destroying unfinished work', () => {
       resolvePostPromotionRecovery({
         store, registry, workspacesRoot, projectId,
         runIntentHash: b0!.runIntentHash,
+        completionTarget: 'release',
       }),
     ).rejects.toBeInstanceOf(ActiveContinuationNotPromoted);
   });

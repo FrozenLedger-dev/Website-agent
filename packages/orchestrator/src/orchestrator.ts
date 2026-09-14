@@ -17,6 +17,8 @@ import {
   SitePlan,
   ReplanSuccessorProvenance,
   VisualRefinementSuccessorProvenance,
+  normalizeRunCompletionTarget,
+  type RunCompletionTarget,
   type AgentTier,
   type ArtifactRef,
   type BrowserRenderAuthority,
@@ -36,6 +38,7 @@ import { JobEngine } from '@statxai/job-engine';
 import {
   decideTerminal,
   isReleaseBlocked,
+  releaseReadinessRefusal,
   terminalForRefusal,
   type ReplanScope,
 } from '@statxai/policy-engine';
@@ -62,6 +65,7 @@ import {
 } from './job-lifecycle/frontend-backend.js';
 import { createFrontendBackendJobSpec } from './job-specs/frontend-backend.js';
 import { authorizeVisualRefinement } from './visual-refinement/authorize.js';
+import { concludeCanonicalDraft } from './canonical-draft/authority.js';
 import { FRONTEND_BACKEND_INPUT } from './job-handlers/frontend-backend.js';
 import { modelFromPlan, reconcileModelWithPlan } from './site-model/materialize.js';
 import { recordEditableSiteModel, resolveEditableSiteModel } from './site-model/persist.js';
@@ -71,6 +75,7 @@ import {
   finalizeBindingPromoted,
   findActivePreparedBinding,
   FrontendBackendBuildNotPublishable,
+  readRunCompletionTarget,
   releaseActiveLineage,
   parseStoredJobSpec,
   prepareFrontendBackendBuildBinding,
@@ -138,6 +143,25 @@ export interface RunOptions {
    * the canonical project's own Git tree would leave temporary files in it.
    */
   validationWorkspacesRoot?: string;
+  /**
+   * How the run ends when it succeeds. Omitted means `release`, exactly as every
+   * run always has. `draft` brings the site to release readiness through the
+   * same pipeline, then concludes its exact final build as the project's
+   * available canonical draft instead of seeking release. `job_lifecycle` only:
+   * a draft is lineage authority, which `legacy_direct` does not have.
+   */
+  completionTarget?: RunCompletionTarget;
+}
+
+/** The run asked for a completion it cannot honestly provide. Refused before anything happens. */
+export class RunCompletionTargetUnsupported extends Error {
+  constructor(
+    readonly projectId: string,
+    detail: string,
+  ) {
+    super(`project "${projectId}": run completion target refused — ${detail}`);
+    this.name = 'RunCompletionTargetUnsupported';
+  }
 }
 
 export async function runProject(options: RunOptions): Promise<RunResult> {
@@ -145,6 +169,11 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   const autonomyMode = options.autonomyMode ?? 'full_autonomous';
   const frontendBackendExecutionMode: FrontendBackendExecutionMode =
     options.frontendBackendExecutionMode ?? 'legacy_direct';
+  // Part of the run's intent from the first instruction; unknown values are refused, never coerced.
+  const completionTarget: RunCompletionTarget = normalizeRunCompletionTarget(options.completionTarget);
+  if (completionTarget === 'draft' && frontendBackendExecutionMode !== 'job_lifecycle') {
+    throw new RunCompletionTargetUnsupported(projectId, 'a draft is canonical build-lineage authority, which only job_lifecycle runs hold');
+  }
   if (frontendBackendExecutionMode === 'job_lifecycle' && !options.validationWorkspacesRoot) {
     throw new Error(
       'runProject: frontendBackendExecutionMode "job_lifecycle" requires validationWorkspacesRoot.',
@@ -279,7 +308,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
       say({ phase: 'discover', detail: validated.reason, level: 'fail' });
       discovery = { ok: false, outcome: 'intake_insufficient' };
     } else {
-      const runIntentHash = computeRunIntentHash({ projectId, profile: validated.profile });
+      const runIntentHash = computeRunIntentHash({ projectId, profile: validated.profile, completionTarget });
       // A canonical draft — concluded, or handed to a semantic edit building from
       // it — owns the project outright; no run resumes, recovers or discovers over it.
       await assertNoCanonicalDraftOwnsRun(store, projectId);
@@ -312,6 +341,9 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         // trusted.
         const spec = parseStoredJobSpec(existingBinding);
         verifyBindingConsistency(existingBinding, spec);
+        if (readRunCompletionTarget(existingBinding) !== completionTarget) {
+          throw new FrontendBackendBuildBindingConflict(projectId, existingBinding.runIntentHash, runIntentHash);
+        }
 
         // Exact bound refs, never "latest" — `resolve` throws if either is
         // missing, which is a platform/control-plane fault, not something
@@ -348,7 +380,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         // discovery, whose first act is to delete the project document and its
         // budgets — and answered from durable lineage authority, never from
         // the run history.
-        recovered = await resolvePostPromotionRecovery({ store, registry, workspacesRoot, projectId, runIntentHash });
+        recovered = await resolvePostPromotionRecovery({ store, registry, workspacesRoot, projectId, runIntentHash, completionTarget });
 
         if (recovered) {
           say({ phase: 'discover', detail: 'Validating intake against the canonical schema' });
@@ -528,13 +560,14 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         });
         binding = await prepareFrontendBackendBuildBinding(store, {
           projectId,
-          runIntentHash: computeRunIntentHash({ projectId, profile }),
+          runIntentHash: computeRunIntentHash({ projectId, profile, completionTarget }),
           businessProfileRef,
           sitePlanRef: initialSitePlanRef,
           jobSpec: spec,
           // Canonical HEAD *before* the specification commit below — `null`
           // is a legitimate first-ever commit, not a placeholder.
           specificationBaseCommit: await workspace.currentCommit(),
+          completionTarget,
         });
       }
 
@@ -655,6 +688,42 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
   };
 
 
+  /**
+   * Conclude the exact canonical build this run holds as the project's available
+   * draft — through canonical draft authority, which re-proves the active
+   * lineage, its structural tip, the promotion and the absence of any release.
+   * A draft a customer will edit must carry an exact editable site model.
+   */
+  const concludeDraftRun = async (): Promise<RunResult> => {
+    if (frontendBackendExecutionMode !== 'job_lifecycle' || !canonicalBuild) {
+      throw new RunCompletionTargetUnsupported(projectId, 'this run holds no canonical build to conclude as a draft');
+    }
+    const editableSiteModel = canonicalBuild.jobSpec.inputs[FRONTEND_BACKEND_INPUT.editableSiteModel];
+    if (!editableSiteModel?.contentHash) {
+      throw new RunCompletionTargetUnsupported(projectId, `canonical build "${canonicalBuild._id}" pins no exact editable site model, so it cannot be an editable draft`);
+    }
+    const { draft } = await concludeCanonicalDraft({
+      store,
+      workspace,
+      projectId,
+      canonicalBindingId: canonicalBuild._id,
+      promotion: canonicalPromotion ?? { promotionId: canonicalBuild.promotionId, promotionCommitSha: canonicalBuild.promotionCommitSha },
+    });
+    say({ phase: 'approve', detail: `Concluded canonical draft ${draft._id} of build ${draft.canonicalBindingId}`, level: 'ok' });
+    return {
+      ...(await concluded(ctx(), 'draft', undefined)),
+      completionTarget,
+      draft: {
+        canonicalDraftId: draft._id,
+        lineageRootBindingId: draft.lineageRootBindingId,
+        canonicalBindingId: draft.canonicalBindingId,
+        promotionId: draft.promotionId,
+        promotionCommitSha: draft.promotionCommitSha,
+        editableSiteModel,
+      },
+    };
+  };
+
   while (true) {
     const evaluation = await evaluateSite(ctx(), {
       sitePlan: currentSitePlanRef,
@@ -723,7 +792,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
 
           const successor = await prepareFrontendBackendBuildBinding(store, {
             projectId,
-            runIntentHash: computeRunIntentHash({ projectId, profile }),
+            runIntentHash: computeRunIntentHash({ projectId, profile, completionTarget }),
             businessProfileRef: canonicalBuild.businessProfile,
             sitePlanRef: canonicalBuild.sitePlan,
             jobSpec: intent.jobSpec,
@@ -785,6 +854,24 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
           // Fresh gates, render, screenshots and review of the refined build — never the predecessor's.
           continue;
         }
+      }
+
+      /**
+       * Release-ready: nothing blocking, no replan or repair outstanding, and no
+       * further refinement authorised. A draft-targeted run ends here, before any
+       * release-specific authority — no release judgement, authorisation,
+       * publication or manifest — held to exactly the deterministic readiness a
+       * release is, and concluding exactly the canonical build this evaluation
+       * measured.
+       */
+      if (completionTarget === 'draft') {
+        const unready = releaseReadinessRefusal({ buildSucceeded: compiled.ok, blockingDefects: 0, gatesPassed: gateRun.passed });
+        if (unready) {
+          say({ phase: 'approve', detail: `Draft not concluded: ${unready}`, level: 'fail' });
+          progress.terminalDecision = 'mark_blocked';
+          break;
+        }
+        return concludeDraftRun();
       }
 
       /**
@@ -969,7 +1056,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         });
         const successor = await prepareFrontendBackendBuildBinding(store, {
           projectId,
-          runIntentHash: computeRunIntentHash({ projectId, profile }),
+          runIntentHash: computeRunIntentHash({ projectId, profile, completionTarget }),
           businessProfileRef,
           sitePlanRef: revised.sitePlanRef,
           jobSpec: successorSpec,

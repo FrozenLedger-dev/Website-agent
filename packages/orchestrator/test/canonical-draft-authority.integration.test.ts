@@ -715,7 +715,7 @@ describe('claiming a draft', () => {
 // ---------------------------------------------------------------------------
 
 describe('Phase 5q and run start', () => {
-  const recover = (projectId: string) => resolvePostPromotionRecovery({ store, registry, workspacesRoot, projectId, runIntentHash: 'intent' });
+  const recover = (projectId: string) => resolvePostPromotionRecovery({ store, registry, workspacesRoot, projectId, runIntentHash: 'intent', completionTarget: 'release' });
 
   it('a valid draft is concluded, not interrupted: reported, with nothing resumed or written', async () => {
     const { p, b0 } = await withPromotedRoot();
@@ -933,7 +933,7 @@ describe('a draft handed to its operation', () => {
     await expect(handOff(F)).rejects.toMatchObject({ reason: 'claimed_by_another' });
     await expect(claimCanonicalDraft({ store, projectId: p.projectId, expectedDraftId: draft._id, expectedCanonicalBindingId: b0._id, claimant: { kind: 'release', operationId: 'release-1' } })).rejects.toMatchObject({ reason: 'claimed_by_another' });
     await expect(releaseCanonicalDraftClaim({ store, projectId: p.projectId, expectedDraftId: draft._id, expectedCanonicalBindingId: b0._id, claimant: E })).rejects.toMatchObject({ reason: 'handed_off' });
-    await expect(resolvePostPromotionRecovery({ store, registry, workspacesRoot, projectId: p.projectId, runIntentHash: 'intent' })).rejects.toMatchObject({ name: 'ActiveContinuationSemanticEditOwned', intentId: E.operationId });
+    await expect(resolvePostPromotionRecovery({ store, registry, workspacesRoot, projectId: p.projectId, runIntentHash: 'intent', completionTarget: 'release' })).rejects.toMatchObject({ name: 'ActiveContinuationSemanticEditOwned', intentId: E.operationId });
   });
 
   it('only an operation that builds may take a handoff, and a fresh root is still refused', async () => {

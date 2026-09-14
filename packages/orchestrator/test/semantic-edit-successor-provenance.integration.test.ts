@@ -306,7 +306,7 @@ describe('Phase 5q', () => {
     await store.frontendBackendBuildBindings.updateMany({ projectId }, { $set: { specificationCommitSha: 'e'.repeat(40) } });
     return b1;
   }
-  const recover = (projectId: string) => resolvePostPromotionRecovery({ store, registry: {} as ArtifactRegistry, workspacesRoot: '/nonexistent', projectId, runIntentHash: 'intent' }).catch((e: unknown) => e);
+  const recover = (projectId: string) => resolvePostPromotionRecovery({ store, registry: {} as ArtifactRegistry, workspacesRoot: '/nonexistent', projectId, runIntentHash: 'intent', completionTarget: 'release' }).catch((e: unknown) => e);
 
   it('a promoted semantic-edit tip with no draft handed to its edit is proven structurally, then fails closed — never continued as another kind', async () => {
     const b1 = await promotedChain('proj_sem_5q_edit', edit(1, 2), 2);

@@ -7499,6 +7499,121 @@ job. Nothing refines, adjudicates, approves, releases or deploys.
   because the coordinator never re-executes an accepted, fenced job.
 - **Tightened after a first survival:** four tests (7, 13, 18, 21).
 
+## Draft-targeted run completion — **DONE**
+
+**Why.** Semantic editing starts from an available canonical draft, but nothing in
+production created the first one: a successful run always sought release. A run
+can now target a draft instead.
+
+**Gate findings.**
+
+- **Run intent:** the run's immutable intent was
+  `runIntentHash = hash(projectId, profile)`, stored on every binding. Recovery
+  matched the incoming request against the root and tip, then always sought
+  release. Completion behaviour was implicit.
+- **Human review:** `awaiting_human_review` is produced only by release
+  authorisation, meaning Sol's release recommendation or an autonomy mode that
+  needs a person to release. That comes after adjudication, repair, replan and
+  visual refinement have settled.
+- **Deterministic readiness:** build, blocking defects and gates were checked
+  inside `authorizeRelease`.
+- **legacy_direct:** it holds no lineage authority.
+
+**Contract.**
+
+- **Type:** `RunCompletionTarget = 'release' | 'draft'`, strict.
+- **Default:** `normalizeRunCompletionTarget` treats absence as `release` and
+  refuses anything else.
+- **Placement:** `RunOptions.completionTarget` is normalised before intake is
+  validated.
+
+**Durability.**
+
+- **Run intent:** `computeRunIntentHash` adds `completionTarget: 'draft'` only for
+  drafts, so every release-targeted and historical hash is byte-identical. Two
+  otherwise identical runs with different targets are different intents.
+- **Root binding:** the root records `completionTarget: 'draft'` at preparation,
+  before any build work. Absence means release, with no migration. Successors
+  record nothing and belong to their root's run.
+- **Recovery:** `readRunCompletionTarget` reads the root. Phase 5q refuses a
+  request whose target differs from the root's, and a draft-targeted lineage that
+  has a release publication.
+
+**Branch point.** Inside the evaluate loop, once nothing blocking remains and no
+further visual refinement is authorised, immediately before Sol is asked to judge
+release.
+
+- **Readiness:** a draft run applies `releaseReadinessRefusal`, the same
+  deterministic build, blocking-defect and gate rules release authorisation now
+  shares.
+- **Not ready:** it is blocked (`mark_blocked`, lineage released), exactly as a
+  release refusal would be.
+- **Ready:** it concludes the run's exact `canonicalBuild` and promotion through
+  `concludeCanonicalDraft`. The build must pin an exact editable site model, or
+  the run fails closed.
+
+**Skipped in draft mode.** Only release-specific steps: Sol's release
+recommendation, release authorisation, publication, provider deployment and the
+manifest.
+
+**Kept.** Planning, build, validation, promotion, evaluation, screenshots, visual
+review, adjudication, repair, replan and bounded refinement.
+
+**Human review.** Human review is release authority. A draft run never
+authorises a release, so it never parks for one. Releasing a draft later must
+pass release authorisation. A lineage already parked for review is still refused
+by Phase 5q, and conclusion refuses that state.
+
+**Result.** `outcome: 'draft'` with `completionTarget` and `draft`, which carries:
+
+- `canonicalDraftId`
+- `lineageRootBindingId`
+- `canonicalBindingId`
+- `promotionId`
+- `promotionCommitSha`
+- the exact `editableSiteModel`
+
+`RunStatus` gains `draft`.
+
+**Recovery and replay.**
+
+- **Crash after final promotion:** recovery re-evaluates and concludes the exact
+  tip, and never releases.
+- **Asking the crashed project to release:** refused as a different intent.
+- **After conclusion:** every run stops at the concluded draft
+  (`ActiveContinuationConcludedDraft`). There is no second draft and no new root.
+- **Malformed draft:** fails closed.
+
+**legacy_direct.** A draft target is refused with `RunCompletionTargetUnsupported`
+before anything is created.
+
+**Console.** Unchanged; omitted means release.
+
+**Tests.**
+
+- **`draft-target-run.integration.test.ts` (14):**
+  - the B0 draft;
+  - generated D0 consumed by `applySemanticEdit` to produce D1;
+  - refinement concluding B2, and replan concluding B1;
+  - not-ready and review-unavailable runs blocked;
+  - legacy refusal and unknown-target refusal;
+  - omitted and explicit release unchanged, with the historical hash;
+  - human review parking;
+  - crash recovery, including the refused release switch;
+  - a parked lineage;
+  - a malformed draft;
+  - a mismatched resume.
+- **`draft-target-run.test.ts` (9):** contract, hash, reader, readiness, and
+  structural pins.
+- **Pin updated:** the canonical-draft boundary pin now allows exactly one draft
+  conclusion in `runProject`.
+- **Updated call sites:** direct `resolvePostPromotionRecovery` callers in tests
+  pass `completionTarget`.
+
+**Mutations: 19 of 19 killed.** Removing the run-start draft guard survived the
+draft-run suites, because Phase 5q independently refuses a concluded draft. It is
+killed by the guard's own semantic-edit and draft boundary suites.
+
 ## Phases 6–17
 
 Not started.

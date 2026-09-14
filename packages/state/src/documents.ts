@@ -363,6 +363,14 @@ export interface FrontendBackendBuildBindingDocument {
    */
   activeLineage?: true;
   /**
+   * How the run this lineage answers ends when it succeeds — recorded on the
+   * ROOT binding only, at preparation, before any build work, and never changed.
+   * Present only as `draft`; absent means `release`, which is what every binding
+   * written before this existed means. Recovery reads it here rather than from
+   * the caller, the environment or the project's state.
+   */
+  completionTarget?: 'draft';
+  /**
    * Operator evidence, set only once `status` becomes `abandoned` (Phase
    * 5m) — all three together, never individually. Optional, not
    * `| null`-defaulted: a binding written before Phase 5m existed simply

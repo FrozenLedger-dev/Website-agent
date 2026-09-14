@@ -176,8 +176,9 @@ describe('Phase 5q and run start', () => {
     expect(recover).toBeLessThan(discoveries[0]!);
     expect(legacy).toBeGreaterThan(-1);
     expect(legacy).toBeLessThan(discoveries[1]!);
-    // No production run concludes, claims or supersedes a draft yet.
-    expect(orchestrator).not.toMatch(/concludeCanonicalDraft|claimCanonicalDraft|releaseCanonicalDraftClaim/);
+    // A run concludes a draft in exactly one place — a draft-targeted run's completion — and never claims or releases one.
+    expect(orchestrator.match(/concludeCanonicalDraft\(/g)).toHaveLength(1);
+    expect(orchestrator).not.toMatch(/claimCanonicalDraft|releaseCanonicalDraftClaim|handOffCanonicalDraft/);
   });
 
   it('a fresh root is refused while a draft is current', async () => {

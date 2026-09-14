@@ -69,6 +69,23 @@ export function verifyAcknowledged(
 }
 
 /**
+ * The deterministic half of release readiness — whether the revision is in a
+ * state anything could be concluded from at all — or `null` when it is.
+ *
+ * Measured facts only: no recommendation, autonomy mode or deployment target.
+ * Shared by release authorisation and by a draft-targeted run's conclusion, so a
+ * draft is held to exactly the readiness a release is.
+ */
+export function releaseReadinessRefusal(evidence: Pick<ReleaseEvidence, 'buildSucceeded' | 'blockingDefects' | 'gatesPassed'>): string | null {
+  if (!evidence.buildSucceeded) return 'The build did not succeed, so there is nothing to release.';
+  if (evidence.blockingDefects > 0) {
+    return `${evidence.blockingDefects} blocking defect(s) remain; blocking severity is harness policy and is not waivable by a recommendation.`;
+  }
+  if (!evidence.gatesPassed) return 'The deterministic gates did not pass.';
+  return null;
+}
+
+/**
  * Decide whether a release happens.
  *
  * The order matters. Deterministic facts are checked before the recommendation
@@ -96,19 +113,8 @@ export function authorizeRelease(input: {
   });
 
   // -- Deterministic policy, checked before any recommendation ---------------
-  if (!evidence.buildSucceeded) {
-    return decided(false, 'block', 'The build did not succeed, so there is nothing to release.');
-  }
-  if (evidence.blockingDefects > 0) {
-    return decided(
-      false,
-      'block',
-      `${evidence.blockingDefects} blocking defect(s) remain; blocking severity is harness policy and is not waivable by a recommendation.`,
-    );
-  }
-  if (!evidence.gatesPassed) {
-    return decided(false, 'block', 'The deterministic gates did not pass.');
-  }
+  const unready = releaseReadinessRefusal(evidence);
+  if (unready) return decided(false, 'block', unready);
 
   // -- The recommendation ---------------------------------------------------
   if (!recommendation) {

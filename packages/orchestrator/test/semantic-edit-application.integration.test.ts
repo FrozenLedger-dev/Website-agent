@@ -730,7 +730,7 @@ describe('recovery from durable state', () => {
     const b1 = (await store.frontendBackendBuildBindings.findOne({ _id: intent.successorBindingId }))!;
     expect(b1.status).toBe('promoted');
 
-    const recovery = await resolvePostPromotionRecovery({ store, registry, workspacesRoot, projectId: d.projectId, runIntentHash: b1.runIntentHash }).catch((e: unknown) => e);
+    const recovery = await resolvePostPromotionRecovery({ store, registry, workspacesRoot, projectId: d.projectId, runIntentHash: b1.runIntentHash, completionTarget: 'release' }).catch((e: unknown) => e);
     expect(recovery).toBeInstanceOf(ActiveContinuationSemanticEditOwned);
     expect(recovery).toMatchObject({ draftId: d.d0._id, intentId: intent._id });
 
@@ -749,7 +749,7 @@ describe('recovery from durable state', () => {
     expect(deployed.calls + calls.approve + calls.refine).toBe(0);
 
     // Completed: recovery reports a concluded draft, and nothing resumes.
-    await expect(resolvePostPromotionRecovery({ store, registry, workspacesRoot, projectId: d.projectId, runIntentHash: b1.runIntentHash })).rejects.toBeInstanceOf(ActiveContinuationConcludedDraft);
+    await expect(resolvePostPromotionRecovery({ store, registry, workspacesRoot, projectId: d.projectId, runIntentHash: b1.runIntentHash, completionTarget: 'release' })).rejects.toBeInstanceOf(ActiveContinuationConcludedDraft);
     expect(await resumeSemanticEdit({ ...deps(), projectId: d.projectId })).toBeNull();
   });
 

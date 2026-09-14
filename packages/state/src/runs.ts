@@ -8,7 +8,7 @@
  */
 import type { StateStore } from './store.js';
 
-export type RunStatus = 'running' | 'released' | 'blocked' | 'intake_insufficient' | 'failed';
+export type RunStatus = 'running' | 'released' | 'draft' | 'blocked' | 'intake_insufficient' | 'failed';
 
 export interface RunDocument {
   _id: string;

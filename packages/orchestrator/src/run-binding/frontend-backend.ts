@@ -30,6 +30,8 @@
 import type { ClientSession } from 'mongodb';
 import * as z from 'zod/v4';
 import {
+  normalizeRunCompletionTarget,
+  type RunCompletionTarget,
   BuildSuccessorProvenance,
   SemanticEditSuccessorProvenance,
   JobSpec,
@@ -297,10 +299,33 @@ export class FrontendBackendBuildBindingMarkerCorrupt extends Error {
 export interface RunIntent {
   readonly projectId: string;
   readonly profile: BusinessProfile;
+  /**
+   * How the run ends when it succeeds. Part of the intent because it changes
+   * what the run's durable authority becomes: two otherwise identical requests
+   * that end at a release and at a draft are different requests. Absent means
+   * `release`.
+   */
+  readonly completionTarget?: RunCompletionTarget;
 }
 
 export function computeRunIntentHash(intent: RunIntent): string {
-  return contentHash({ projectId: intent.projectId, profile: intent.profile });
+  // A release-targeted intent hashes exactly as every intent always has, so no
+  // historical binding changes identity; only a draft target adds itself.
+  return normalizeRunCompletionTarget(intent.completionTarget) === 'draft'
+    ? contentHash({ projectId: intent.projectId, profile: intent.profile, completionTarget: 'draft' })
+    : contentHash({ projectId: intent.projectId, profile: intent.profile });
+}
+
+/**
+ * The completion target a lineage's root recorded: `draft` when it says so,
+ * `release` when it records nothing — historical bindings included. Anything
+ * else is corruption, never a guess.
+ */
+export function readRunCompletionTarget(root: FrontendBackendBuildBindingDocument): RunCompletionTarget {
+  const stored: unknown = (root as { completionTarget?: unknown }).completionTarget;
+  if (stored === undefined) return 'release';
+  if (stored === 'draft') return 'draft';
+  throw new FrontendBackendBuildBindingCorrupt(root._id, `completionTarget is ${JSON.stringify(stored)}, not "draft" or absent`);
 }
 
 interface BindingIdentity {
@@ -864,6 +889,11 @@ export interface PrepareBindingInput {
     readonly predecessorBindingId: string;
     readonly provenance: BuildSuccessorProvenance;
   };
+  /**
+   * How the run ends when it succeeds — recorded on a root only; a successor
+   * belongs to its root's run. Must agree with the `runIntentHash` given.
+   */
+  readonly completionTarget?: RunCompletionTarget;
 }
 
 function isDuplicateKeyError(error: unknown): boolean {
@@ -925,9 +955,17 @@ export async function prepareFrontendBackendBuildBinding(
     }
   }
 
+  const completionTarget = normalizeRunCompletionTarget(input.completionTarget);
+  if (input.lineage && input.completionTarget !== undefined) {
+    throw new FrontendBackendBuildSuccessorProvenanceInvalid(input.lineage.predecessorBindingId, "a successor belongs to its root's run and records no completion target of its own");
+  }
+
   const existing = await store.frontendBackendBuildBindings.findOne({ _id: bindingId });
   if (existing) {
     verifyBindingConsistency(existing, input.jobSpec, input.lineage, lineageRootBindingId);
+    if (!input.lineage && readRunCompletionTarget(existing) !== completionTarget) {
+      throw new FrontendBackendBuildBindingCorrupt(existing._id, `binding completes as "${readRunCompletionTarget(existing)}", not "${completionTarget}"`);
+    }
     return existing;
   }
 
@@ -971,7 +1009,7 @@ export async function prepareFrontendBackendBuildBinding(
             ? { replanDecision: input.lineage.provenance.replanDecision }
             : { successorProvenance: input.lineage.provenance }),
         }
-      : { activeLineage: true as const }),
+      : { activeLineage: true as const, ...(completionTarget === 'draft' ? { completionTarget: 'draft' as const } : {}) }),
     createdAt: now,
     updatedAt: now,
   };

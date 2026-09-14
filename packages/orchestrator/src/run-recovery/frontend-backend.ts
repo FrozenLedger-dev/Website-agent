@@ -32,7 +32,7 @@
  * workspace; or recover a build that has not promoted, which Phase 5k and the
  * job lifecycle already own.
  */
-import type { ArtifactRef, BusinessProfile, SitePlan } from '@statxai/contracts';
+import type { ArtifactRef, BusinessProfile, RunCompletionTarget, SitePlan } from '@statxai/contracts';
 import { BusinessProfile as BusinessProfileSchema, SitePlan as SitePlanSchema } from '@statxai/contracts';
 import type { ReleaseAuthorization } from '@statxai/policy-engine';
 import type {
@@ -57,6 +57,7 @@ import {
   findActiveLineageRoot,
   parseStoredJobSpec,
   readBuildLineage,
+  readRunCompletionTarget,
   verifyBindingConsistency,
 } from '../run-binding/frontend-backend.js';
 
@@ -218,6 +219,8 @@ export interface PostPromotionRecovery {
   readonly budgetUsed: BudgetUsage;
   /** The lineage's one release publication, already proven to publish `tip`, or `null`. */
   readonly publication: ReleasePublicationDocument | null;
+  /** How the recovered run ends, read from the lineage root — never from the caller. */
+  readonly completionTarget: RunCompletionTarget;
 }
 
 export interface ResolvePostPromotionRecoveryInput {
@@ -227,6 +230,8 @@ export interface ResolvePostPromotionRecoveryInput {
   readonly projectId: string;
   /** The incoming, already-validated request's run intent. */
   readonly runIntentHash: string;
+  /** The completion target the incoming request asked for; it must be the one the lineage recorded. */
+  readonly completionTarget: RunCompletionTarget;
 }
 
 /**
@@ -288,6 +293,12 @@ export async function resolvePostPromotionRecovery(
     if (member.runIntentHash !== input.runIntentHash) {
       throw new ActiveContinuationIntentConflict(projectId, root._id, member.runIntentHash, input.runIntentHash);
     }
+  }
+
+  // How the run ends is the root's durable record, never the caller's say-so.
+  const completionTarget = readRunCompletionTarget(root);
+  if (completionTarget !== input.completionTarget) {
+    throw new ActiveContinuationCorrupt(projectId, `lineage "${root._id}" completes as "${completionTarget}", but the request asked for "${input.completionTarget}"`);
   }
 
   if (tip.status !== 'promoted') {
@@ -364,6 +375,9 @@ export async function resolvePostPromotionRecovery(
 
   // The lineage's release, if it has one, must publish exactly this build.
   const publication = await findReleasePublicationForLineage(store, projectId, root._id);
+  if (publication && completionTarget === 'draft') {
+    throw new ActiveContinuationCorrupt(projectId, `draft-targeted lineage "${root._id}" has release publication "${publication._id}"`);
+  }
   if (publication) {
     assertReceiptMatchesCanonicalBuild(publication, {
       lineageRootBindingId: root._id,
@@ -392,6 +406,7 @@ export async function resolvePostPromotionRecovery(
     budgetLimits: budgetDoc.limits,
     budgetUsed: budgetDoc.used,
     publication,
+    completionTarget,
   };
 }
 

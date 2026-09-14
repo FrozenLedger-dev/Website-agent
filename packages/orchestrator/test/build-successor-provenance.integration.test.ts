@@ -340,7 +340,7 @@ describe('Phase 5q reads successor kind from the typed contract', () => {
     return { b0, b1 };
   }
   const recover = (projectId: string) =>
-    resolvePostPromotionRecovery({ store, registry: {} as ArtifactRegistry, workspacesRoot: '/nonexistent', projectId, runIntentHash: 'intent' });
+    resolvePostPromotionRecovery({ store, registry: {} as ArtifactRegistry, workspacesRoot: '/nonexistent', projectId, runIntentHash: 'intent', completionTarget: 'release' });
 
   it('a promoted visual-refinement tip passes the same structural proof and continues into ordinary recovery', async () => {
     const projectId = 'proj_succ_5q_visual';

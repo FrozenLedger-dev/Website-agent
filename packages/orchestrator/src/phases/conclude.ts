@@ -13,12 +13,24 @@
  */
 import type { RunContext, RunProgress, UsageByTier, UsageTotals } from '../run-context.js';
 import type { Defect } from '../defects.js';
-import type { DeploymentManifest, TerminalOutcome } from '@statxai/contracts';
+import type { ArtifactRef, DeploymentManifest, RunCompletionTarget, TerminalOutcome } from '@statxai/contracts';
 import type { FrontendBackendLifecycleResult } from '../job-lifecycle/frontend-backend.js';
 
 export interface RunResult {
   projectId: string;
-  outcome: 'released' | 'blocked' | 'intake_insufficient';
+  /** `draft`: a draft-targeted run concluded its final build as the project's available canonical draft. */
+  outcome: 'released' | 'draft' | 'blocked' | 'intake_insufficient';
+  /** How this run was asked to end. Absent on exits before the run's intent was established. */
+  completionTarget?: RunCompletionTarget;
+  /** Set exactly when `outcome === 'draft'`: the exact authority the run concluded into. */
+  draft?: {
+    canonicalDraftId: string;
+    lineageRootBindingId: string;
+    canonicalBindingId: string;
+    promotionId: string;
+    promotionCommitSha: string;
+    editableSiteModel: ArtifactRef;
+  };
   terminalDecision?: TerminalOutcome;
   /**
    * Set only when `outcome === 'blocked'` because the `job_lifecycle`
