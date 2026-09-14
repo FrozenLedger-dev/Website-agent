@@ -44,10 +44,13 @@ const CONTRACT = 'packages/contracts/src/build-lineage.ts';
 const STORE = 'packages/state/src/store.ts';
 
 describe('the successor reason is typed and exhaustive', () => {
-  it('the contract is a discriminated union of exactly replan and visual_refinement, each with exactly named refs', async () => {
+  it('the contract is a discriminated union of exactly replan, visual_refinement and semantic_edit, each with exactly named refs', async () => {
     const code = await src(CONTRACT);
-    expect(code).toMatch(/discriminatedUnion\('kind', \[ReplanSuccessorProvenance, VisualRefinementSuccessorProvenance\]\)/);
-    expect(code.match(/kind: z\.literal\('[a-z_]+'\)/g)).toEqual(["kind: z.literal('replan')", "kind: z.literal('visual_refinement')"]);
+    expect(code).toMatch(/discriminatedUnion\('kind', \[ReplanSuccessorProvenance, VisualRefinementSuccessorProvenance, SemanticEditSuccessorProvenance\]\)/);
+    expect(code.match(/kind: z\.literal\('[a-z_]+'\)/g)).toEqual(["kind: z.literal('replan')", "kind: z.literal('visual_refinement')", "kind: z.literal('semantic_edit')"]);
+    expect(code).toContain("const ExactEditableSiteModelRef = refNamed('editable-site-model').extend({ contentHash: z.string().regex(/^[a-f0-9]{64}$/) });");
+    expect(code).toMatch(/kind: z\.literal\('semantic_edit'\),\s*baseEditableSiteModel: ExactEditableSiteModelRef,\s*editableSiteModel: ExactEditableSiteModelRef,\s*\}\)/);
+    expect(code).toMatch(/z\s*\.strictObject\(\{\s*kind: z\.literal\('semantic_edit'\)/);
     expect(code).toContain("replanDecision: refNamed('replan-decision')");
     expect(code).toContain("visualQualityReview: refNamed('visual-quality-review')");
     expect(code).toContain("screenshotSet: refNamed('screenshot-set')");
@@ -117,14 +120,16 @@ describe('one lineage, whatever the reason', () => {
 });
 
 describe('Phase 5q owns every successor kind through the typed contract', () => {
-  it('recovery proves the tip from its own stored reason and refuses no well-formed successor kind', async () => {
+  it('recovery proves the tip from its own stored reason, then refuses exactly a semantic edit as not yet owned — never as corrupt or another kind', async () => {
     const code = await src(RECOVERY);
     const read = code.indexOf('readBuildLineage(tip)');
     const verified = code.indexOf('verifyBindingConsistency(', read);
+    const refused = code.indexOf('throw new ActiveContinuationSuccessorNotOwned(projectId, tip._id, position.provenance.kind);', verified);
     expect(read).toBeGreaterThan(-1);
     expect(verified).toBeGreaterThan(read);
-    expect(code).not.toContain('ActiveContinuationSuccessorNotOwned');
-    expect(code).not.toMatch(/provenance\.kind\s*!==\s*'replan'/);
+    expect(refused).toBeGreaterThan(verified);
+    expect(code.slice(verified, refused)).toContain("position.provenance.kind === 'semantic_edit'");
+    expect(code).not.toMatch(/provenance\.kind\s*!==\s*'(replan|visual_refinement)'/);
     // Recovery never builds: it evaluates what promoted and lets the run decide what comes next.
     expect(code).not.toMatch(/prepareFrontendBackendBuildBinding\(|refineSiteVisually\(|authorizeVisualRefinement\(/);
   });
@@ -143,5 +148,55 @@ describe('successors are prepared only by the two harness decisions that own the
       "provenance: VisualRefinementSuccessorProvenance.parse({ kind: 'visual_refinement'",
       "provenance: ReplanSuccessorProvenance.parse({ kind: 'replan'",
     ]);
+  });
+});
+
+describe('semantic-edit successors: identity only, and nothing that creates one', () => {
+  it('only the contract, the lineage reader and recovery know the semantic_edit kind — no production code creates one', async () => {
+    const knowers: string[] = [];
+    for (const file of await allProductionFiles()) {
+      if (/semantic_edit|SemanticEditSuccessorProvenance/.test(await src(file))) knowers.push(file);
+    }
+    // The state document only types the persisted field; it creates nothing.
+    expect(knowers.sort()).toEqual([CONTRACT, BINDING, RECOVERY, 'packages/state/src/documents.ts'].sort());
+    const binding = await src(BINDING);
+    expect(binding).not.toMatch(/kind: 'semantic_edit'/);
+    const orchestrator = await src('packages/orchestrator/src/orchestrator.ts');
+    expect(orchestrator).not.toMatch(/semantic|SemanticEdit/i);
+  });
+
+  it('no code decides a kind by elimination: not replan never means visual refinement, and a predecessor never means a kind', async () => {
+    for (const file of await allProductionFiles()) {
+      const code = await src(file);
+      expect(code, file).not.toMatch(/provenance\.kind\s*!==\s*'(replan|visual_refinement|semantic_edit)'\s*\?/);
+      expect(code, file).not.toMatch(/provenance\.kind\s*===\s*'replan'\s*\?[^:]*:\s*\{\s*visualQualityReview/);
+    }
+    const binding = await src(BINDING);
+    const reader = body(binding, 'export function readBuildLineage(', '\nfunction issues(');
+    expect(reader).toContain('TypedSuccessorProvenance.safeParse(binding.successorProvenance)');
+    expect(binding).toContain("const TypedSuccessorProvenance = z.discriminatedUnion('kind', [VisualRefinementSuccessorProvenance, SemanticEditSuccessorProvenance]);");
+  });
+
+  it('the semantic-edit reason carries no customer, session, patch, source or time — only the two exact models', async () => {
+    const contract = await src(CONTRACT);
+    const shape = body(contract, 'export const SemanticEditSuccessorProvenance = z', '  .refine(');
+    expect(shape.match(/^\s{4}(\w+):/gm)?.map((m) => m.trim())).toEqual(['kind:', 'baseEditableSiteModel:', 'editableSiteModel:']);
+    expect(shape).not.toMatch(/customer|session|account|email|patch|operation|source|commit|At\b|time/i);
+  });
+
+  it('no semantic-edit job origin, job spec, skill or customer editor route exists yet', async () => {
+    expect(await src('packages/contracts/src/job.ts')).not.toMatch(/semantic/i);
+    expect(await src('packages/orchestrator/src/job-specs/frontend-backend.ts')).not.toMatch(/semantic/i);
+    expect(await src('packages/agents/src/runtime.ts')).not.toMatch(/semantic|edit/i);
+    const routes: string[] = [];
+    const walk = async (dir: string): Promise<void> => {
+      for (const entry of await readdir(join(REPO, dir), { withFileTypes: true }).catch(() => [])) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) await walk(path);
+        else if (entry.name === 'route.ts' || entry.name === 'page.tsx') routes.push(path);
+      }
+    };
+    await walk('apps/customer/app');
+    expect(routes.sort()).toEqual(['apps/customer/app/api/auth/callback/route.ts', 'apps/customer/app/api/auth/login/route.ts', 'apps/customer/app/api/auth/logout/route.ts', 'apps/customer/app/api/auth/me/route.ts']);
   });
 });

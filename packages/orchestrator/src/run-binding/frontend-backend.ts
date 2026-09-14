@@ -28,8 +28,10 @@
  * this phase does not implement — see `docs/upgrade-status.md`).
  */
 import type { ClientSession } from 'mongodb';
+import * as z from 'zod/v4';
 import {
   BuildSuccessorProvenance,
+  SemanticEditSuccessorProvenance,
   JobSpec,
   ReplanSuccessorProvenance,
   VisualRefinementSuccessorProvenance,
@@ -577,13 +579,19 @@ export type BuildLineagePosition =
  *
  * - a replan successor stores `replanDecision` — how every replan successor,
  *   historical or new, has always been written;
- * - a visual-refinement successor stores `successorProvenance`.
+ * - a visual-refinement or semantic-edit successor stores its typed
+ *   `successorProvenance`, whose `kind` says which — never a replan.
+ *
+ * Nothing outside this reader tells the kinds apart.
  *
  * An initial build stores neither and no predecessor. Everything else — a
  * predecessor with no reason, a reason with no predecessor, both encodings at
  * once, a malformed ref or cycle — is corrupt, and nothing is guessed: no field
  * is preferred over another, and no reason is ever inferred from a predecessor.
  */
+/** The successor reasons stored in `successorProvenance`. A replan is never one of them: it has its own encoding. */
+const TypedSuccessorProvenance = z.discriminatedUnion('kind', [VisualRefinementSuccessorProvenance, SemanticEditSuccessorProvenance]);
+
 export function readBuildLineage(binding: FrontendBackendBuildBindingDocument): BuildLineagePosition {
   const hasReplan = binding.replanDecision !== undefined;
   const hasTyped = binding.successorProvenance !== undefined;
@@ -603,7 +611,7 @@ export function readBuildLineage(binding: FrontendBackendBuildBindingDocument): 
     return { kind: 'successor', predecessorBindingId: binding.predecessorBindingId, provenance: parsed.data };
   }
   if (hasTyped) {
-    const parsed = VisualRefinementSuccessorProvenance.safeParse(binding.successorProvenance);
+    const parsed = TypedSuccessorProvenance.safeParse(binding.successorProvenance);
     if (!parsed.success) throw new FrontendBackendBuildBindingCorrupt(binding._id, `successorProvenance is malformed: ${issues(parsed.error)}`);
     return { kind: 'successor', predecessorBindingId: binding.predecessorBindingId, provenance: parsed.data };
   }
@@ -624,11 +632,15 @@ function lineagePositionOf(binding: FrontendBackendBuildBindingDocument, rootId:
   }
 }
 
-/** Exact equality of two successor reasons: same kind, same refs, same cycle. */
+/** Exact equality of two successor reasons: same kind, and every authoritative field the same. */
 function sameProvenance(a: BuildSuccessorProvenance, b: BuildSuccessorProvenance): boolean {
   if (a.kind === 'replan' && b.kind === 'replan') return sameRef(a.replanDecision, b.replanDecision);
   if (a.kind === 'visual_refinement' && b.kind === 'visual_refinement') {
     return sameRef(a.visualQualityReview, b.visualQualityReview) && sameRef(a.screenshotSet, b.screenshotSet) && a.refinementCycle === b.refinementCycle;
+  }
+  if (a.kind === 'semantic_edit' && b.kind === 'semantic_edit') {
+    // Both refs always carry their content hash, so this is exact name, version and content.
+    return sameRef(a.baseEditableSiteModel, b.baseEditableSiteModel) && sameRef(a.editableSiteModel, b.editableSiteModel);
   }
   return false;
 }
@@ -690,7 +702,7 @@ export function verifyBindingConsistency(
         binding._id,
         stored.provenance.kind === 'replan'
           ? 'binding.replanDecision does not match the exact replan decision presented'
-          : 'binding.successorProvenance does not match the exact visual refinement presented',
+          : `binding.successorProvenance does not match the exact ${stored.provenance.kind} presented`,
       );
     }
   } else if (stored.kind === 'successor') {
@@ -734,6 +746,14 @@ export function verifyBindingConsistency(
   } else if (specSource || specReview || specSet) {
     throw new FrontendBackendBuildBindingCorrupt(binding._id, 'spec pins visual refinement inputs, but the binding is not a visual refinement successor');
   }
+
+  // A semantic-edit successor exists to implement exactly one model version: its spec pins that version, and no other.
+  if (stored.kind === 'successor' && stored.provenance.kind === 'semantic_edit') {
+    const specModel = spec.inputs[FRONTEND_BACKEND_INPUT.editableSiteModel];
+    if (!specModel || !sameRef(specModel, stored.provenance.editableSiteModel) || specModel.contentHash !== stored.provenance.editableSiteModel.contentHash) {
+      throw new FrontendBackendBuildBindingCorrupt(binding._id, 'a semantic edit successor\'s spec does not pin exactly the editable site model it implements');
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -750,7 +770,7 @@ export interface PrepareBindingInput {
   readonly specificationBaseCommit: string | null;
   /**
    * The exact canonical build this one replaces (Phase 5q0), and exactly why:
-   * a replan decision, or a visual refinement. Omitted entirely by an initial
+   * a replan decision, a visual refinement, or a semantic edit. Omitted entirely by an initial
    * build. There is no way to name a predecessor without a reason — a
    * predecessor never implies one.
    */
@@ -799,6 +819,25 @@ export async function prepareFrontendBackendBuildBinding(
   const lineageRootBindingId = input.lineage
     ? await inheritLineageRoot(store, input.projectId, input.lineage.predecessorBindingId)
     : bindingId;
+
+  /**
+   * A semantic edit names two exact model versions, and both are bound to builds
+   * here, from binding state alone: the base is exactly the model the predecessor
+   * build carries, and the result is exactly the model this build's spec pins.
+   * Whether the result really descends from the base through valid patches is the
+   * models' own provenance, proven by whoever resolves them — not by lineage.
+   */
+  if (input.lineage?.provenance.kind === 'semantic_edit') {
+    const { baseEditableSiteModel: base, editableSiteModel: result } = input.lineage.provenance;
+    const exact = (ref: ArtifactRef | undefined, expected: ArtifactRef) => ref !== undefined && sameRef(ref, expected) && ref.contentHash === expected.contentHash;
+    const predecessor = await store.frontendBackendBuildBindings.findOne({ _id: input.lineage.predecessorBindingId, projectId: input.projectId });
+    if (!exact(predecessor?.jobSpec.inputs[FRONTEND_BACKEND_INPUT.editableSiteModel], base)) {
+      throw new FrontendBackendBuildSuccessorProvenanceInvalid(input.lineage.predecessorBindingId, 'the base editable site model is not the exact model the predecessor build carries');
+    }
+    if (!exact(input.jobSpec.inputs[FRONTEND_BACKEND_INPUT.editableSiteModel], result)) {
+      throw new FrontendBackendBuildSuccessorProvenanceInvalid(input.lineage.predecessorBindingId, 'the spec does not pin exactly the editable site model the semantic edit implements');
+    }
+  }
 
   const existing = await store.frontendBackendBuildBindings.findOne({ _id: bindingId });
   if (existing) {

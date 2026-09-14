@@ -154,7 +154,8 @@ describe('builds and evaluations measure an exact pinned model', () => {
 
   it('no production code resolves a model by name or "latest"; every read is the exact, hash-checked ref', async () => {
     for (const file of await allProductionFiles()) {
-      if (file === CONTRACT || file === PERSIST) continue;
+      // The build-lineage contract may name the artifact a ref must be; it resolves nothing.
+      if (file === CONTRACT || file === PERSIST || file === 'packages/contracts/src/build-lineage.ts') continue;
       const code = await src(file);
       expect(code, file).not.toMatch(/EDITABLE_SITE_MODEL_ARTIFACT|'editable-site-model'/);
     }

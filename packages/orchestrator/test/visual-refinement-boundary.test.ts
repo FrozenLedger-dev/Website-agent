@@ -213,9 +213,11 @@ describe('no latest lookups for refinement authority', () => {
 });
 
 describe('Phase 5q owns the promoted refinement without replaying it', () => {
-  it('recovery refuses no successor kind and never builds or refines', async () => {
+  it('recovery owns replans and visual refinements, refuses only a semantic edit, and never builds or refines', async () => {
     const recovery = await src('packages/orchestrator/src/run-recovery/frontend-backend.ts');
-    expect(recovery).not.toMatch(/ActiveContinuationSuccessorNotOwned|refineSiteVisually|authorizeVisualRefinement|lifecycleCoordinator|prepareFrontendBackendBuildBinding/);
+    expect(recovery).not.toMatch(/refineSiteVisually|authorizeVisualRefinement|lifecycleCoordinator|prepareFrontendBackendBuildBinding/);
+    expect(recovery).not.toMatch(/provenance\.kind\s*(!==|===)\s*'(replan|visual_refinement)'/);
+    expect(recovery.match(/throw new ActiveContinuationSuccessorNotOwned\(/g)).toHaveLength(1);
     const contract = await src('packages/contracts/src/job.ts');
     expect(contract).toContain("z.strictObject({ kind: z.literal('visual_refine'), refinementCycle: z.number().int().min(1).max(1_000) }),");
   });

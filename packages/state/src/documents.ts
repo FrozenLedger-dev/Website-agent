@@ -5,7 +5,7 @@
  * authors and cannot influence (Appendix B: "state belongs to the platform,
  * reasoning belongs to the model").
  */
-import type { ArtifactRef, AutonomyMode, JobRecord, JobSpec, ReviewOutcomeRecord, VisualRefinementSuccessorProvenance, WorkerRole } from '@statxai/contracts';
+import type { ArtifactRef, AutonomyMode, JobRecord, JobSpec, ReviewOutcomeRecord, SemanticEditSuccessorProvenance, VisualRefinementSuccessorProvenance, WorkerRole } from '@statxai/contracts';
 import type { Binary } from 'mongodb';
 
 /** Project lifecycle, distinct from job lifecycle. */
@@ -315,7 +315,7 @@ export interface FrontendBackendBuildBindingDocument {
    * either encoding into one typed `BuildSuccessorProvenance` and refuses any
    * document that holds both, neither, or a malformed one.
    */
-  successorProvenance?: VisualRefinementSuccessorProvenance;
+  successorProvenance?: VisualRefinementSuccessorProvenance | SemanticEditSuccessorProvenance;
   /**
    * The exact root of the build lineage this binding belongs to.
    *

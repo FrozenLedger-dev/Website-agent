@@ -36,5 +36,28 @@ export const VisualRefinementSuccessorProvenance = z.strictObject({
 });
 export type VisualRefinementSuccessorProvenance = z.infer<typeof VisualRefinementSuccessorProvenance>;
 
-export const BuildSuccessorProvenance = z.discriminatedUnion('kind', [ReplanSuccessorProvenance, VisualRefinementSuccessorProvenance]);
+/** An exact editable-site-model version: its name, version and content hash, all three. */
+const ExactEditableSiteModelRef = refNamed('editable-site-model').extend({ contentHash: z.string().regex(/^[a-f0-9]{64}$/) });
+
+/**
+ * A successor that implements an exact editable-site-model revision.
+ *
+ * Build identity only — not a copy of the edit. `baseEditableSiteModel` is the
+ * exact model the predecessor build carries; `editableSiteModel` is the exact
+ * model this build must carry. Which patches lead from one to the other is the
+ * models' own immutable provenance, and who asked for the edit belongs to the
+ * edit's own record, never to build lineage.
+ */
+export const SemanticEditSuccessorProvenance = z
+  .strictObject({
+    kind: z.literal('semantic_edit'),
+    baseEditableSiteModel: ExactEditableSiteModelRef,
+    editableSiteModel: ExactEditableSiteModelRef,
+  })
+  .refine((value) => value.baseEditableSiteModel.version !== value.editableSiteModel.version, {
+    message: 'a semantic edit implements a different model version than its base',
+  });
+export type SemanticEditSuccessorProvenance = z.infer<typeof SemanticEditSuccessorProvenance>;
+
+export const BuildSuccessorProvenance = z.discriminatedUnion('kind', [ReplanSuccessorProvenance, VisualRefinementSuccessorProvenance, SemanticEditSuccessorProvenance]);
 export type BuildSuccessorProvenance = z.infer<typeof BuildSuccessorProvenance>;

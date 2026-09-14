@@ -166,10 +166,12 @@ describe('nothing beyond the authentication foundation', () => {
     }
   });
 
-  it('no new build successor kind was added', async () => {
+  it('build lineage carries no customer identity, and customer auth is independent of build lineage', async () => {
     const lineage = await src('packages/contracts/src/build-lineage.ts');
-    expect(lineage).toMatch(/discriminatedUnion\('kind', \[ReplanSuccessorProvenance, VisualRefinementSuccessorProvenance\]\)/);
-    expect(lineage).not.toMatch(/customer|semantic_edit/i);
+    expect(lineage).not.toMatch(/customer|session|account|email|cookie|principal/i);
+    for (const file of [...(await files(PKG)), ...(await files(APP))]) {
+      expect(await src(file), file).not.toMatch(/build-lineage|SuccessorProvenance|predecessorBindingId|semantic_edit/);
+    }
   });
 
   it('the tool gateway still registers exactly filesystem and test_runner', async () => {

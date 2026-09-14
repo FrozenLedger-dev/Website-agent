@@ -7060,6 +7060,142 @@ Two notes on how they were killed:
 UX, organisation UI, IdP logout (RP-initiated), semantic-edit successor
 provenance, and patch-to-build application.
 
+## Semantic-edit build successor provenance — **DONE**
+
+**Why.** A customer semantic edit will turn model M0 into M1, and M1 must become
+a successor build B1. That successor is neither a replan nor a visual
+refinement, so it needs its own typed reason before any edit lifecycle can exist.
+This slice records lineage identity only.
+
+**Gate findings.**
+
+- **Union:** it was `replan | visual_refinement`.
+- **Persistence:** replans persist as `replanDecision`, both legacy and new.
+  Visual refinements persist as typed `successorProvenance`.
+- **Reader:** `readBuildLineage` is the single reader. It parsed the typed field
+  only as a visual refinement, so a third kind read as corrupt.
+- **Other kind switches:** `sameProvenance` and the refinement-input consistency
+  check. The refinement cycle counter and triggering-review lookup only look for
+  `visual_refinement`.
+- **Phase 5q:** it owned every well-formed tip.
+- **Model provenance:** a semantic-patch model records its exact base ref,
+  operation and target, and every model ref carries its content hash. But a
+  future edit build may implement a patch chain M0→M1→M2, so the result's own
+  provenance base is not necessarily the model the predecessor build carried.
+  Proving that relation needs the artifact registry, which belongs to the
+  lifecycle, not to lineage.
+- **No-ops:** `commitSemanticPatch` always records a new version, so base and
+  result can never be the same version.
+- **Index:** the one-successor index is `{projectId, predecessorBindingId}`,
+  which is reason-independent.
+
+**Contract (`SemanticEditSuccessorProvenance`, strict).**
+
+- **Fields:** `{ kind: 'semantic_edit', baseEditableSiteModel, editableSiteModel }`.
+  Both are exact `editable-site-model` refs, and each requires a content hash.
+- **Version check:** base and result versions must differ.
+- **Why these fields:** this is the smallest shape that binds both models to
+  builds without resolving artifacts. It is build identity, not a copy of the
+  edit.
+- **Kept out:** no patch copy, customer, session, source or time.
+
+**Persistence.** A semantic edit persists in the typed `successorProvenance`
+encoding, discriminated by `kind`. `readBuildLineage` parses that field as
+`visual_refinement | semantic_edit` and nothing else. Replans keep their
+historical encoding. There is no migration, and visual refinement persistence is
+unchanged.
+
+**Consistency.**
+
+- **Equality:** `sameProvenance` compares both refs exactly: name, version and
+  hash.
+- **Preparation:** refused unless the base is exactly the model the predecessor
+  build's spec pins, and this build's spec pins exactly the result.
+- **Verification:** `verifyBindingConsistency` refuses a semantic-edit successor
+  whose stored spec does not pin exactly its result model.
+- **Presentation:** a semantic edit presented as an initial build is corrupt.
+
+**Lineage.**
+
+- **Root and slot:** the successor inherits the predecessor's root and takes no
+  active-lineage slot.
+- **One successor:** it shares the one successor slot, so a replan or refinement
+  blocks an edit and the reverse.
+- **Duplicate lookup:** it names the existing successor, whatever its reason.
+- **Mixed chains:** these derive one tip.
+- **Walk:** branch, cycle, foreign-root and unreachable rules are unchanged.
+
+**Phase 5q.** A promoted semantic-edit tip is proven structurally, then refused
+with `ActiveContinuationSuccessorNotOwned`. It is never reported as corrupt and
+never continued as another kind. Replan and visual-refinement tips are still
+owned.
+
+**Scope.** Nothing in production creates a semantic-edit successor. There is no
+semantic-edit JobOrigin, job spec, skill, editor route or patch-to-build path.
+
+**Tests.**
+
+- **`semantic-edit-successor-provenance.test.ts` (14):** the contract's valid
+  shape and every rejection, including carried customer, session, patch or time
+  data, unknown kinds, and cross-kind parsing.
+- **`semantic-edit-successor-provenance.integration.test.ts` (24):**
+  - preparation, root inheritance and reading back;
+  - replay and consistency, including mismatched model refs, other kinds and
+    presentation as an initial build;
+  - the base and result bound to builds;
+  - invalid reasons refused before anything is written;
+  - legacy root, legacy replan and visual refinement unchanged;
+  - six contradictory stored shapes;
+  - the slot in all four directions, with the exact rival named;
+  - a mixed replan → visual → edit → replan lineage;
+  - walk rejections, and an index-level branch;
+  - 5q refuses an edit tip as not owned while replan and refinement tips stay
+    owned.
+- **Structural updates** in the provenance, visual-refinement, editable-model and
+  customer-auth boundary suites:
+  - the three-kind union;
+  - only the contract, the reader, recovery and the document type know
+    `semantic_edit`;
+  - no kind decided by elimination;
+  - reason fields limited to the two models;
+  - no edit JobOrigin, spec, skill or route;
+  - build lineage free of customer identity, and customer auth independent of it.
+
+**Mutations: 20 of 20 killed.** Each ran against the semantic-edit contract,
+provenance-boundary and integration suites. Sources were restored byte-identical
+after each.
+
+- **Classification:**
+  - a semantic edit read as a replan;
+  - a semantic edit read as a visual refinement;
+  - the lineage walk treating a semantic edit as corrupt.
+- **Contract:**
+  - the editable-site-model name check removed;
+  - the base ref made optional;
+  - a customer id added as required authority.
+- **Consistency:** model mismatches ignored.
+- **Stored shapes:**
+  - a root carrying semantic-edit provenance;
+  - a successor persisted without its predecessor;
+  - legacy `replanDecision` beside a semantic edit.
+- **Lineage and slot:**
+  - a new lineage root started;
+  - the index keyed by reason;
+  - the index excluding typed reasons;
+  - the walk ignoring semantic edits;
+  - the duplicate lookup filtering out semantic edits.
+- **Phase 5q:**
+  - a semantic edit continued as a replan;
+  - a refusal aimed at visual refinement instead.
+- **Regressions:**
+  - historical replan normalisation broken;
+  - visual refinement parsing broken.
+- **Scope:** production orchestration creating semantic edits.
+
+**Known flake:** the pre-existing `acceptance vs abandonment race` test failed once
+under full-suite load. It passed 5 of 5 in isolation and touches no lineage-kind
+code.
+
 ## Phases 6–17
 
 Not started.
