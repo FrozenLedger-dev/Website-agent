@@ -7844,6 +7844,174 @@ into engine and worker).
 - **Stale-token test tightened:** it now asserts the refused call left the intent
   un-promoted and un-evaluated.
 
+## Customer editor foundation — **DONE**
+
+**Why.** Customers could sign in, and drafts could be edited semantically by a
+durable worker, but no customer could see or change their site.
+
+**Surface (`apps/customer`, logic in `@statxai/customer-editor`).**
+
+- **Pages:** `/projects` (the projects of the customer's active memberships) and
+  `/projects/[projectId]/editor`. Both are server components that resolve the
+  customer through `requireCustomerPrincipal` and redirect to login otherwise.
+- **Routes:** thin wrappers over framework-agnostic handlers:
+  - `GET /api/projects`
+  - `GET /api/projects/:projectId/editor`
+  - `GET /api/projects/:projectId/preview/:draftId/[...route]?channel=…`
+  - `POST /api/projects/:projectId/edits`
+  - `GET /api/projects/:projectId/edits/:intentId`
+- **Client boundary:** the editor UI and the error boundary are the only client
+  components. They import `@statxai/customer-editor/client` and the new
+  browser-safe `@statxai/contracts/editable-site-model` subpath — never a store,
+  customer auth or the orchestrator.
+- **Worker dependency:** customer edits are continued only by the standalone
+  `pnpm worker:semantic-edit` process. Run it beside the customer app; the app
+  never starts it.
+
+**Project discovery.** Active memberships by `customerUserId` → active accounts →
+`project_account_bindings` by `accountId` (both indexed, bounded to 200). Each
+project is authorised again through `authorizeCustomerProjectView`. The list
+shows project id, account name, role and draft state only.
+
+**Editor state (`loadCustomerEditorState`, the one loader).**
+
+1. Authorise view (every denial is the generic 404).
+2. `resolveCanonicalDraftAuthority`: a concluded or a handed-off draft.
+3. The draft's exact build, the exact editable-site-model ref its job spec pins
+   (resolved by hash), and the draft's exact `siteExportSnapshot` — proven to be
+   of exactly that build, promotion, promotion commit and model.
+4. While a semantic edit holds the draft: its customer-safe status.
+
+- **Two outputs:** a bounded DTO for the browser (exact model and snapshot refs,
+  a model view without plan, provenance, identity ledger, plan keys or blob keys,
+  preview routes, permissions, edit status), and a server-only authority the
+  preview and edit routes act on. No build id, promotion, lineage, job or token
+  reaches the browser.
+- **While an edit runs:** D0, M0 and S0 stay the editor's authority; the edit's
+  M1 is never shown. Editability is `edit_in_progress`, and submission is closed.
+- **After a terminal failure:** D0 stays shown and claimed; editability is
+  `edit_failed` with one safe reason. Nothing releases the claim.
+- **Unprovable drafts:** a missing snapshot, a snapshot of another build, a
+  missing model pin — reported as `draft_unavailable`, never with the cause.
+
+**Preview transport.**
+
+- **Gate finding (real Chrome):** a frame sandboxed `allow-scripts` without
+  `allow-same-origin` has an opaque origin. Its document request carries the
+  `SameSite=Lax` session, but its subresource requests are cross-site and carry
+  none.
+- **Design:** so each preview is one self-contained document of the exact current
+  draft's snapshot. No capability token exists.
+  - HTML is parsed with parse5; CSS with postcss and postcss-value-parser.
+  - Linked stylesheets (and `@import`) become `<style>`; fonts and images the
+    HTML, `srcset`, `style` attributes or CSS reference become `data:` URIs, read
+    through `readSiteExportFile` by exact manifest path.
+  - `/_next/static/...`, relative and `../` URLs resolve only inside the manifest.
+    Anything unresolved, external or of another type is dropped; nothing ever
+    points at the customer app's origin.
+  - Removed: every script, `on*` attribute, `javascript:` and all other link
+    targets (links become `#`), meta refresh, `<base>`, frames, objects, form
+    actions, preloads, comments. CSS that could close its `<style>` is dropped.
+  - Bound: 24 MiB of inlined bytes per document — refused with 413, never
+    truncated.
+  - Exactly one script is injected: the selection bridge, with a per-response
+    nonce.
+- **Response policy:** `default-src 'none'; script-src 'nonce-…'; style-src
+  'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; …;
+  form-action 'none'; frame-ancestors 'self'; sandbox allow-scripts`, plus
+  `no-store`, `nosniff` and `no-referrer`. Even a direct top-level visit is
+  sandboxed with an opaque origin and no network.
+- **Authority:** only the current draft id previews; a superseded draft id is not
+  found. No workspace, `app/out` or file is ever read.
+
+**Selection.**
+
+- **Bridge:** outlines the marked object under the pointer, stops site clicks,
+  submits, auxclicks and drags, and posts the nearest `data-statx-*-id` of each
+  kind around a click. It holds no credential and makes no request.
+- **Editor acceptance:** a message counts only when `event.source` is exactly the
+  preview frame's window, its random channel matches, and it parses strictly.
+- **Resolution:** precedence `field > asset > block > section > page`; the chosen
+  ID must parse as its kind and exist on the previewed page of the exact model.
+  An unresolvable marker selects nothing — no lower marker is substituted.
+- **Keyboard path:** a page outline outside the frame selects the same objects.
+
+**Supported edits** — every control builds the existing `SemanticPatch` through
+the contract's own schemas:
+
+- **Fields:** text, CTA (label and contract link), phone, email and address, on
+  pages, section headings and blocks (`set_field_value` with the value seen).
+- **Sections:** show or hide, bounded layout, move up and down (IDs unchanged).
+- **Blocks:** show or hide, edit fields, remove, and add any supported kind whose
+  fields are editable here (harness-minted IDs).
+- **Deferred:** asset slots are shown read-only (no safe chooser exists); design
+  tokens; drag and drop; image blocks.
+
+**Submission (`POST …/edits`).** Principal → same-origin → edit authorisation
+(viewer: 403; outsider: 404) → the one loader → strict body `{ expectedDraftId,
+baseModel, patch }` → exact concurrency against the loaded authority →
+`submitSemanticEdit` only → `202 { intentId, state, baseDraftId, baseModel }`.
+
+- **Conflicts:** a stale draft, stale model or stale expectation is
+  `409 stale_revision`; a held draft is `409 edit_in_progress`. A patch is never
+  rebased.
+- **Malformed:** a malformed, over-claiming or invalid body or value is
+  `400 invalid_edit`.
+- **Never in the request:** no model, build, validation, promotion, evaluation or
+  release, and no background execution.
+
+**Status and UX.**
+
+- **Status route:** view authorisation, then the intent of exactly this project,
+  as five fields: `intentId`, `state`, `failure`, `baseDraftId`, `resultDraftId`.
+- **Polling:** every 2 s while non-terminal, stopping on completion, failure or
+  unmount.
+- **Pending:** "Saving changes…", "Building new revision…", "Validating and
+  finishing…" over the unchanged D0 preview, with the inspector disabled.
+- **Completion:** a fresh editor state; the current draft (D1, or a newer one,
+  which is said) is loaded, selection is kept only if it still resolves, the frame
+  reloads from the new snapshot, and only then "Changes applied".
+- **Wording:** "Draft · Ready to edit". No approval or publish wording, and no
+  publish, chat, prompt, source or CSS editor.
+
+**Tests.**
+
+- **`customer-editor.test.ts` (29):** model view, selection and precedence,
+  patch shapes and validators, messages and words, transport (scripts, handlers,
+  links, markers, inlining, traversal, style escape, bounds).
+- **`customer-editor-boundary.test.ts` (16):** structural authority, preview,
+  selection, submission, UI and client-boundary pins.
+- **`customer-editor.integration.test.ts` (25):** discovery, editor load and
+  fail-closed cases, preview authority and paths, submission security and
+  concurrency, in-progress, status, completion (D1/M1/S1), added and removed
+  blocks, terminal failure, a same-project snapshot of another build, and operator
+  Basic credentials on every route — with the real lifecycle and worker.
+- **`editor-preview-browser.integration.test.ts` (14):** Chrome — opaque origin,
+  no cookie, no subresource or API request, no generated script, handler,
+  `javascript:` link, navigation or form escape, CSP on a top-level visit, design
+  rendering from the snapshot, bridge source checks, marker chains, identity by
+  marker.
+- **`customer-editor-e2e.integration.test.ts` (2):** the real customer app
+  (`next dev`) in Chrome with a signed-in customer: list → editor → route switch →
+  click heading → save (202) → queued and running over D0 → worker completes →
+  D1 and S1 with the new heading; a viewer is read-only and refused.
+- **Pins updated** for the new customer surface: customer auth, canonical draft,
+  semantic-edit, successor provenance, site export, editable site model, draft
+  target run, browser renderer (the customer editor's dev dependency on
+  `playwright-core` for isolation tests) and the worker.
+
+**Mutations: 30 of 30 killed.** Some are killed only by structural pins, because
+another layer also enforces the rule:
+
+- **Bridge source check (`event.source`):** the browser suite's parent page
+  reimplements the check instead of loading the editor.
+- **A stale model against the request:** submission re-proves the base model.
+- **Fire-and-forget resume, promotion or release imports** after submit.
+- **A chat or prompt control.**
+
+One mutation first survived because it was too weak: provider error text read
+from the wrong job. Pointed at the edit's failed job, it is killed.
+
 ## Phases 6–17
 
 Not started.

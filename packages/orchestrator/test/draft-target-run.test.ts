@@ -140,13 +140,29 @@ describe('the draft branch', () => {
     }
   });
 
-  it('release mode keeps the existing release path, and nothing here touches semantic editing or customer surfaces', async () => {
+  it('release mode keeps the existing release path, and nothing here touches semantic editing, and the customer surface starts no run', async () => {
     const orchestrator = await src(ORCHESTRATOR);
     expect(orchestrator).toContain("say({ phase: 'approve', detail: 'No blocking criteria outstanding — asking Sol to judge release' });");
     expect(orchestrator).toContain('const { manifest, finalCommit } = await publishRelease(ctx(), progress.authorization, {');
     expect(orchestrator).not.toMatch(/applySemanticEdit|semantic-edit\/apply|handOffCanonicalDraft/);
     const routes = (await productionFiles('apps/customer/app')).filter((f) => /route\.ts$|page\.tsx$/.test(f)).sort();
-    expect(routes).toEqual(['apps/customer/app/api/auth/callback/route.ts', 'apps/customer/app/api/auth/login/route.ts', 'apps/customer/app/api/auth/logout/route.ts', 'apps/customer/app/api/auth/me/route.ts']);
+    expect(routes).toEqual([
+      'apps/customer/app/api/auth/callback/route.ts',
+      'apps/customer/app/api/auth/login/route.ts',
+      'apps/customer/app/api/auth/logout/route.ts',
+      'apps/customer/app/api/auth/me/route.ts',
+      'apps/customer/app/api/projects/[projectId]/editor/route.ts',
+      'apps/customer/app/api/projects/[projectId]/edits/[intentId]/route.ts',
+      'apps/customer/app/api/projects/[projectId]/edits/route.ts',
+      'apps/customer/app/api/projects/[projectId]/preview/[draftId]/[[...route]]/route.ts',
+      'apps/customer/app/api/projects/route.ts',
+      'apps/customer/app/page.tsx',
+      'apps/customer/app/projects/[projectId]/editor/page.tsx',
+      'apps/customer/app/projects/page.tsx',
+    ]);
+    for (const file of [...(await productionFiles('packages/customer-editor/src')), ...(await productionFiles('apps/customer/app'))]) {
+      expect(await src(file), file).not.toMatch(/completionTarget|runProject|launchRun/);
+    }
     for (const file of [...(await productionFiles('apps/console/app')), ...(await productionFiles('apps/console/lib'))]) {
       expect(await src(file), file).not.toMatch(/completionTarget/);
     }

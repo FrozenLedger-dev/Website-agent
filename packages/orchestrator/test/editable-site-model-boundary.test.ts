@@ -174,6 +174,8 @@ describe('builds and evaluations measure an exact pinned model', () => {
       'packages/orchestrator/src/orchestrator.ts',
       'packages/orchestrator/src/phases/evaluate.ts',
       'packages/orchestrator/src/semantic-edit/apply.ts',
+      // The customer editor shows exactly the model the current draft's build pinned.
+      'packages/customer-editor/src/editor-state.ts',
     ].sort());
   });
 

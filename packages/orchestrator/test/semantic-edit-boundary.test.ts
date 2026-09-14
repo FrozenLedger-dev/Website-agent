@@ -183,13 +183,31 @@ describe('authority separation', () => {
     expect(intent).not.toMatch(/session|token|cookie|email/i);
   });
 
-  it('customer authentication reaches neither the edit service nor build authority, and no edit route or editor exists', async () => {
+  it('customer authentication reaches neither the edit service nor build authority; the customer app submits edits only through the customer editor', async () => {
     for (const file of [...(await productionFiles('packages/customer-auth/src')), ...(await productionFiles('apps/customer/app')), ...(await productionFiles('apps/customer/lib'))]) {
       const code = await src(file);
       expect(code, file).not.toMatch(/@statxai\/orchestrator|applySemanticEdit|semantic-edit|canonicalDrafts|frontendBackendBuildBindings|semanticEditIntents/);
     }
     const routes = (await productionFiles('apps/customer/app')).filter((f) => f.endsWith('route.ts') || f.endsWith('page.tsx')).sort();
-    expect(routes).toEqual(['apps/customer/app/api/auth/callback/route.ts', 'apps/customer/app/api/auth/login/route.ts', 'apps/customer/app/api/auth/logout/route.ts', 'apps/customer/app/api/auth/me/route.ts']);
+    expect(routes).toEqual([
+      'apps/customer/app/api/auth/callback/route.ts',
+      'apps/customer/app/api/auth/login/route.ts',
+      'apps/customer/app/api/auth/logout/route.ts',
+      'apps/customer/app/api/auth/me/route.ts',
+      'apps/customer/app/api/projects/[projectId]/editor/route.ts',
+      'apps/customer/app/api/projects/[projectId]/edits/[intentId]/route.ts',
+      'apps/customer/app/api/projects/[projectId]/edits/route.ts',
+      'apps/customer/app/api/projects/[projectId]/preview/[draftId]/[[...route]]/route.ts',
+      'apps/customer/app/api/projects/route.ts',
+      'apps/customer/app/page.tsx',
+      'apps/customer/app/projects/[projectId]/editor/page.tsx',
+      'apps/customer/app/projects/page.tsx',
+    ]);
+    // The editor submits durably and nothing else: it never applies, resumes or continues an edit.
+    for (const file of await productionFiles('packages/customer-editor/src')) {
+      expect(await src(file), file).not.toMatch(/applySemanticEdit|resumeSemanticEdit|resumeSemanticEditIntent|continueSemanticEdit|semanticEditIntents\./);
+    }
+    expect(await src('packages/customer-editor/src/edits.ts')).toMatch(/await submitSemanticEdit\(\{/);
     for (const file of await productionFiles('apps/console/app')) {
       expect(await src(file), file).not.toMatch(/applySemanticEdit|SemanticPatch|semantic-edit/);
     }

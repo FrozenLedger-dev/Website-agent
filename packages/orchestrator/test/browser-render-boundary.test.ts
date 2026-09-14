@@ -73,13 +73,21 @@ describe('a generated site reaches a browser only through the BrowserRenderer', 
     expect(await src('packages/contracts/src/browser.ts')).not.toMatch(/import .*playwright|chromium|launch\(/i);
   });
 
-  it('no package depends on a browser driver; only the trusted runtime manifest pins one', async () => {
+  it('no package ships a browser driver; only the trusted runtime manifest pins one, and the customer editor’s isolation tests use one as a dev dependency', async () => {
     const manifests: string[] = [];
-    for (const dir of [...(await readdir(join(REPO, 'packages'))).map((p) => `packages/${p}`), 'apps/console', '.']) {
+    for (const dir of [...(await readdir(join(REPO, 'packages'))).map((p) => `packages/${p}`), 'apps/console', 'apps/customer', '.']) {
       const text = await readFile(join(REPO, dir, 'package.json'), 'utf8').catch(() => '');
       if (/playwright|puppeteer|chromium/i.test(text)) manifests.push(dir);
     }
-    expect(manifests).toEqual([]);
+    expect(manifests).toEqual(['packages/customer-editor']);
+    // Test-only: it drives a local browser against the editor preview to prove isolation; no production code imports it.
+    const editor = JSON.parse(await readFile(join(REPO, 'packages/customer-editor/package.json'), 'utf8')) as { dependencies: Record<string, string>; devDependencies: Record<string, string> };
+    expect(JSON.stringify(editor.dependencies)).not.toMatch(/playwright|puppeteer|chromium/i);
+    expect(editor.devDependencies).toEqual({ 'playwright-core': '1.63.0' });
+    const editorSources = await readdir(join(REPO, 'packages/customer-editor/src'), { recursive: true });
+    for (const file of editorSources.filter((f) => /\.ts$/.test(f))) {
+      expect(await readFile(join(REPO, 'packages/customer-editor/src', file), 'utf8'), file).not.toMatch(/playwright|puppeteer|chromium/i);
+    }
     const runtime = JSON.parse(await readFile(join(REPO, 'templates/browser-runtime/package.json'), 'utf8')) as { dependencies: Record<string, string> };
     expect(runtime.dependencies).toEqual({ 'playwright-core': '1.63.0' });
   });

@@ -37,3 +37,5 @@ export {
   type PublishResult,
   type ReleaseDeploymentGateway,
 } from './phases/publish.js';
+// The exact-ref model reader, for server code that shows a draft's model (the customer editor).
+export { EditableSiteModelRefInvalid, resolveEditableSiteModel } from './site-model/persist.js';

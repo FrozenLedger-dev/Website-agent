@@ -154,8 +154,24 @@ describe('the worker is a standalone process over semantic_edit_intents', () => 
     expect(body(worker, 'async stop(graceMs = 30_000): Promise<void> {', '\n  }\n')).toMatch(/this\.stopping\.abort\(\);[\s\S]*controller\.abort\(\)/);
   });
 
-  it('no customer edit route exists yet', async () => {
+  it('the customer app only submits and reads status: its routes are exactly authentication and the editor, and none runs the worker', async () => {
     const routes = (await productionFiles('apps/customer/app')).filter((f) => /route\.ts$|page\.tsx$/.test(f)).sort();
-    expect(routes).toEqual(['apps/customer/app/api/auth/callback/route.ts', 'apps/customer/app/api/auth/login/route.ts', 'apps/customer/app/api/auth/logout/route.ts', 'apps/customer/app/api/auth/me/route.ts']);
+    expect(routes).toEqual([
+      'apps/customer/app/api/auth/callback/route.ts',
+      'apps/customer/app/api/auth/login/route.ts',
+      'apps/customer/app/api/auth/logout/route.ts',
+      'apps/customer/app/api/auth/me/route.ts',
+      'apps/customer/app/api/projects/[projectId]/editor/route.ts',
+      'apps/customer/app/api/projects/[projectId]/edits/[intentId]/route.ts',
+      'apps/customer/app/api/projects/[projectId]/edits/route.ts',
+      'apps/customer/app/api/projects/[projectId]/preview/[draftId]/[[...route]]/route.ts',
+      'apps/customer/app/api/projects/route.ts',
+      'apps/customer/app/page.tsx',
+      'apps/customer/app/projects/[projectId]/editor/page.tsx',
+      'apps/customer/app/projects/page.tsx',
+    ]);
+    for (const file of await productionFiles('packages/customer-editor/src')) {
+      expect(await src(file), file).not.toMatch(/SemanticEditWorker|claimSemanticEditExecution|resumeSemanticEditIntent/);
+    }
   });
 });

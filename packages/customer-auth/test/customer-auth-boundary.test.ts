@@ -98,11 +98,19 @@ describe('authentication is the mature library’s', () => {
     expect(deps).toContain('const oidc = await discoverCustomerOidc(config);');
   });
 
-  it('the provider secret stays on the server: no public env var, no client component, no secret or token in any response body', async () => {
+  it('the provider secret stays on the server: no public env var, client components only where no customer auth reaches, no secret or token in any response body', async () => {
+    // The editor UI and the error boundary are the only client components; neither can reach configuration, sessions or providers.
+    const CLIENT_COMPONENTS = ['apps/customer/app/error.tsx', 'apps/customer/app/projects/[projectId]/editor/editor.tsx'];
     for (const file of [...(await files(PKG)), ...(await files(APP))]) {
       const code = await src(file);
-      expect(code, file).not.toMatch(/NEXT_PUBLIC_|'use client'|"use client"/);
+      expect(code, file).not.toMatch(/NEXT_PUBLIC_/);
+      if (CLIENT_COMPONENTS.includes(file)) {
+        expect(code, file).not.toMatch(/@statxai\/customer-auth|@statxai\/state|lib\/(deps|session)|process\.env|clientSecret/);
+      } else {
+        expect(code, file).not.toMatch(/'use client'|"use client"/);
+      }
     }
+    for (const file of CLIENT_COMPONENTS) expect(await src(file), file).toMatch(/^'use client';/);
     const http = await src(`${PKG}/http.ts`);
     expect(http).not.toMatch(/clientSecret|access_token|refresh_token|id_token|tokens\.(access|refresh)/);
     expect(http).not.toMatch(/customerSessions\.find|customerUsers\.find\(\)|Response\.json\(user\b|Response\.json\(session\b/);
@@ -159,10 +167,16 @@ describe('project authorization reads tenancy from persisted state only', () => 
 });
 
 describe('nothing beyond the authentication foundation', () => {
-  it('no customer editor, project route, semantic patch endpoint or build initiation exists', async () => {
-    for (const file of [...(await files(PKG)), ...(await files(APP))].filter((f) => !f.endsWith('next.config.ts'))) {
+  it('customer authentication knows no editor or build; the customer app reaches editing only through the customer editor, and initiates no build', async () => {
+    for (const file of await files(PKG)) {
       const code = await src(file);
-      expect(code, file).not.toMatch(/@statxai\/(orchestrator|workspace|agents|job-engine|contracts)|commitSemanticPatch|SemanticPatch|editable-site-model|runProject|launchRun|publishRelease|registry\./);
+      expect(code, file).not.toMatch(/@statxai\/(orchestrator|workspace|agents|job-engine|contracts|customer-editor)|commitSemanticPatch|SemanticPatch|editable-site-model|runProject|launchRun|publishRelease|registry\./);
+    }
+    for (const file of (await files(APP)).filter((f) => !f.endsWith('next.config.ts'))) {
+      const code = await src(file);
+      expect(code, file).not.toMatch(/@statxai\/(orchestrator|workspace|agents|job-engine)|commitSemanticPatch|runProject|launchRun|publishRelease|registry\./);
+      // Contracts only as the browser-safe model contract; edits only as the editor's patch builders.
+      for (const m of code.matchAll(/from '(@statxai\/contracts[^']*)'/g)) expect(m[1], file).toBe('@statxai/contracts/editable-site-model');
     }
   });
 

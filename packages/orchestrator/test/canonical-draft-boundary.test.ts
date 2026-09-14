@@ -232,13 +232,27 @@ describe('scope', () => {
     expect(authority).not.toMatch(/terra-edit|semanticEditIntents|applySemanticEdit|coordinator|evaluateSite/);
   });
 
-  it('customer authentication neither reaches draft or build authority nor gains an edit route', async () => {
+  it('customer authentication reaches no draft or build authority; the customer app reaches drafts only through the customer editor', async () => {
     for (const file of [...(await productionFiles('packages/customer-auth/src')), ...(await productionFiles('apps/customer/app')), ...(await productionFiles('apps/customer/lib'))]) {
       const code = await src(file);
       expect(code, file).not.toMatch(/@statxai\/orchestrator|canonical-draft|canonicalDrafts|claimCanonicalDraft|frontendBackendBuildBindings|promotions|releasePublications/);
     }
     const routes = (await productionFiles('apps/customer/app')).filter((f) => f.endsWith('route.ts')).sort();
-    expect(routes).toEqual(['apps/customer/app/api/auth/callback/route.ts', 'apps/customer/app/api/auth/login/route.ts', 'apps/customer/app/api/auth/logout/route.ts', 'apps/customer/app/api/auth/me/route.ts']);
-    expect((await productionFiles('apps/customer/app')).filter((f) => /page\.tsx$/.test(f))).toEqual([]);
+    expect(routes).toEqual([
+      'apps/customer/app/api/auth/callback/route.ts',
+      'apps/customer/app/api/auth/login/route.ts',
+      'apps/customer/app/api/auth/logout/route.ts',
+      'apps/customer/app/api/auth/me/route.ts',
+      'apps/customer/app/api/projects/[projectId]/editor/route.ts',
+      'apps/customer/app/api/projects/[projectId]/edits/[intentId]/route.ts',
+      'apps/customer/app/api/projects/[projectId]/edits/route.ts',
+      'apps/customer/app/api/projects/[projectId]/preview/[draftId]/[[...route]]/route.ts',
+      'apps/customer/app/api/projects/route.ts',
+    ]);
+    expect((await productionFiles('apps/customer/app')).filter((f) => /page\.tsx$/.test(f)).sort()).toEqual(['apps/customer/app/page.tsx', 'apps/customer/app/projects/[projectId]/editor/page.tsx', 'apps/customer/app/projects/page.tsx']);
+    // Draft authority reaches customers only as the editor's exact read: it claims, hands off, concludes or releases nothing.
+    for (const file of await productionFiles('packages/customer-editor/src')) {
+      expect(await src(file), file).not.toMatch(/claimCanonicalDraft|handOffCanonicalDraft|concludeCanonicalDraft|releaseCanonicalDraftClaim|canonicalDrafts\.(update|insert|delete|findOneAndUpdate)|promotions|releasePublications/);
+    }
   });
 });

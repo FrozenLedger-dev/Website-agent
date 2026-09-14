@@ -169,8 +169,15 @@ describe('semantic-edit successors: created only by the semantic-edit applicatio
     // The state document only types the persisted field; it creates nothing. Canonical draft
     // authority names `semantic_edit` only as a claim category, never as a successor.
     // The job contract names the edit's origin; the application is the one place a semantic-edit successor is made.
-    expect(knowers.sort()).toEqual([CONTRACT, BINDING, RECOVERY, 'packages/state/src/documents.ts', 'packages/orchestrator/src/canonical-draft/authority.ts', 'packages/contracts/src/job.ts', 'packages/orchestrator/src/semantic-edit/apply.ts', 'packages/state/src/store.ts'].sort());
+    // The customer editor reads `semantic_edit` only as the draft claim's category, to show the edit holding it.
+    expect(knowers.sort()).toEqual([CONTRACT, BINDING, RECOVERY, 'packages/state/src/documents.ts', 'packages/orchestrator/src/canonical-draft/authority.ts', 'packages/contracts/src/job.ts', 'packages/orchestrator/src/semantic-edit/apply.ts', 'packages/customer-editor/src/editor-state.ts', 'packages/customer-editor/src/projects.ts', 'packages/state/src/store.ts'].sort());
     expect(await src('packages/orchestrator/src/canonical-draft/authority.ts')).not.toMatch(/SemanticEditSuccessorProvenance|successorProvenance/);
+    for (const reader of ['packages/customer-editor/src/editor-state.ts', 'packages/customer-editor/src/projects.ts']) {
+      const code = await src(reader);
+      expect(code, reader).not.toMatch(/SemanticEditSuccessorProvenance|successorProvenance|kind: 'semantic_edit'/);
+      expect(code.match(/semantic_edit/g), reader).toHaveLength(1);
+      expect(code, reader).toMatch(/draft\.claim\?\.kind (===|!==) 'semantic_edit'/);
+    }
     const binding = await src(BINDING);
     expect(binding).not.toMatch(/kind: 'semantic_edit'/);
     const orchestrator = await src('packages/orchestrator/src/orchestrator.ts');
@@ -196,7 +203,7 @@ describe('semantic-edit successors: created only by the semantic-edit applicatio
     expect(shape).not.toMatch(/customer|session|account|email|patch|operation|source|commit|At\b|time/i);
   });
 
-  it('the semantic edit has its own job origin, job spec and skill — and still no customer editor route exists', async () => {
+  it('the semantic edit has its own job origin, job spec and skill — and the customer surface is exactly authentication plus the draft editor', async () => {
     const job = await src('packages/contracts/src/job.ts');
     expect(job).toContain("z.strictObject({ kind: z.literal('semantic_edit'), intentId: z.string().regex(/^semantic-edit-[a-f0-9]{64}$/) }),");
     expect(await src('packages/orchestrator/src/job-specs/frontend-backend.ts')).toContain('export function createFrontendBackendSemanticEditJobSpec(');
@@ -210,6 +217,19 @@ describe('semantic-edit successors: created only by the semantic-edit applicatio
       }
     };
     await walk('apps/customer/app');
-    expect(routes.sort()).toEqual(['apps/customer/app/api/auth/callback/route.ts', 'apps/customer/app/api/auth/login/route.ts', 'apps/customer/app/api/auth/logout/route.ts', 'apps/customer/app/api/auth/me/route.ts']);
+    expect(routes.sort()).toEqual([
+      'apps/customer/app/api/auth/callback/route.ts',
+      'apps/customer/app/api/auth/login/route.ts',
+      'apps/customer/app/api/auth/logout/route.ts',
+      'apps/customer/app/api/auth/me/route.ts',
+      'apps/customer/app/api/projects/[projectId]/editor/route.ts',
+      'apps/customer/app/api/projects/[projectId]/edits/[intentId]/route.ts',
+      'apps/customer/app/api/projects/[projectId]/edits/route.ts',
+      'apps/customer/app/api/projects/[projectId]/preview/[draftId]/[[...route]]/route.ts',
+      'apps/customer/app/api/projects/route.ts',
+      'apps/customer/app/page.tsx',
+      'apps/customer/app/projects/[projectId]/editor/page.tsx',
+      'apps/customer/app/projects/page.tsx',
+    ]);
   });
 });

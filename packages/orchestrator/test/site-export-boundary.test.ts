@@ -138,9 +138,22 @@ describe('drafts name exact snapshots', () => {
 });
 
 describe('scope', () => {
-  it('no customer preview route, editor or edit worker exists; the mutable export is served only by the operator console', async () => {
+  it('the customer preview serves only exact snapshots through the customer editor; the mutable export is served only by the operator console', async () => {
     const customer = (await productionFiles('apps/customer/app')).filter((f) => /route\.ts$|page\.tsx$/.test(f)).sort();
-    expect(customer).toEqual(['apps/customer/app/api/auth/callback/route.ts', 'apps/customer/app/api/auth/login/route.ts', 'apps/customer/app/api/auth/logout/route.ts', 'apps/customer/app/api/auth/me/route.ts']);
+    expect(customer).toEqual([
+      'apps/customer/app/api/auth/callback/route.ts',
+      'apps/customer/app/api/auth/login/route.ts',
+      'apps/customer/app/api/auth/logout/route.ts',
+      'apps/customer/app/api/auth/me/route.ts',
+      'apps/customer/app/api/projects/[projectId]/editor/route.ts',
+      'apps/customer/app/api/projects/[projectId]/edits/[intentId]/route.ts',
+      'apps/customer/app/api/projects/[projectId]/edits/route.ts',
+      'apps/customer/app/api/projects/[projectId]/preview/[draftId]/[[...route]]/route.ts',
+      'apps/customer/app/api/projects/route.ts',
+      'apps/customer/app/page.tsx',
+      'apps/customer/app/projects/[projectId]/editor/page.tsx',
+      'apps/customer/app/projects/page.tsx',
+    ]);
     for (const file of [...(await productionFiles('apps/customer/app')), ...(await productionFiles('apps/customer/lib')), ...(await productionFiles('packages/customer-auth/src'))]) {
       expect(await src(file), file).not.toMatch(/readSiteExport|resolveSiteExportRequest|app\/out|resumeSemanticEdit|applySemanticEdit/);
     }
@@ -148,6 +161,10 @@ describe('scope', () => {
     for (const file of await allProductionFiles()) if (/'app', 'out'|app\/out/.test(await src(file))) servers.push(file);
     // The operator console's preview route and the operator preview script — never a customer surface.
     expect(servers.sort()).toEqual(['apps/console/app/api/preview/[projectId]/[[...path]]/route.ts', 'scripts/preview.ts']);
+    // The customer preview reads the exact snapshot a draft names, and only there.
+    const snapshotReaders: string[] = [];
+    for (const file of await productionFiles('packages/customer-editor/src')) if (/readSiteExportSnapshot\(|readSiteExportFile\(|resolveSiteExportRequest\(/.test(await src(file))) snapshotReaders.push(file);
+    expect(snapshotReaders.sort()).toEqual(['packages/customer-editor/src/editor-state.ts', 'packages/customer-editor/src/http.ts']);
     for (const file of await allProductionFiles()) {
       if (file === 'packages/orchestrator/src/semantic-edit/apply.ts') continue;
       expect(await src(file), file).not.toMatch(/resumeSemanticEdit\(/);

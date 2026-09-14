@@ -2,9 +2,9 @@
  * The customer app and the operator console are separate authorities.
  *
  * A customer session never reaches an operator route; operator Basic
- * credentials never produce a customer; the customer app serves only its four
- * authentication routes, each failing closed when customer auth is not
- * configured.
+ * credentials never produce a customer; the customer app serves exactly its
+ * authentication routes and the draft editor's pages and routes, each failing
+ * closed when customer auth is not configured.
  */
 import { readdir } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
@@ -46,7 +46,7 @@ describe('operator and customer authority never cross', () => {
 });
 
 describe('the customer app surface', () => {
-  it('serves exactly the four customer authentication routes, and no page, editor or project route', async () => {
+  it('serves exactly the authentication routes, the projects page, and the draft editor — no publish, release, chat or source route', async () => {
     const found: string[] = [];
     const walk = async (dir: string): Promise<void> => {
       for (const entry of await readdir(dir, { withFileTypes: true })) {
@@ -57,7 +57,26 @@ describe('the customer app surface', () => {
       }
     };
     await walk(join(CUSTOMER_ROOT, 'app'));
-    expect(found.sort()).toEqual(['app/api/auth/callback/route.ts', 'app/api/auth/login/route.ts', 'app/api/auth/logout/route.ts', 'app/api/auth/me/route.ts']);
+    expect(found.sort()).toEqual([
+      'app/api/auth/callback/route.ts',
+      'app/api/auth/login/route.ts',
+      'app/api/auth/logout/route.ts',
+      'app/api/auth/me/route.ts',
+      'app/api/projects/[projectId]/editor/route.ts',
+      'app/api/projects/[projectId]/edits/[intentId]/route.ts',
+      'app/api/projects/[projectId]/edits/route.ts',
+      'app/api/projects/[projectId]/preview/[draftId]/[[...route]]/route.ts',
+      'app/api/projects/route.ts',
+      'app/error.tsx',
+      'app/globals.css',
+      'app/layout.tsx',
+      'app/not-found.tsx',
+      'app/page.tsx',
+      'app/projects/[projectId]/editor/editor.tsx',
+      'app/projects/[projectId]/editor/loading.tsx',
+      'app/projects/[projectId]/editor/page.tsx',
+      'app/projects/page.tsx',
+    ]);
   });
 
   it.each([
@@ -70,6 +89,26 @@ describe('the customer app surface', () => {
     Object.assign(process.env, OPERATOR_ENV);
     const mod = (await import(`../app/api/auth/${route}/route.ts`)) as Record<string, (request: Request) => Promise<Response>>;
     const response = await mod[method]!(new Request(`https://app.statxai.example/api/auth/${route}`, { method, headers: { authorization: `Basic ${btoa('ops:correct-horse-battery-staple')}`, origin: 'https://app.statxai.example' } }));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'unavailable' });
+  });
+});
+
+describe('the customer editor routes fail closed without customer configuration', () => {
+  it.each([
+    ['projects', 'GET', '../app/api/projects/route.ts', {}],
+    ['editor state', 'GET', '../app/api/projects/[projectId]/editor/route.ts', { projectId: 'proj_x' }],
+    ['preview', 'GET', '../app/api/projects/[projectId]/preview/[draftId]/[[...route]]/route.ts', { projectId: 'proj_x', draftId: 'd', route: [] }],
+    ['edit submission', 'POST', '../app/api/projects/[projectId]/edits/route.ts', { projectId: 'proj_x' }],
+    ['edit status', 'GET', '../app/api/projects/[projectId]/edits/[intentId]/route.ts', { projectId: 'proj_x', intentId: 'i' }],
+  ])('%s is unavailable — operator Basic credentials open nothing', async (_name, method, path, params) => {
+    for (const key of Object.keys(process.env)) if (key.startsWith('CUSTOMER_')) delete process.env[key];
+    Object.assign(process.env, OPERATOR_ENV);
+    const mod = (await import(path)) as Record<string, (request: Request, context: { params: Promise<object> }) => Promise<Response>>;
+    const response = await mod[method]!(
+      new Request('https://app.statxai.example/api/projects', { method, headers: { authorization: `Basic ${btoa('ops:correct-horse-battery-staple')}`, origin: 'https://app.statxai.example' } }),
+      { params: Promise.resolve(params) },
+    );
     expect(response.status).toBe(503);
     expect(await response.json()).toEqual({ error: 'unavailable' });
   });

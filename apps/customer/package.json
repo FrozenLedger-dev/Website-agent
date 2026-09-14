@@ -9,7 +9,9 @@
     "start": "next start --port 3200"
   },
   "dependencies": {
+    "@statxai/contracts": "workspace:*",
     "@statxai/customer-auth": "workspace:*",
+    "@statxai/customer-editor": "workspace:*",
     "@statxai/state": "workspace:*",
     "next": "^15.1.0",
     "react": "^19.0.0",
