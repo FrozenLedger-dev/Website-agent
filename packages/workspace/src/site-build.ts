@@ -8,6 +8,8 @@
  *
  * That build executes the model's code, so it runs in the sandbox (`./sandbox.ts`).
  */
+import { createHash } from 'node:crypto';
+import { exportDigestOf } from './export-digest.js';
 import { copyFile, cp, lchown, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
@@ -35,6 +37,12 @@ export interface BuildResult {
   outDir: string;
   /** Present only when the build was terminated for exceeding a sandbox limit. */
   limit?: 'time' | 'memory';
+  /**
+   * The canonical export digest (`exportDigestOf`) of exactly the files this
+   * build wrote into `outDir` — present exactly when `ok`. What a later reader of
+   * `outDir` must still find there to be reading this build's export.
+   */
+  exportDigest?: string;
 }
 
 /** Paths the model may write. Everything else is platform-owned. */
@@ -252,6 +260,7 @@ export async function buildSite(siteRoot: string, options: BuildSiteOptions = {}
     durationMs: Date.now() - started,
     output: tail([run.output, verdict].filter(Boolean).join('\n')),
     outDir,
+    ...(run.ok && run.exportDigest ? { exportDigest: run.exportDigest } : {}),
     ...(run.timedOut ? { limit: 'time' as const } : run.oomKilled ? { limit: 'memory' as const } : {}),
   };
 }
@@ -269,6 +278,8 @@ export interface CandidateBuildResult {
   readonly oomKilled: boolean;
   readonly output: string;
   readonly limits: SandboxLimits;
+  /** The canonical digest of the export collected into `siteRoot/out`, when one was. */
+  readonly exportDigest?: string;
 }
 
 /**
@@ -308,8 +319,9 @@ export async function executeCandidateBuild(siteRoot: string, options: BuildSite
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
     });
 
-    const built = run.exitCode === 0 && (await collectExport(join(workspace, 'out'), join(siteRoot, 'out'))) > 0;
-    return { ok: built, exitCode: run.exitCode, timedOut: run.timedOut, oomKilled: run.oomKilled, output: run.output, limits };
+    const collected = run.exitCode === 0 ? await collectExport(join(workspace, 'out'), join(siteRoot, 'out')) : null;
+    const built = collected !== null && collected.files > 0;
+    return { ok: built, exitCode: run.exitCode, timedOut: run.timedOut, oomKilled: run.oomKilled, output: run.output, limits, ...(built ? { exportDigest: collected.digest } : {}) };
   } finally {
     await rm(runRoot, { recursive: true, force: true });
   }
@@ -366,9 +378,10 @@ async function chownTree(dir: string, uid: number, gid: number): Promise<void> {
  * Copy the export out of the sandbox workspace — after the container is gone,
  * regular files only, within a size budget. Returns the number of files copied.
  */
-async function collectExport(from: string, to: string): Promise<number> {
+async function collectExport(from: string, to: string): Promise<{ files: number; digest: string }> {
   let files = 0;
   let bytes = 0;
+  const written: { path: string; sha256: string }[] = [];
   const walk = async (dir: string): Promise<void> => {
     const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
     for (const entry of entries) {
@@ -383,6 +396,8 @@ async function collectExport(from: string, to: string): Promise<number> {
       const target = join(to, relative(from, full));
       await mkdir(dirname(target), { recursive: true });
       await copyFile(full, target);
+      // Digested from what was written, so the digest describes `to`, not the sandbox's copy.
+      written.push({ path: relative(to, target).split(sep).join('/'), sha256: createHash('sha256').update(await readFile(target)).digest('hex') });
       files += 1;
     }
   };
@@ -392,9 +407,9 @@ async function collectExport(from: string, to: string): Promise<number> {
     // Not a site this platform builds: no partial export is left to be gated.
     if (!(error instanceof ExportTooLarge)) throw error;
     await rm(to, { recursive: true, force: true });
-    return 0;
+    return { files: 0, digest: exportDigestOf([]) };
   }
-  return files;
+  return { files, digest: exportDigestOf(written) };
 }
 
 class ExportTooLarge extends Error {}

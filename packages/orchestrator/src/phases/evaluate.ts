@@ -21,10 +21,16 @@ import {
 } from '@statxai/contracts';
 import { reviewSite } from '@statxai/agents';
 import { isFrameworkPage, runGates, siteModelMarkerFindings } from '@statxai/gates';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   BlobStore,
+  SiteExportSnapshotRefused,
   buildSite as compileSite,
   captureInBrowser,
+  captureSiteExportSnapshot,
+  materializeSiteExport,
   persistScreenshotSet,
   readBuiltFiles,
   readExportFiles,
@@ -108,6 +114,15 @@ export interface Evaluation {
    * it adds no defect and blocks nothing yet.
    */
   browserRender: BrowserRenderReport | null;
+  /**
+   * The exact immutable `site-export-snapshot` of the export this evaluation
+   * measured — every exported file as a content-addressed blob, bound to the
+   * build's exact authority — or null when there was no export, or when it
+   * could not be captured (`siteExportSnapshotRefusal` says why). The browser
+   * render and the screenshots are of exactly these bytes.
+   */
+  siteExportSnapshot: ArtifactRef | null;
+  siteExportSnapshotRefusal: string | null;
   /** The exact `test-report` artifact this evaluation wrote — its deterministic gate results. */
   testReport: ArtifactRef;
   /**
@@ -154,6 +169,14 @@ export interface EvaluationSubject {
   /** The exact model the canonical build pinned, or null for a build that predates the model. */
   readonly editableSiteModel: ArtifactRef | null;
   readonly authority: BrowserRenderAuthority;
+}
+
+/** The browser evidence and the export snapshot of one evaluation disagree about what was exported. */
+export class EvaluationSiteExportMismatch extends Error {
+  constructor(detail: string) {
+    super(`evaluation refused: ${detail}`);
+    this.name = 'EvaluationSiteExportMismatch';
+  }
 }
 
 /** An evaluation was handed a model that does not describe the plan it evaluates. */
@@ -218,18 +241,69 @@ export async function evaluateSite(ctx: RunContext, subject: EvaluationSubject):
    * rendered, and advisory: it changes no defect, gate or release decision in
    * this slice.
    */
-  const captured = compiled.ok
-    ? await captureInBrowser({
-        exportDir: compiled.outDir,
-        plan: progress.plan,
-        subject: {
+  const sourceCommit = compiled.ok ? await deps.workspace.currentCommit() : null;
+
+  /**
+   * The export, captured once as immutable evidence of this exact build — only
+   * when it still digests to what the build itself wrote, so a directory another
+   * writer touched is refused rather than recorded — and rendered from those
+   * captured bytes, never from the mutable directory again.
+   */
+  let exportSnapshot: Awaited<ReturnType<typeof captureSiteExportSnapshot>> | null = null;
+  let siteExportSnapshotRefusal: string | null = null;
+  let renderDir = compiled.outDir;
+  let privateExport: string | null = null;
+  if (compiled.ok) {
+    if (!compiled.exportDigest) {
+      siteExportSnapshotRefusal = 'the build reported no export digest to capture against';
+    } else {
+      try {
+        exportSnapshot = await captureSiteExportSnapshot({
+          registry: deps.registry,
+          blobs: new BlobStore(deps.store),
           projectId: facts.projectId,
-          sitePlan: subject.sitePlan,
-          sourceCommit: await deps.workspace.currentCommit(),
-          authority: subject.authority,
-        },
-      })
-    : null;
+          exportDir: compiled.outDir,
+          subject: { projectId: facts.projectId, sitePlan: subject.sitePlan, sourceCommit, authority: subject.authority, editableSiteModel: subject.editableSiteModel },
+          expectedExportDigest: compiled.exportDigest,
+        });
+        privateExport = await mkdtemp(join(tmpdir(), 'statxai-export-'));
+        await materializeSiteExport(exportSnapshot.files, privateExport);
+        renderDir = privateExport;
+      } catch (error) {
+        if (!(error instanceof SiteExportSnapshotRefused)) throw error;
+        siteExportSnapshotRefusal = error.message;
+      }
+    }
+    deps.say({
+      phase: 'evaluate',
+      detail: exportSnapshot
+        ? `Export snapshot: ${exportSnapshot.snapshot.totalFiles} files (${exportSnapshot.ref.name}@${exportSnapshot.ref.version})`
+        : `Export snapshot not captured: ${siteExportSnapshotRefusal ?? ''}`,
+      level: exportSnapshot ? 'ok' : 'warn',
+    });
+  }
+
+  let captured: Awaited<ReturnType<typeof captureInBrowser>> | null = null;
+  try {
+    captured = compiled.ok
+      ? await captureInBrowser({
+          exportDir: renderDir,
+          plan: progress.plan,
+          subject: {
+            projectId: facts.projectId,
+            sitePlan: subject.sitePlan,
+            sourceCommit,
+            authority: subject.authority,
+          },
+        })
+      : null;
+  } finally {
+    if (privateExport) await rm(privateExport, { recursive: true, force: true });
+  }
+  // One export, one digest: what was rendered and photographed is exactly what was captured.
+  if (exportSnapshot && captured && captured.report.subject.exportDigest !== exportSnapshot.snapshot.exportDigest) {
+    throw new EvaluationSiteExportMismatch(`the browser rendered export ${captured.report.subject.exportDigest}, not the captured snapshot ${exportSnapshot.snapshot.exportDigest}`);
+  }
   const browserRender = captured?.report ?? null;
 
   if (browserRender) {
@@ -372,6 +446,8 @@ export async function evaluateSite(ctx: RunContext, subject: EvaluationSubject):
     compiled,
     gateRun,
     browserRender,
+    siteExportSnapshot: exportSnapshot?.ref ?? null,
+    siteExportSnapshotRefusal,
     testReport,
     screenshotSet: screenshots?.ref ?? null,
     visualQualityReview,

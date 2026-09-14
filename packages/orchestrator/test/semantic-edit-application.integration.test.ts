@@ -17,6 +17,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { deflateSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
+import { mkdir as mkdirp, rm as rmDir, writeFile as writeOut } from 'node:fs/promises';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -33,7 +35,8 @@ import {
   type SitePlan,
 } from '@statxai/contracts';
 import { StateStore, createBudget, type CanonicalDraftDocument, type FrontendBackendBuildBindingDocument } from '@statxai/state';
-import { ArtifactRegistry, ProjectWorkspace, contentHash } from '@statxai/workspace';
+import { ArtifactRegistry, BlobStore, ProjectWorkspace, contentHash, readSiteExportFile, readSiteExportSnapshot } from '@statxai/workspace';
+import { readFile as readDisk } from 'node:fs/promises';
 import { exportFromPageFiles, pageFilesForModel } from './support/site-model-export.js';
 import {
   computeRunIntentHash,
@@ -208,7 +211,18 @@ vi.mock('@statxai/workspace', async (importOriginal) => {
   const actual = await importOriginal<typeof Workspace>();
   return {
     ...actual,
-    buildSite: vi.fn(async () => ({ ok: true, durationMs: 5, output: '', outDir: '/out' })),
+    // A faithful compile: the page files a build wrote become its static export in `out`, with the build's own digest.
+    buildSite: vi.fn(async (siteRoot: string) => {
+      const files = await exportFromPageFiles(siteRoot);
+      const outDir = join(siteRoot, 'out');
+      await rmDir(outDir, { recursive: true, force: true });
+      for (const file of files) {
+        await mkdirp(join(outDir, file.path, '..'), { recursive: true });
+        await writeOut(join(outDir, file.path), file.contents, 'utf8');
+      }
+      const exportDigest = actual.exportDigestOf(files.map((f) => ({ path: f.path, sha256: createHash('sha256').update(f.contents).digest('hex') })));
+      return { ok: true, durationMs: 5, output: '', outDir, exportDigest };
+    }),
     readBuiltFiles: vi.fn(async (siteRoot: string) => exportFromPageFiles(siteRoot)),
     readExportFiles: vi.fn(async () => []),
     readSourceFiles: vi.fn(async () => [{ path: 'app/page.tsx', contents: 'x' }]),
@@ -220,7 +234,8 @@ vi.mock('@statxai/workspace', async (importOriginal) => {
     captureInBrowser: vi.fn(async (options: Workspace.BrowserRenderOptions) => {
       calls.capture += 1;
       if (captureFailures.has(calls.capture)) throw new Error('process died mid-evaluation');
-      const subject = { ...options.subject, exportDigest: String(calls.capture).padStart(64, 'e') };
+      // The renderer digests exactly the export it was handed, as the real one does.
+      const subject = { ...options.subject, exportDigest: (await actual.readExportTree(options.exportDir)).exportDigest };
       const captures = options.plan.sitemap.pages.flatMap((p) =>
         actual.BROWSER_VIEWPORTS.map((viewport, i) => ({ route: p.route, viewport, reason: 'captured' as const, page: { width: viewport.width, height: viewport.height }, truncated: false, png: png(viewport.width, viewport.height, calls.capture * 16 + i), width: viewport.width, height: viewport.height, detail: null })),
       );
@@ -343,7 +358,8 @@ async function draftProject(options: { conclude?: boolean } = {}): Promise<Draft
   const b0 = (await store.frontendBackendBuildBindings.findOne({ _id: binding._id }))!;
   const evaluation = await evaluateSite(contextFor(projectId, ws), { sitePlan: sitePlanRef, editableSiteModel: model.ref, authority: { mode: 'job_lifecycle', buildBindingId: b0._id, promotionId: b0.promotionId, promotionCommitSha: b0.promotionCommitSha } });
   if (evaluation.kind !== 'evaluated' || !evaluation.screenshotSet) throw new Error('fixture evaluation failed');
-  const draft = options.conclude === false ? null : (await concludeCanonicalDraft({ store, workspace: ws, projectId, canonicalBindingId: b0._id, promotion: { promotionId: b0.promotionId, promotionCommitSha: b0.promotionCommitSha } })).draft;
+  if (!evaluation.siteExportSnapshot) throw new Error('fixture evaluation captured no export snapshot');
+  const draft = options.conclude === false ? null : (await concludeCanonicalDraft({ store, registry, siteExportSnapshot: evaluation.siteExportSnapshot, workspace: ws, projectId, canonicalBindingId: b0._id, promotion: { promotionId: b0.promotionId, promotionCommitSha: b0.promotionCommitSha } })).draft;
   return { projectId, ws, b0, m0: model.ref, model0: model.model, d0: draft!, b0ScreenshotSet: evaluation.screenshotSet };
 }
 
@@ -463,6 +479,24 @@ describe('one semantic edit, from draft to draft', () => {
     expect(await store.frontendBackendBuildBindings.countDocuments({ projectId: d.projectId, activeLineage: true })).toBe(0);
     expect((await loadCurrentCanonicalDraft(store, d.projectId))?._id).toBe(d1._id);
     expect((await deriveLineageTipFromRoot(store, (await store.frontendBackendBuildBindings.findOne({ _id: d.b0._id }))!))._id).toBe(b1._id);
+
+    // --- Exact exports: D0 still names S0 (B0's bytes) while the mutable export now holds B1; D1 names S1 of exactly B1.
+    expect(d.d0.siteExportSnapshot).toBeDefined();
+    expect(d0.siteExportSnapshot).toEqual(d.d0.siteExportSnapshot);
+    expect(d1.siteExportSnapshot).toEqual(intent.evaluation!.siteExportSnapshot);
+    expect(d1.siteExportSnapshot).not.toEqual(d0.siteExportSnapshot);
+    const blobs = new BlobStore(store);
+    const s0 = await readSiteExportSnapshot(registry, d.projectId, d0.siteExportSnapshot!);
+    const s1 = await readSiteExportSnapshot(registry, d.projectId, d1.siteExportSnapshot!);
+    expect(s0.subject.authority).toMatchObject({ buildBindingId: d.b0._id });
+    expect(s1.subject.authority).toMatchObject({ buildBindingId: b1._id, promotionId: b1.promotionId });
+    expect(s1.subject.editableSiteModel).toEqual(result.editableSiteModel);
+    expect(s1.exportDigest).toBe(b1Set.subject.exportDigest);
+    const onDisk = await readDisk(join(d.ws.siteRoot, 'out', 'index.html'), 'utf8');
+    expect(onDisk).toContain('<p>edited 1</p>');
+    expect((await readSiteExportFile(blobs, s0, 'index.html'))!.bytes.toString()).toContain('<p>B0</p>');
+    expect((await readSiteExportFile(blobs, s0, 'index.html'))!.bytes.toString()).not.toContain('Wardrobes made in our workshop');
+    expect((await readSiteExportFile(blobs, s1, 'index.html'))!.bytes.toString()).toContain('Wardrobes made in our workshop');
 
     // --- Draft only: no refinement, adjudication, approval, release or deployment.
     expect(calls.refine).toBe(0);
@@ -779,8 +813,13 @@ describe('recovery from durable state', () => {
     expect((await store.canonicalDrafts.findOne({ _id: d.d0._id }))).toHaveProperty('current', true);
 
     const captures = calls.capture;
+    const snapshotsBefore = await count(d.projectId, 'site-export-snapshot');
     const resumed = await applySemanticEdit(editInput(d));
     expect(resumed).toMatchObject({ status: 'completed', evaluation: intent.evaluation });
+    // Concluded from exactly the snapshot the evaluation recorded — no new capture, no lookup.
+    expect(intent.evaluation!.siteExportSnapshot).toBeDefined();
+    expect((await store.canonicalDrafts.findOne({ _id: resumed.resultDraftId! }))?.siteExportSnapshot).toEqual(intent.evaluation!.siteExportSnapshot);
+    expect(await count(d.projectId, 'site-export-snapshot')).toBe(snapshotsBefore);
     expect(calls.capture).toBe(captures);
     expect(calls.edit).toHaveLength(1);
     expect(await store.canonicalDrafts.countDocuments({ projectId: d.projectId, current: true })).toBe(1);

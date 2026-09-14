@@ -7614,6 +7614,125 @@ before anything is created.
 draft-run suites, because Phase 5q independently refuses a concluded draft. It is
 killed by the guard's own semantic-edit and draft boundary suites.
 
+## Immutable site export snapshots — **DONE**
+
+**Why.** The operator preview serves `WORKSPACES_ROOT/<project>/app/out`, which
+every canonical compile rewrites. A semantic edit's evaluation of B1 rewrites it
+while D0 is still the current draft, so it cannot be revision authority. Evidence
+kept only the export's digest and screenshots.
+
+**Gate findings.**
+
+- **Where the export is written:** `buildSite` writes the export into
+  `siteRoot/out`. It clears the directory, then copies the export out of the
+  sandbox. Only `evaluateSite` (and legacy paths) compile the canonical workspace;
+  validation and `test_runner` compile disposable workspaces.
+- **Concurrency:** writers are serialised only by project ownership (lineage and
+  draft). A live run and a crashed one are indistinguishable, so correctness must
+  not assume a single writer.
+- **Digest:** the export digest was computed only in the browser renderer, as
+  sha256 over `path \0 sha256 \n` in path order. It walked copies and silently
+  skipped non-regular files.
+- **Blob store:** keys are sha256, entries are immutable and deduplicated, reads
+  are re-hashed, and each blob is at most 12 MiB. A deduplicated write with a
+  different content type is refused as corrupt.
+
+**One digest.** `exportDigestOf` (`workspace/src/export-digest.ts`, pure) is the
+only implementation, with the same algorithm, so historical render digests keep
+their meaning.
+
+- **Compile:** `buildSite` now returns `exportDigest` of exactly the files it
+  wrote into `out`.
+- **Renderer:** the browser renderer uses the same function.
+
+**Capture (`evaluateSite`).**
+
+1. **Gates:** after the deterministic gates run against the compiled export.
+2. **Read:** `captureSiteExportSnapshot` reads `out` once. Only regular files are
+   accepted; symlinks, FIFOs and devices are refused. The read is bounded.
+3. **Check:** it refuses unless the read digests to the compile's own digest
+   (`export_changed`), so a directory another writer touched is never captured.
+4. **Store:** it writes every file as a blob, then one strict manifest artifact.
+5. **Render:** the render then runs on a private copy materialised from those
+   captured bytes.
+6. **Fence:** a render whose digest differs from the snapshot's throws
+   `EvaluationSiteExportMismatch` before screenshots are persisted.
+
+A refused capture leaves `siteExportSnapshot: null` with a reason. Release and
+render behave as before; draft conclusion fails closed.
+
+**Artifact (`site-export-snapshot`).**
+
+- **Manifest:** `policyVersion`, `subject`, `exportDigest`, `files`, `totalFiles`
+  and `totalBytes`.
+- **Subject:** the render subject (project, exact site plan, source commit, build
+  authority with binding and promotion) plus the exact `editableSiteModel`.
+- **Files:** `{ path, blob, sha256, bytes }`, with paths canonical, relative,
+  unique and ascending. No raw bytes.
+- **Policy `statxai-site-export-snapshot@1`:** at most 4,096 files; each file at
+  most 12 MiB (exactly the blob limit); at most 256 MiB in total.
+- **Refusals (never truncation):** `too_many_files`, `file_too_large`,
+  `snapshot_too_large`, `invalid_entry`, `empty_export`, `export_changed`.
+- **Failure model:** blobs are written before the manifest, so a failure may leave
+  deduplicated orphan blobs but never a manifest naming a missing blob. No
+  garbage collection.
+- **Content type:** every snapshot blob is stored as `application/octet-stream`.
+  Media type comes from the trusted path when served.
+
+**Reader.**
+
+- **`readSiteExportSnapshot(registry, projectId, ref)`:** exact ref only, with a
+  content hash required. It checks the stored document's hash, the schema and its
+  invariants, the project, and re-derives the digest from the entries.
+- **`readSiteExportFile`:** reads by exact manifest path through `BlobStore.get`,
+  which re-hashes, and re-checks against the entry.
+- **`resolveSiteExportRequest`:** decodes once and refuses traversal, encoded
+  traversal, backslashes, absolute segments, malformed percent-encoding and NUL.
+  It resolves `/` to `index.html`, a route to `route.html` or `route/index.html`,
+  and assets exactly, against the manifest only. Unknown paths are `null`, with no
+  filesystem fallback.
+
+**Drafts.**
+
+- **Record:** `CanonicalDraftDocument.siteExportSnapshot` holds the exact ref.
+- **Conclusion:** `concludeCanonicalDraft` requires the caller's exact snapshot. It
+  re-reads it and refuses a snapshot of another project, binding, promotion,
+  promotion commit, site plan or editable model, a ref that does not prove
+  itself, and a replay with a different snapshot.
+- **Draft-targeted runs:** pass their final evaluation's snapshot.
+- **Semantic edits:** record it on the intent's evaluation and conclude D1 from
+  exactly that ref, including after a crash before conclusion. D0 keeps S0
+  byte-for-byte while `out` holds B1.
+- **Legacy drafts:** they have no snapshot, stay readable, and
+  `requireCanonicalDraftExportSnapshot` refuses them. Nothing is backfilled and
+  `out` is never a substitute.
+
+**Unchanged.** Release and publication semantics, the operator preview, and the
+provider. No customer preview route, editor or edit worker.
+
+**Tests.**
+
+- **`workspace/test/site-export.test.ts` (33):** contract, digest, tree reading
+  (byte-exact, symlink, FIFO, bounds), request resolution, traversal and media
+  types.
+- **`workspace/test/site-export.integration.test.ts` (9):** capture and blobs,
+  byte-exact reads, dedup and versioning, `export_changed`, immutability after
+  `out` changes, exact-ref refusals, a forged manifest, a corrupt blob, and a real
+  browser render digest equal to the snapshot's.
+- **Integration additions:**
+  - canonical draft: snapshot recorded, six wrong-subject refusals, a forged ref,
+    a replay mismatch, a legacy draft;
+  - draft run: D0 names S0 of B0, the render digest matches, nested routes resolve,
+    and `export_changed` or render mismatch never drafts;
+  - semantic edit: S0 immutable while `out` is B1, D1 names S1, and recovery
+    reuses the recorded S1.
+- **`site-export-boundary.test.ts` (8):** structural.
+- **Pins updated** for the pure digest module and the render input.
+
+**Mutations: 20 of 20 killed.** Two of them — draft conclusion and semantic-edit
+recovery choosing the latest snapshot — are killed structurally, because in those
+scenarios the latest snapshot is also the exact one.
+
 ## Phases 6–17
 
 Not started.

@@ -554,9 +554,16 @@ async function continueSemanticEdit(deps: SemanticEditDeps, loaded: SemanticEdit
       say({ phase: 'evaluate', detail: `semantic edit ${intent._id}: review unavailable (${evaluation.reason})`, level: 'fail' });
       return resultOf(intent, replayed, { evaluationUnavailable: evaluation.reason });
     }
+    if (!evaluation.siteExportSnapshot) {
+      // No exact export to preview the new draft from: it stays promoted, and a replay evaluates again.
+      const reason = `no site export snapshot (${evaluation.siteExportSnapshotRefusal ?? 'none captured'})`;
+      say({ phase: 'evaluate', detail: `semantic edit ${intent._id}: ${reason}`, level: 'fail' });
+      return resultOf(intent, replayed, { evaluationUnavailable: reason });
+    }
     intent = await advanceIntent(store, intent, 'promoted', 'evaluated', {
       evaluation: {
         testReport: evaluation.testReport,
+        siteExportSnapshot: evaluation.siteExportSnapshot,
         screenshotSet: evaluation.screenshotSet,
         visualQualityReview: evaluation.visualQualityReview?.ref ?? null,
         gatesPassed: evaluation.compiled.ok && evaluation.gateRun.passed,
@@ -576,6 +583,9 @@ async function continueSemanticEdit(deps: SemanticEditDeps, loaded: SemanticEdit
   const evaluatedIntent = intent;
   const { draft } = await concludeCanonicalDraft({
     store,
+    registry,
+    // Exactly the snapshot this edit's evaluation recorded — never looked up again.
+    siteExportSnapshot: intent.evaluation.siteExportSnapshot,
     workspace,
     projectId,
     canonicalBindingId: successor._id,

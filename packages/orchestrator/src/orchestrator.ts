@@ -694,7 +694,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
    * lineage, its structural tip, the promotion and the absence of any release.
    * A draft a customer will edit must carry an exact editable site model.
    */
-  const concludeDraftRun = async (): Promise<RunResult> => {
+  const concludeDraftRun = async (siteExportSnapshot: ArtifactRef | null, snapshotRefusal: string | null): Promise<RunResult> => {
     if (frontendBackendExecutionMode !== 'job_lifecycle' || !canonicalBuild) {
       throw new RunCompletionTargetUnsupported(projectId, 'this run holds no canonical build to conclude as a draft');
     }
@@ -702,8 +702,14 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
     if (!editableSiteModel?.contentHash) {
       throw new RunCompletionTargetUnsupported(projectId, `canonical build "${canonicalBuild._id}" pins no exact editable site model, so it cannot be an editable draft`);
     }
+    // A draft is previewed from exactly its build's immutable export, or it is not a draft.
+    if (!siteExportSnapshot) {
+      throw new RunCompletionTargetUnsupported(projectId, `canonical build "${canonicalBuild._id}" has no exact site export snapshot (${snapshotRefusal ?? 'none captured'})`);
+    }
     const { draft } = await concludeCanonicalDraft({
       store,
+      registry,
+      siteExportSnapshot,
       workspace,
       projectId,
       canonicalBindingId: canonicalBuild._id,
@@ -720,6 +726,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
         promotionId: draft.promotionId,
         promotionCommitSha: draft.promotionCommitSha,
         editableSiteModel,
+        siteExportSnapshot,
       },
     };
   };
@@ -871,7 +878,7 @@ export async function runProject(options: RunOptions): Promise<RunResult> {
           progress.terminalDecision = 'mark_blocked';
           break;
         }
-        return concludeDraftRun();
+        return concludeDraftRun(evaluation.siteExportSnapshot, evaluation.siteExportSnapshotRefusal);
       }
 
       /**

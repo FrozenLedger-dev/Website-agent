@@ -471,6 +471,13 @@ export interface CanonicalDraftDocument {
   promotionId: string;
   promotionCommitSha: string;
   /**
+   * The exact immutable `site-export-snapshot` of the build this draft owns —
+   * what a preview of this draft serves, and nothing else ever. Absent only on
+   * drafts concluded before snapshots existed: those have no exact preview, and
+   * nothing substitutes the mutable export for one.
+   */
+  siteExportSnapshot?: ArtifactRef;
+  /**
    * `available` until one exact operation claims it; a claim is durable, never
    * expires, and moves only by its own claimant's explicit release.
    */
@@ -545,6 +552,8 @@ export interface SemanticEditIntentDocument {
   /** Set from `evaluated`: the exact evidence the successor build's fresh evaluation wrote. */
   evaluation?: {
     testReport: ArtifactRef;
+    /** The exact immutable export snapshot of the successor — what its draft will name. */
+    siteExportSnapshot: ArtifactRef;
     screenshotSet: ArtifactRef | null;
     visualQualityReview: ArtifactRef | null;
     gatesPassed: boolean;

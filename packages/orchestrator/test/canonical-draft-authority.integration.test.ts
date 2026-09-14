@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ReplanSuccessorProvenance, VisualRefinementSuccessorProvenance, type ArtifactRef, type BuildSuccessorProvenance } from '@statxai/contracts';
 import { StateStore, type CanonicalDraftDocument, type FrontendBackendBuildBindingDocument } from '@statxai/state';
-import { ArtifactRegistry, ProjectWorkspace } from '@statxai/workspace';
+import { ArtifactRegistry, BlobStore, ProjectWorkspace, captureSiteExportSnapshot, readExportTree } from '@statxai/workspace';
 import type { ReleaseAuthorization } from '@statxai/policy-engine';
 import {
   FrontendBackendBuildLineageCorrupt,
@@ -38,6 +38,8 @@ import {
   assertCanonicalDraftPromotionMarker,
   canonicalDraftId,
   CanonicalDraftInOperation,
+  CanonicalDraftExportUnavailable,
+  requireCanonicalDraftExportSnapshot,
   claimCanonicalDraft,
   handOffCanonicalDraft,
   resolveCanonicalDraftAuthority,
@@ -59,6 +61,13 @@ let store: StateStore;
 let registry: ArtifactRegistry;
 let workspacesRoot: string;
 let counter = 0;
+/** Each promoted fixture build's exact export snapshot, by binding id. */
+const snapshots = new Map<string, ArtifactRef>();
+const snapshotOf = (bindingId: string) => {
+  const ref = snapshots.get(bindingId);
+  if (!ref) throw new Error(`no snapshot for ${bindingId}`);
+  return ref;
+};
 
 beforeAll(async () => {
   store = await StateStore.connect({ uri: process.env.MONGODB_URI ?? 'mongodb://localhost:27018/statxai_test?replicaSet=rs0', dbName: 'statxai_test' });
@@ -151,6 +160,19 @@ async function project(state: 'building' | 'validating' = 'validating'): Promise
       const promotionCommitSha = (await ws.commit(`Promote accepted frontend/backend candidate\n\n${promotionMarker(promotionId)}`))!;
       await store.promotions.insertOne({ _id: promotionId, projectId, jobId: binding.jobId, attempt: 1, output: { name: 'x', version: 1 }, baseCommit: null, status: 'committed', commitSha: promotionCommitSha, createdAt: new Date(), updatedAt: new Date() });
       await finalizeBindingPromoted(store, binding._id, { promotionId, promotionCommitSha });
+      // The exact export snapshot an evaluation of this build would capture.
+      const exportDir = await mkdtemp(join(workspacesRoot, 'export-'));
+      await writeFile(join(exportDir, 'index.html'), `<!doctype html><title>${binding._id}</title>`, 'utf8');
+      const tree = await readExportTree(exportDir);
+      const captured = await captureSiteExportSnapshot({
+        registry,
+        blobs: new BlobStore(store),
+        projectId,
+        exportDir,
+        expectedExportDigest: tree.exportDigest,
+        subject: { projectId, sitePlan: binding.sitePlan, sourceCommit: promotionCommitSha, authority: { mode: 'job_lifecycle', buildBindingId: binding._id, promotionId, promotionCommitSha }, editableSiteModel: binding.jobSpec.inputs.editableSiteModel ?? null },
+      });
+      snapshots.set(binding._id, captured.ref);
       return (await store.frontendBackendBuildBindings.findOne({ _id: binding._id }))!;
     },
     async reload(id) {
@@ -169,6 +191,9 @@ async function withPromotedRoot(): Promise<{ p: Project; b0: FrontendBackendBuil
 const conclude = (p: Project, build: FrontendBackendBuildBindingDocument, over: Partial<{ promotionId: string | null; promotionCommitSha: string | null }> = {}) =>
   concludeCanonicalDraft({
     store,
+    registry,
+    // A build that never promoted has no snapshot of its own; its predecessor's is offered, and conclusion refuses it anyway.
+    siteExportSnapshot: snapshots.get(build._id) ?? snapshotOf(build.predecessorBindingId!),
     workspace: p.ws,
     projectId: p.projectId,
     canonicalBindingId: build._id,
@@ -370,7 +395,7 @@ describe('draft conclusion', () => {
     await expect(conclude(p, b0)).rejects.toThrow(/no active build lineage/);
 
     const other = await withPromotedRoot();
-    await expect(concludeCanonicalDraft({ store, workspace: other.p.ws, projectId: other.p.projectId, canonicalBindingId: b0._id, promotion: { promotionId: b0.promotionId, promotionCommitSha: b0.promotionCommitSha } })).rejects.toBeInstanceOf(CanonicalDraftConclusionRefused);
+    await expect(concludeCanonicalDraft({ store, registry, siteExportSnapshot: snapshotOf(b0._id), workspace: other.p.ws, projectId: other.p.projectId, canonicalBindingId: b0._id, promotion: { promotionId: b0.promotionId, promotionCommitSha: b0.promotionCommitSha } })).rejects.toBeInstanceOf(CanonicalDraftConclusionRefused);
     expect(await draftsOf(p.projectId)).toEqual([]);
     expect(await draftsOf(other.p.projectId)).toEqual([]);
   });
@@ -967,7 +992,7 @@ describe('a draft handed to its operation', () => {
     await handOff(E);
     const b1 = await p.promote(await p.prepare('1', { predecessorBindingId: b0._id, provenance: replan(1) }));
     const next = (over: Partial<Parameters<typeof concludeCanonicalDraft>[0]> = {}) =>
-      concludeCanonicalDraft({ store, workspace: p.ws, projectId: p.projectId, canonicalBindingId: b1._id, promotion: { promotionId: b1.promotionId, promotionCommitSha: b1.promotionCommitSha }, supersede: { draftId: draft._id, claimant: E }, ...over });
+      concludeCanonicalDraft({ store, registry, siteExportSnapshot: snapshotOf(b1._id), workspace: p.ws, projectId: p.projectId, canonicalBindingId: b1._id, promotion: { promotionId: b1.promotionId, promotionCommitSha: b1.promotionCommitSha }, supersede: { draftId: draft._id, claimant: E }, ...over });
 
     await expect(conclude(p, b1)).rejects.toThrow(/already exists while a lineage is active/);
     await expect(next({ supersede: { draftId: draft._id, claimant: F } })).rejects.toBeInstanceOf(CanonicalDraftConclusionRefused);
@@ -989,5 +1014,88 @@ describe('a draft handed to its operation', () => {
     expect(again).toMatchObject({ replayed: true, draft: { _id: d1._id } });
     expect(completions).toEqual([false, true]);
     expect(await store.canonicalDrafts.countDocuments({ projectId: p.projectId, current: true })).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The exact export snapshot a draft names
+// ---------------------------------------------------------------------------
+
+describe('a draft names the exact export snapshot of its build', () => {
+  async function snapshotWith(p: Project, build: FrontendBackendBuildBindingDocument, over: Partial<{ projectId: string; buildBindingId: string; promotionId: string; promotionCommitSha: string; sitePlanVersion: number; model: ArtifactRef | null }>) {
+    const projectId = over.projectId ?? p.projectId;
+    const exportDir = await mkdtemp(join(workspacesRoot, 'export-'));
+    await writeFile(join(exportDir, 'index.html'), `<!doctype html><title>${Math.random()}</title>`, 'utf8');
+    const tree = await readExportTree(exportDir);
+    const captured = await captureSiteExportSnapshot({
+      registry,
+      blobs: new BlobStore(store),
+      projectId,
+      exportDir,
+      expectedExportDigest: tree.exportDigest,
+      subject: {
+        projectId,
+        sitePlan: { ...build.sitePlan, version: over.sitePlanVersion ?? build.sitePlan.version },
+        sourceCommit: build.promotionCommitSha,
+        authority: { mode: 'job_lifecycle', buildBindingId: over.buildBindingId ?? build._id, promotionId: over.promotionId ?? build.promotionId, promotionCommitSha: over.promotionCommitSha ?? build.promotionCommitSha },
+        editableSiteModel: over.model === undefined ? (build.jobSpec.inputs.editableSiteModel ?? null) : over.model,
+      },
+    });
+    return captured.ref;
+  }
+  const concludeWith = (p: Project, build: FrontendBackendBuildBindingDocument, siteExportSnapshot: ArtifactRef) =>
+    concludeCanonicalDraft({ store, registry, siteExportSnapshot, workspace: p.ws, projectId: p.projectId, canonicalBindingId: build._id, promotion: { promotionId: build.promotionId, promotionCommitSha: build.promotionCommitSha } });
+
+  it('records the exact snapshot ref it was handed', async () => {
+    const { p, b0 } = await withPromotedRoot();
+    const { draft } = await conclude(p, b0);
+    expect(draft.siteExportSnapshot).toEqual(snapshotOf(b0._id));
+    expect(requireCanonicalDraftExportSnapshot(draft)).toEqual(snapshotOf(b0._id));
+    expect((await store.canonicalDrafts.findOne({ _id: draft._id }))?.siteExportSnapshot).toEqual(snapshotOf(b0._id));
+  });
+
+  it.each([
+    ['another project', { projectId: 'proj_draft_foreign' }, /not a valid site export snapshot|belongs to another project/],
+    ['another binding', { buildBindingId: 'frontend-backend-build-other' }, /was not exported by build/],
+    ['another promotion', { promotionId: 'promotion-other' }, /was not exported by build/],
+    ['another promotion commit', { promotionCommitSha: 'e'.repeat(40) }, /was not exported by build/],
+    ['another site plan', { sitePlanVersion: 99 }, /different site plan/],
+    ['another editable site model', { model: { name: 'editable-site-model', version: 9, contentHash: 'd'.repeat(64) } }, /different editable site model/],
+  ] as const)('refuses a snapshot of %s, writing nothing', async (_label, over, message) => {
+    const { p, b0 } = await withPromotedRoot();
+    const ref = await snapshotWith(p, b0, over);
+    await expect(concludeWith(p, b0, ref)).rejects.toThrow(message);
+    expect(await draftsOf(p.projectId)).toEqual([]);
+    expect(await activeRootOf(p.projectId)).not.toBeNull();
+  });
+
+  it('refuses a ref that does not prove itself: a forged hash, a wrong name, a missing version', async () => {
+    const { p, b0 } = await withPromotedRoot();
+    const good = snapshotOf(b0._id);
+    await expect(concludeWith(p, b0, { ...good, contentHash: 'f'.repeat(64) })).rejects.toBeInstanceOf(CanonicalDraftConclusionRefused);
+    await expect(concludeWith(p, b0, { ...good, name: 'screenshot-set' })).rejects.toBeInstanceOf(CanonicalDraftConclusionRefused);
+    await expect(concludeWith(p, b0, { ...good, version: good.version + 50 })).rejects.toBeInstanceOf(CanonicalDraftConclusionRefused);
+    // A manifest whose files no longer digest to its exportDigest.
+    const doc = (await store.artifacts.findOne({ projectId: p.projectId, name: 'site-export-snapshot', version: good.version }))!;
+    await store.artifacts.updateOne({ _id: doc._id }, { $set: { 'data.exportDigest': 'e'.repeat(64) } });
+    await expect(concludeWith(p, b0, good)).rejects.toBeInstanceOf(CanonicalDraftConclusionRefused);
+    expect(await draftsOf(p.projectId)).toEqual([]);
+  });
+
+  it('an exact replay with a different snapshot is refused', async () => {
+    const { p, b0 } = await withPromotedRoot();
+    await conclude(p, b0);
+    const other = await snapshotWith(p, b0, {});
+    await expect(concludeWith(p, b0, other)).rejects.toThrow(/different site export snapshot/);
+  });
+
+  it('a draft concluded before snapshots existed stays readable, and has no preview — nothing is fabricated', async () => {
+    const { p, b0 } = await withPromotedRoot();
+    const { draft } = await conclude(p, b0);
+    await store.canonicalDrafts.updateOne({ _id: draft._id }, { $unset: { siteExportSnapshot: '' } });
+    const legacy = (await loadCurrentCanonicalDraft(store, p.projectId))!;
+    expect(legacy._id).toBe(draft._id);
+    expect(() => requireCanonicalDraftExportSnapshot(legacy)).toThrow(CanonicalDraftExportUnavailable);
+    expect(await store.artifacts.countDocuments({ projectId: p.projectId, name: 'site-export-snapshot' })).toBe(1);
   });
 });

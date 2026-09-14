@@ -29,7 +29,9 @@
  */
 import type { ClientSession } from 'mongodb';
 import type { CanonicalDraftClaimant, CanonicalDraftDocument, FrontendBackendBuildBindingDocument, ProjectState, StateStore } from '@statxai/state';
-import { contentHash, type ProjectWorkspace } from '@statxai/workspace';
+import { FRONTEND_BACKEND_INPUT } from '../job-handlers/frontend-backend.js';
+import { SiteExportSnapshotInvalid, contentHash, readSiteExportSnapshot, type ArtifactRegistry, type ProjectWorkspace } from '@statxai/workspace';
+import type { ArtifactRef } from '@statxai/contracts';
 import { promotionMarker } from '../job-promotion/frontend-backend.js';
 import {
   FrontendBackendBuildBindingCorrupt,
@@ -98,6 +100,23 @@ export class CanonicalDraftInOperation extends Error {
     super(`project "${projectId}": canonical draft "${draftId}" is handed to ${claimant.kind} operation "${claimant.operationId}"`);
     this.name = 'CanonicalDraftInOperation';
   }
+}
+
+/** The draft predates export snapshots: it has no exact preview, and nothing may stand in for one. */
+export class CanonicalDraftExportUnavailable extends Error {
+  constructor(
+    readonly projectId: string,
+    readonly draftId: string,
+  ) {
+    super(`project "${projectId}": canonical draft "${draftId}" records no site export snapshot, so it has no exact preview`);
+    this.name = 'CanonicalDraftExportUnavailable';
+  }
+}
+
+/** The exact export snapshot a draft names — or a typed refusal for a draft that names none. Never a fallback. */
+export function requireCanonicalDraftExportSnapshot(draft: CanonicalDraftDocument): ArtifactRef {
+  if (!draft.siteExportSnapshot) throw new CanonicalDraftExportUnavailable(draft.projectId, draft._id);
+  return draft.siteExportSnapshot;
 }
 
 /** A claimant that is not a well-formed, non-secret operation identity. */
@@ -344,6 +363,13 @@ const CONCLUDABLE: ReadonlySet<ProjectState> = new Set<ProjectState>(['planning'
 
 export interface ConcludeCanonicalDraftInput {
   readonly store: StateStore;
+  readonly registry: ArtifactRegistry;
+  /**
+   * The exact `site-export-snapshot` the concluding evaluation captured of this
+   * build. Supplied by the caller from that evaluation, never looked up here, and
+   * proven to be of exactly this build and promotion before it is recorded.
+   */
+  readonly siteExportSnapshot: ArtifactRef;
   readonly workspace: Pick<ProjectWorkspace, 'findCommitsByMarker'>;
   readonly projectId: string;
   /** The exact canonical build the concluding run holds, by id — re-read here. */
@@ -394,6 +420,17 @@ export async function concludeCanonicalDraft(input: ConcludeCanonicalDraftInput)
     throw refuse(`canonical history does not carry exactly one commit for promotion "${promotionId}" at ${promotionCommitSha}`);
   }
 
+  // The exact export snapshot, re-proven from its own stored bytes and manifest.
+  let snapshot;
+  try {
+    snapshot = await readSiteExportSnapshot(input.registry, projectId, input.siteExportSnapshot);
+  } catch (error) {
+    if (error instanceof SiteExportSnapshotInvalid) throw refuse(error.message);
+    throw error;
+  }
+  const snapshotRef: ArtifactRef = { name: input.siteExportSnapshot.name, version: input.siteExportSnapshot.version, contentHash: input.siteExportSnapshot.contentHash! };
+  const sameSnapshotRef = (a: ArtifactRef | undefined) => a !== undefined && a.name === snapshotRef.name && a.version === snapshotRef.version && a.contentHash === snapshotRef.contentHash;
+
   return store.withTransaction(async (session) => {
     const project = await store.projects.findOne({ _id: projectId }, { session });
     if (!project) throw refuse('the project document is missing');
@@ -408,6 +445,9 @@ export async function concludeCanonicalDraft(input: ConcludeCanonicalDraftInput)
       const current = await loadCurrentCanonicalDraft(store, projectId, { session });
       if (!current || current._id !== draftId || current.promotionCommitSha !== promotionCommitSha) {
         throw refuse(`the project is already the concluded draft "${current?._id ?? '(none)'}", not a draft of build "${canonicalBindingId}"`);
+      }
+      if (!sameSnapshotRef(current.siteExportSnapshot)) {
+        throw refuse(`draft "${draftId}" was concluded with a different site export snapshot`);
       }
       if (input.supersede) {
         const previous = await store.canonicalDrafts.findOne({ _id: input.supersede.draftId, projectId }, { session });
@@ -426,6 +466,26 @@ export async function concludeCanonicalDraft(input: ConcludeCanonicalDraftInput)
     const tip = await tipFrom(() => deriveActiveLineageTip(store, root, { session }), refuse);
     if (tip._id !== canonicalBindingId) throw refuse(`the active lineage has advanced to "${tip._id}"; "${canonicalBindingId}" is not its tip`);
     await provePromotion(store, tip, { promotionId, promotionCommitSha }, { session }, refuse);
+
+    // The snapshot is of exactly this build: its plan, its model, its build authority and promotion.
+    const { subject } = snapshot;
+    const pinnedModel = tip.jobSpec.inputs[FRONTEND_BACKEND_INPUT.editableSiteModel] ?? null;
+    const sameExact = (a: ArtifactRef | null, b: ArtifactRef | null) =>
+      a === null || b === null ? a === b : a.name === b.name && a.version === b.version && a.contentHash === b.contentHash;
+    if (
+      subject.authority.mode !== 'job_lifecycle' ||
+      subject.authority.buildBindingId !== canonicalBindingId ||
+      subject.authority.promotionId !== promotionId ||
+      subject.authority.promotionCommitSha !== promotionCommitSha
+    ) {
+      throw refuse(`site export snapshot ${snapshotRef.name}@${snapshotRef.version} was not exported by build "${canonicalBindingId}" at promotion "${promotionId}"`);
+    }
+    if (subject.sitePlan.name !== tip.sitePlan.name || subject.sitePlan.version !== tip.sitePlan.version) {
+      throw refuse(`site export snapshot ${snapshotRef.name}@${snapshotRef.version} is of a different site plan than build "${canonicalBindingId}"`);
+    }
+    if (!sameExact(subject.editableSiteModel, pinnedModel)) {
+      throw refuse(`site export snapshot ${snapshotRef.name}@${snapshotRef.version} carries a different editable site model than build "${canonicalBindingId}" pins`);
+    }
 
     const owner = await releaseOwner(store, projectId, root._id, { session });
     if (owner) throw refuse(`${owner} already owns continuation`);
@@ -458,7 +518,7 @@ export async function concludeCanonicalDraft(input: ConcludeCanonicalDraftInput)
       throw refuse(`draft "${existing._id}" already exists while a lineage is active`);
     }
 
-    const draft: CanonicalDraftDocument = { _id: draftId, ...identity, promotionCommitSha, status: 'available', current: true, createdAt: now, updatedAt: now };
+    const draft: CanonicalDraftDocument = { _id: draftId, ...identity, promotionCommitSha, siteExportSnapshot: snapshotRef, status: 'available', current: true, createdAt: now, updatedAt: now };
     await store.canonicalDrafts.insertOne(draft, { session });
 
     const moved = await store.projects.updateOne({ _id: projectId, state: project.state }, { $set: { state: 'draft', updatedAt: now } }, { session });

@@ -30,6 +30,8 @@ export interface RunResult {
     promotionId: string;
     promotionCommitSha: string;
     editableSiteModel: ArtifactRef;
+    /** The exact immutable export of that build — what a preview of this draft serves. */
+    siteExportSnapshot: ArtifactRef;
   };
   terminalDecision?: TerminalOutcome;
   /**

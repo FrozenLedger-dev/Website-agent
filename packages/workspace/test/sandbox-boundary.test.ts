@@ -168,7 +168,9 @@ describe('the sandbox holds no authority and forwards no environment', () => {
   it('site-build imports only Node built-ins and the sandbox — no job, acceptance, promotion or release authority', async () => {
     const code = await src(SITE_BUILD);
     const imports = [...code.matchAll(/from '([^']+)'/g)].map((m) => m[1]!);
-    expect(imports.filter((name) => !name.startsWith('node:'))).toEqual(['./sandbox.js']);
+    // The one export digest is a pure hash module; nothing else is reached.
+    expect(imports.filter((name) => !name.startsWith('node:')).sort()).toEqual(['./export-digest.js', './sandbox.js']);
+    expect([...(await src('packages/workspace/src/export-digest.ts')).matchAll(/from '([^']+)'/g)].map((m) => m[1])).toEqual(['node:crypto']);
     for (const file of [SANDBOX, SITE_BUILD]) {
       expect(await src(file)).not.toMatch(
         /@statxai\/(state|job-engine|orchestrator|contracts|agents|gates)|mongodb|JobEngine|StateStore|accept\w*Candidate|promot\w+\(|releas\w+\(/,

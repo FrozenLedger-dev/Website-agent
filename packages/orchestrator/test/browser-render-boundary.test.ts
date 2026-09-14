@@ -120,7 +120,7 @@ describe('authority separation', () => {
   it('the renderer imports only Node built-ins, the contracts and the sandbox primitives', async () => {
     const { outside } = await rendererParts();
     const imports = [...outside.matchAll(/from '([^']+)'/g)].map((m) => m[1]!);
-    expect(imports.filter((name) => !name.startsWith('node:')).sort()).toEqual(['./sandbox.js', '@statxai/contracts', 'zod/v4']);
+    expect(imports.filter((name) => !name.startsWith('node:')).sort()).toEqual(['./export-digest.js', './sandbox.js', '@statxai/contracts', 'zod/v4']);
     expect(outside).not.toMatch(/JobEngine|StateStore|ArtifactRegistry|ModelRuntime|\.invoke\(|accept\w*Candidate|promot|releas|budget|lineage|job-engine|@statxai\/(state|agents|orchestrator)/i);
   });
 
@@ -159,13 +159,18 @@ describe('canonical evaluation renders the exact build it evaluates', () => {
     expect(order.every((i) => i > -1)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     const render = site.slice(site.indexOf('await captureInBrowser({'), site.indexOf('const browserRender = '));
-    expect(render).toContain('exportDir: compiled.outDir,');
+    // Rendered from the exact captured snapshot bytes when one was captured; otherwise, as before, the build's export.
+    expect(render).toContain('exportDir: renderDir,');
+    expect(site).toContain('let renderDir = compiled.outDir;');
+    expect(site).toMatch(/await materializeSiteExport\(exportSnapshot\.files, privateExport\);\s*renderDir = privateExport;/);
+    expect(site.indexOf('await captureSiteExportSnapshot({')).toBeLessThan(site.indexOf('await captureInBrowser({'));
     expect(render).toContain('plan: progress.plan,');
     expect(render).toContain('projectId: facts.projectId,');
     expect(render).toContain('sitePlan: subject.sitePlan,');
-    expect(render).toContain('sourceCommit: await deps.workspace.currentCommit(),');
+    expect(render).toContain('sourceCommit,');
+    expect(site).toContain('const sourceCommit = compiled.ok ? await deps.workspace.currentCommit() : null;');
     expect(render).toContain('authority: subject.authority,');
-    expect(site).toMatch(/const captured = compiled\.ok\s*\?\s*await captureInBrowser\(/);
+    expect(site).toMatch(/captured = compiled\.ok\s*\?\s*await captureInBrowser\(/);
     // Evidence only: browser findings do not become defects in this slice.
     expect(site.slice(site.indexOf('const gateDefects'))).not.toMatch(/browserRender\.(renders|findings)/);
   });

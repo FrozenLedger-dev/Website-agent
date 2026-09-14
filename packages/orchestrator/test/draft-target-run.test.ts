@@ -122,16 +122,16 @@ describe('the draft branch', () => {
     const draftBranch = body(loop, "if (completionTarget === 'draft') {", "say({ phase: 'approve', detail: 'No blocking criteria outstanding");
     expect(draftBranch).toContain('releaseReadinessRefusal({ buildSucceeded: compiled.ok, blockingDefects: 0, gatesPassed: gateRun.passed })');
     expect(draftBranch).toMatch(/progress\.terminalDecision = 'mark_blocked';\s*break;/);
-    expect(draftBranch).toContain('return concludeDraftRun();');
+    expect(draftBranch).toContain('return concludeDraftRun(evaluation.siteExportSnapshot, evaluation.siteExportSnapshotRefusal);');
     expect(draftBranch).not.toMatch(/seekRelease|publishRelease|recommendApproval|authorizeRelease|awaiting_human_review/);
   });
 
   it('concludes exactly the run canonical build through canonical draft authority, with its exact model — no second implementation', async () => {
     const orchestrator = await src(ORCHESTRATOR);
-    const conclude = body(orchestrator, 'const concludeDraftRun = async (): Promise<RunResult> => {', '\n  };\n');
+    const conclude = body(orchestrator, 'const concludeDraftRun = async (siteExportSnapshot: ArtifactRef | null, snapshotRefusal: string | null): Promise<RunResult> => {', '\n  };\n');
     expect(conclude).toContain('const editableSiteModel = canonicalBuild.jobSpec.inputs[FRONTEND_BACKEND_INPUT.editableSiteModel];');
     expect(conclude).toMatch(/if \(!editableSiteModel\?\.contentHash\) \{\s*throw new RunCompletionTargetUnsupported/);
-    expect(conclude).toMatch(/await concludeCanonicalDraft\(\{\s*store,\s*workspace,\s*projectId,\s*canonicalBindingId: canonicalBuild\._id,\s*promotion: canonicalPromotion \?\?/);
+    expect(conclude).toMatch(/await concludeCanonicalDraft\(\{\s*store,\s*registry,\s*siteExportSnapshot,\s*workspace,\s*projectId,\s*canonicalBindingId: canonicalBuild\._id,\s*promotion: canonicalPromotion \?\?/);
     expect(conclude).not.toMatch(/canonicalDrafts\.|activeLineage|releaseActiveLineage|state: 'draft'|registry\.|\.sort\(|latest/i);
     expect(orchestrator.match(/concludeCanonicalDraft\(/g)).toHaveLength(1);
     for (const file of await productionFiles('packages/orchestrator/src')) {

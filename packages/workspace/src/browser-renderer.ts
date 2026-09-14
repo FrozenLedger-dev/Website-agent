@@ -31,6 +31,7 @@
  * nothing — no job, acceptance, promotion, release or project state, no model,
  * and no screenshot.
  */
+import { exportDigestOf } from './export-digest.js';
 import { createHash, randomBytes } from 'node:crypto';
 import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -493,10 +494,7 @@ async function snapshotExport(from: string, to: string): Promise<{ files: number
   };
   await mkdir(to, { recursive: true });
   await walk(from);
-  entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  const digest = createHash('sha256');
-  for (const entry of entries) digest.update(`${entry.path}\0${entry.hash}\n`);
-  return { files: entries.length, digest: digest.digest('hex') };
+  return { files: entries.length, digest: exportDigestOf(entries.map((entry) => ({ path: entry.path, sha256: entry.hash }))) };
 }
 
 export interface BrowserRenderOptions {

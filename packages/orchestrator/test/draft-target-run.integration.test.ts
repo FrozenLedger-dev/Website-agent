@@ -16,6 +16,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { deflateSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
+import { mkdir as mkdirp, rm as rmDir, writeFile as writeOut } from 'node:fs/promises';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -24,7 +26,7 @@ import type * as Gates from '@statxai/gates';
 import type * as Workspace from '@statxai/workspace';
 import { EditableSiteModel, ScreenshotSet, type SitePlan } from '@statxai/contracts';
 import { StateStore, type FrontendBackendBuildBindingDocument } from '@statxai/state';
-import { ArtifactRegistry, ProjectWorkspace, contentHash } from '@statxai/workspace';
+import { ArtifactRegistry, BlobStore, ProjectWorkspace, contentHash, readSiteExportFile, readSiteExportSnapshot, resolveSiteExportRequest } from '@statxai/workspace';
 import { pageFilesForModel, exportFromPageFiles } from './support/site-model-export.js';
 import { computeRunIntentHash, deriveLineageTipFromRoot, FrontendBackendBuildBindingConflict } from '../src/run-binding/frontend-backend.js';
 import { CanonicalDraftAuthorityCorrupt, loadCurrentCanonicalDraft } from '../src/canonical-draft/authority.js';
@@ -83,6 +85,9 @@ let captureFailures: Set<number>;
 /** Gate verdicts in call order: official validation measures first, canonical evaluation after. */
 let gateVerdicts: boolean[];
 let reviewThrows: boolean;
+/** Test levers on the faithful compile and renderer: a wrong build digest, or a renderer that rendered something else. */
+let compileDigestTamper: boolean;
+let renderDigestTamper: boolean;
 const calls = { plan: 0, build: 0, refine: 0, approve: 0, adjudicate: 0, replan: 0, capture: 0, edit: 0, deploy: 0 };
 const next = <T>(queue: T[]): T => (queue.length > 1 ? queue.shift()! : queue[0]!);
 
@@ -166,7 +171,18 @@ vi.mock('@statxai/workspace', async (importOriginal) => {
   const actual = await importOriginal<typeof Workspace>();
   return {
     ...actual,
-    buildSite: vi.fn(async () => ({ ok: true, durationMs: 5, output: '', outDir: '/out' })),
+    // A faithful compile: the page files a build wrote become its static export in `out`, with the build's own digest.
+    buildSite: vi.fn(async (siteRoot: string) => {
+      const files = await exportFromPageFiles(siteRoot);
+      const outDir = join(siteRoot, 'out');
+      await rmDir(outDir, { recursive: true, force: true });
+      for (const file of files) {
+        await mkdirp(join(outDir, file.path, '..'), { recursive: true });
+        await writeOut(join(outDir, file.path), file.contents, 'utf8');
+      }
+      const exportDigest = actual.exportDigestOf(files.map((f) => ({ path: f.path, sha256: createHash('sha256').update(f.contents).digest('hex') })));
+      return { ok: true, durationMs: 5, output: '', outDir, exportDigest: compileDigestTamper ? 'f'.repeat(64) : exportDigest };
+    }),
     readBuiltFiles: vi.fn(async (siteRoot: string) => exportFromPageFiles(siteRoot)),
     readExportFiles: vi.fn(async () => []),
     readSourceFiles: vi.fn(async () => [{ path: 'app/page.tsx', contents: 'x' }]),
@@ -178,7 +194,8 @@ vi.mock('@statxai/workspace', async (importOriginal) => {
     captureInBrowser: vi.fn(async (options: Workspace.BrowserRenderOptions) => {
       calls.capture += 1;
       if (captureFailures.has(calls.capture)) throw new Error('process died mid-evaluation');
-      const subject = { ...options.subject, exportDigest: String(calls.capture).padStart(64, 'e') };
+      // The renderer digests exactly the export it was handed, as the real one does.
+      const subject = { ...options.subject, exportDigest: renderDigestTamper ? 'd'.repeat(64) : (await actual.readExportTree(options.exportDir)).exportDigest };
       const captures = options.plan.sitemap.pages.flatMap((p) =>
         actual.BROWSER_VIEWPORTS.map((viewport, i) => ({ route: p.route, viewport, reason: 'captured' as const, page: { width: viewport.width, height: viewport.height }, truncated: false, png: png(viewport.width, viewport.height, calls.capture * 16 + i), width: viewport.width, height: viewport.height, detail: null })),
       );
@@ -245,6 +262,8 @@ beforeEach(async () => {
   captureFailures = new Set();
   gateVerdicts = [true];
   reviewThrows = false;
+  compileDigestTamper = false;
+  renderDigestTamper = false;
   for (const key of Object.keys(calls) as (keyof typeof calls)[]) calls[key] = 0;
   for (const c of [store.jobs, store.auditLog, store.artifacts, store.projects, store.budgets, store.defectBudgets, store.promotions, store.frontendBackendBuildBindings, store.releasePublications, store.visualRefinementIntents, store.blobs, store.canonicalDrafts, store.semanticEditIntents]) {
     await (c as { deleteMany(f: object): Promise<unknown> }).deleteMany({});
@@ -337,11 +356,21 @@ describe('a draft-targeted run', () => {
       promotionId: b0!.promotionId,
       promotionCommitSha: b0!.promotionCommitSha,
       editableSiteModel: b0!.jobSpec.inputs.editableSiteModel,
+      siteExportSnapshot: draft.siteExportSnapshot,
     });
     expect(result.draft!.editableSiteModel.contentHash).toMatch(/^[a-f0-9]{64}$/);
     expect((await store.projects.findOne({ _id: projectId }))?.state).toBe('draft');
     expect(await store.frontendBackendBuildBindings.countDocuments({ projectId, activeLineage: true })).toBe(0);
     await expectNoRelease(projectId);
+
+    // The draft names the exact immutable export of exactly B0 — the same bytes the browser rendered and photographed.
+    const s0 = await readSiteExportSnapshot(registry, projectId, draft.siteExportSnapshot!);
+    expect(s0.subject).toMatchObject({ projectId, sitePlan: b0!.sitePlan, authority: { mode: 'job_lifecycle', buildBindingId: b0!._id, promotionId: b0!.promotionId, promotionCommitSha: b0!.promotionCommitSha }, editableSiteModel: b0!.jobSpec.inputs.editableSiteModel });
+    expect(s0.exportDigest).toBe(set.subject.exportDigest);
+    expect(await count(projectId, 'site-export-snapshot')).toBe(1);
+    const services = await resolveSiteExportRequest(s0, '/services');
+    expect(services).toBe('services.html');
+    expect((await readSiteExportFile(new BlobStore(store), s0, services!))!.bytes.toString()).toContain('<p>build 1</p>');
 
     // A retry, or any fresh run, stops at the concluded draft — no second draft, no new root.
     await expect(run(projectId, { completionTarget: 'draft' })).rejects.toBeInstanceOf(ActiveContinuationConcludedDraft);
@@ -432,6 +461,23 @@ describe('a draft-targeted run', () => {
     reviewThrows = true;
     expect((await run(unavailable, { completionTarget: 'draft' })).outcome).toBe('blocked');
     expect(await store.canonicalDrafts.countDocuments({ projectId: unavailable })).toBe(0);
+  });
+
+  it('an export that changed after its build, or a render of different bytes, never becomes a draft', async () => {
+    const { RunCompletionTargetUnsupported } = await import('../src/orchestrator.js');
+    const changed = 'proj_draftrun_export_changed';
+    compileDigestTamper = true;
+    await expect(run(changed, { completionTarget: 'draft' })).rejects.toBeInstanceOf(RunCompletionTargetUnsupported);
+    expect(await count(changed, 'site-export-snapshot')).toBe(0);
+    expect(await store.canonicalDrafts.countDocuments({ projectId: changed })).toBe(0);
+
+    const mismatched = 'proj_draftrun_render_mismatch';
+    compileDigestTamper = false;
+    renderDigestTamper = true;
+    const { EvaluationSiteExportMismatch } = await import('../src/phases/evaluate.js');
+    await expect(run(mismatched, { completionTarget: 'draft' })).rejects.toBeInstanceOf(EvaluationSiteExportMismatch);
+    expect(await count(mismatched, 'screenshot-set')).toBe(0);
+    expect(await store.canonicalDrafts.countDocuments({ projectId: mismatched })).toBe(0);
   });
 
   it('legacy_direct cannot conclude a draft, and is refused before anything is created', async () => {
