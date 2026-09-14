@@ -14,7 +14,7 @@
 import { authorizeCustomerProjectView, type CustomerPrincipal } from '@statxai/customer-auth';
 import { readSemanticEditExecutionStatus } from '@statxai/orchestrator';
 import type { StateStore } from '@statxai/state';
-import type { CustomerProjectSummary, DraftEditability } from './dto.js';
+import type { CustomerProjectSummary, DraftEditability, InitialGenerationSummary } from './dto.js';
 
 /** At most this many projects are listed for one customer. */
 export const MAX_LISTED_PROJECTS = 200;
@@ -26,6 +26,31 @@ async function draftSummary(store: StateStore, projectId: string): Promise<'none
   if (draft.claim?.kind !== 'semantic_edit') return 'busy';
   const edit = await readSemanticEditExecutionStatus(store, projectId, draft.claim.operationId);
   return edit?.state === 'failed' ? 'edit_failed' : 'edit_in_progress';
+}
+
+/**
+ * `null` while there is a draft (its own status already says everything), or
+ * while the project has no initial draft request at all — a legacy,
+ * operator-created project, never shown as "generating".
+ */
+async function generationSummary(store: StateStore, projectId: string, draft: 'none' | DraftEditability): Promise<InitialGenerationSummary | null> {
+  if (draft !== 'none') return null;
+  const request = await store.initialDraftRequests.findOne({ projectId }, { projection: { status: 1 } });
+  if (!request) return null;
+  if (request.status === 'failed') return 'failed';
+  if (request.status === 'queued' || request.status === 'active') return 'in_progress';
+  return null;
+}
+
+/**
+ * A customer-facing name for a project. Every customer-created project has an
+ * initial draft request naming the intake it was generated from; a project
+ * predating this capability (operator-created, no such request) falls back to
+ * its id, exactly as it was shown before this field existed.
+ */
+async function displayNameOf(store: StateStore, projectId: string): Promise<string> {
+  const request = await store.initialDraftRequests.findOne({ projectId }, { projection: { 'intake.businessName': 1 } });
+  return request?.intake.businessName || projectId;
 }
 
 export async function listCustomerProjects(store: StateStore, principal: CustomerPrincipal): Promise<CustomerProjectSummary[]> {
@@ -47,7 +72,15 @@ export async function listCustomerProjects(store: StateStore, principal: Custome
     const authorization = await authorizeCustomerProjectView(store, principal, binding._id);
     if (!authorization.allowed) continue;
     const account = accounts.find((a) => a._id === authorization.accountId);
-    projects.push({ projectId: binding._id, accountName: account?.displayName ?? '', role: authorization.role, draft: await draftSummary(store, binding._id) });
+    const draft = await draftSummary(store, binding._id);
+    projects.push({
+      projectId: binding._id,
+      displayName: await displayNameOf(store, binding._id),
+      accountName: account?.displayName ?? '',
+      role: authorization.role,
+      draft,
+      generation: await generationSummary(store, binding._id, draft),
+    });
   }
   return projects;
 }

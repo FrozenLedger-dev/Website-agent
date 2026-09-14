@@ -8,14 +8,17 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { StateStore, type CustomerRole } from '@statxai/state';
 import {
+  CUSTOMER_ACCOUNT_ROLE_PERMISSIONS,
   CUSTOMER_ROLE_PERMISSIONS,
   CustomerTenancyConflict,
+  authorizeCustomerAccountCreate,
   authorizeCustomerProjectEdit,
   authorizeCustomerProjectView,
   bindProjectToCustomerAccount,
   createCustomerAccount,
   customerProjectDenialResponse,
   grantCustomerMembership,
+  listCustomerCreateEligibleAccounts,
   resolveCustomerUser,
   setCustomerAccountStatus,
   setCustomerMembershipStatus,
@@ -236,5 +239,74 @@ describe('project tenancy', () => {
     await expect(grantCustomerMembership(store, { accountId: account._id, customerUserId: 'cu_nonexistent', role: 'owner' })).rejects.toBeInstanceOf(CustomerTenancyConflict);
     const person = await customer('someone');
     await expect(grantCustomerMembership(store, { accountId: account._id, customerUserId: person.customerUserId, role: 'admin' as never })).rejects.toBeInstanceOf(CustomerTenancyConflict);
+  });
+});
+
+describe('account-scoped create authority — before a project exists', () => {
+  it('pins the role model: owner and editor may create; viewer never can', () => {
+    expect(CUSTOMER_ACCOUNT_ROLE_PERMISSIONS).toEqual({ owner: ['create'], editor: ['create'], viewer: [] });
+  });
+
+  it.each([
+    ['owner', true],
+    ['editor', true],
+    ['viewer', false],
+  ] as [CustomerRole, boolean][])('a %s may create a project in their own account: %s', async (role, canCreate) => {
+    const { account } = await tenant('Acme');
+    const person = await customer(`${role}-create`);
+    await grantCustomerMembership(store, { accountId: account._id, customerUserId: person.customerUserId, role });
+
+    const authorization = await authorizeCustomerAccountCreate(store, person, account._id);
+    expect(authorization.allowed).toBe(canCreate);
+    if (canCreate) expect(authorization).toEqual({ allowed: true, permission: 'create', accountId: account._id, role });
+    else expect(authorization).toEqual({ allowed: false, permission: 'create', denial: 'insufficient_role' });
+  });
+
+  it('no membership, a disabled membership, a disabled account, and a disabled user are all refused — a browser-claimed accountId is never trusted past this', async () => {
+    const { account } = await tenant('Acme');
+    const stranger = await customer('stranger-create');
+    expect(await authorizeCustomerAccountCreate(store, stranger, account._id)).toEqual({ allowed: false, permission: 'create', denial: 'no_membership' });
+
+    const owner = await customer('owner-create');
+    await grantCustomerMembership(store, { accountId: account._id, customerUserId: owner.customerUserId, role: 'owner' });
+    await setCustomerMembershipStatus(store, { accountId: account._id, customerUserId: owner.customerUserId, status: 'disabled' });
+    expect(await authorizeCustomerAccountCreate(store, owner, account._id)).toEqual({ allowed: false, permission: 'create', denial: 'disabled_membership' });
+    await setCustomerMembershipStatus(store, { accountId: account._id, customerUserId: owner.customerUserId, status: 'active' });
+
+    await setCustomerAccountStatus(store, account._id, 'disabled');
+    expect(await authorizeCustomerAccountCreate(store, owner, account._id)).toEqual({ allowed: false, permission: 'create', denial: 'disabled_account' });
+    await setCustomerAccountStatus(store, account._id, 'active');
+
+    expect(await authorizeCustomerAccountCreate(store, owner, 'acct_nonexistent')).toEqual({ allowed: false, permission: 'create', denial: 'unknown_account' });
+
+    await store.customerUsers.updateOne({ _id: owner.customerUserId }, { $set: { status: 'disabled' } });
+    expect(await authorizeCustomerAccountCreate(store, owner, account._id)).toEqual({ allowed: false, permission: 'create', denial: 'disabled_user' });
+  });
+
+  it('a member of account A cannot create in account B by naming its id — cross-tenant create is refused exactly like cross-tenant view/edit', async () => {
+    const a = await tenant('Acme');
+    const b = await tenant('Bravo');
+    const aliceOfA = await customer('alice-create');
+    await grantCustomerMembership(store, { accountId: a.account._id, customerUserId: aliceOfA.customerUserId, role: 'owner' });
+
+    expect((await authorizeCustomerAccountCreate(store, aliceOfA, a.account._id)).allowed).toBe(true);
+    expect(await authorizeCustomerAccountCreate(store, aliceOfA, b.account._id)).toEqual({ allowed: false, permission: 'create', denial: 'no_membership' });
+  });
+
+  it('lists every active account the customer may create in, with a customer-safe name only — excludes viewer-only accounts, disabled accounts and disabled memberships', async () => {
+    const owned = await tenant('Acme');
+    const viewedOnly = await tenant('Bravo');
+    const disabledAcct = await tenant('Charlie');
+    const person = await customer('multi-account');
+    await grantCustomerMembership(store, { accountId: owned.account._id, customerUserId: person.customerUserId, role: 'editor' });
+    await grantCustomerMembership(store, { accountId: viewedOnly.account._id, customerUserId: person.customerUserId, role: 'viewer' });
+    await grantCustomerMembership(store, { accountId: disabledAcct.account._id, customerUserId: person.customerUserId, role: 'owner' });
+    await setCustomerAccountStatus(store, disabledAcct.account._id, 'disabled');
+
+    const eligible = await listCustomerCreateEligibleAccounts(store, person);
+    expect(eligible).toEqual([{ accountId: owned.account._id, displayName: 'Acme' }]);
+
+    const strangerWithNothing = await customer('nothing');
+    expect(await listCustomerCreateEligibleAccounts(store, strangerWithNothing)).toEqual([]);
   });
 });

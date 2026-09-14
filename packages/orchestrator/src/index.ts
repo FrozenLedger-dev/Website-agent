@@ -28,6 +28,13 @@ export * from './canonical-draft/authority.js';
 export * from './semantic-edit/apply.js';
 export * from './semantic-edit/execution.js';
 export * from './semantic-edit/worker.js';
+// Reused directly by customer self-service project creation, rather than
+// re-deriving intake validation: the one existing, exported, side-effect-free
+// intake validator.
+export { validateIntake, type DiscoverResult, type ValidatedIntake } from './phases/discover.js';
+export * from './initial-draft/generate.js';
+export * from './initial-draft/execution.js';
+export * from './initial-draft/worker.js';
 // The publish phase's own surface — the deployment gateway an operator tool or
 // a test substitutes, and the options `publishRelease` now takes.
 export {

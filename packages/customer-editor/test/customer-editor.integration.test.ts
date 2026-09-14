@@ -164,7 +164,7 @@ describe('project discovery from persisted tenancy', () => {
     const response = await handleCustomerProjects(get(`/api/projects?accountId=${foreignAccount._id}&projectId=${foreign.projectId}`, viewer, { 'x-account-id': foreignAccount._id }), deps);
     expect(response.status).toBe(200);
     const body = (await response.json()) as { projects: { projectId: string }[] };
-    expect(body).toEqual({ projects: [{ projectId: a.projectId, accountName: 'Acme', role: 'viewer', draft: 'ready_to_edit' }] });
+    expect(body).toEqual({ projects: [{ projectId: a.projectId, displayName: a.projectId, accountName: 'Acme', role: 'viewer', draft: 'ready_to_edit', generation: null }] });
     expect(JSON.stringify(body)).not.toMatch(/bnd_|binding|promotion|lineage|job|acct_|mem_|cu_/i);
     expect(accountA._id).toMatch(/^acct_/);
   });
@@ -546,6 +546,6 @@ describe('while an edit runs, and after', () => {
     expect((await submitAs(editor, d, editBody(d, 'Try again'))).status).toBe(409);
     expect((await previewOf(editor, d.projectId, d.d0._id)).status).toBe(200);
     const listed = await listCustomerProjects(store, editor.principal);
-    expect(listed).toEqual([{ projectId: d.projectId, accountName: 'Harrowgate', role: 'editor', draft: 'edit_failed' }]);
+    expect(listed).toEqual([{ projectId: d.projectId, displayName: d.projectId, accountName: 'Harrowgate', role: 'editor', draft: 'edit_failed', generation: null }]);
   });
 });

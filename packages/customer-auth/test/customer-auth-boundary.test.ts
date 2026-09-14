@@ -99,8 +99,13 @@ describe('authentication is the mature library’s', () => {
   });
 
   it('the provider secret stays on the server: no public env var, client components only where no customer auth reaches, no secret or token in any response body', async () => {
-    // The editor UI and the error boundary are the only client components; neither can reach configuration, sessions or providers.
-    const CLIENT_COMPONENTS = ['apps/customer/app/error.tsx', 'apps/customer/app/projects/[projectId]/editor/editor.tsx'];
+    // The editor UI, the project-creation form, the generation-progress poller and the error boundary are the only client components; none can reach configuration, sessions or providers.
+    const CLIENT_COMPONENTS = [
+      'apps/customer/app/error.tsx',
+      'apps/customer/app/projects/[projectId]/editor/editor.tsx',
+      'apps/customer/app/projects/[projectId]/generating/generating-status.tsx',
+      'apps/customer/app/projects/new/new-project-form.tsx',
+    ];
     for (const file of [...(await files(PKG)), ...(await files(APP))]) {
       const code = await src(file);
       expect(code, file).not.toMatch(/NEXT_PUBLIC_/);

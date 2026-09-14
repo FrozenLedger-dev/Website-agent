@@ -86,6 +86,70 @@ async function authorizeProject(
   return { allowed: true, permission, projectId, accountId: binding.accountId, role: membership.role };
 }
 
+// ---------------------------------------------------------------------------
+// Account-scoped authority — for actions taken before a project exists
+// ---------------------------------------------------------------------------
+//
+// Project creation has no project to authorise against yet, so it is checked
+// against the account instead: the same principal → user → membership → role
+// chain as `authorizeProject`, minus the project and its binding. A browser
+// may name which account it means; this never trusts that name past
+// re-resolving the membership it implies.
+
+export type CustomerAccountPermission = 'create';
+
+/** Which roles may create a project in their account. A viewer never can, centrally — not by omission at each call site. */
+export const CUSTOMER_ACCOUNT_ROLE_PERMISSIONS: Readonly<Record<CustomerRole, readonly CustomerAccountPermission[]>> = Object.freeze({
+  owner: Object.freeze(['create'] as const),
+  editor: Object.freeze(['create'] as const),
+  viewer: Object.freeze([] as const),
+});
+
+export type CustomerAccountDenial = 'unknown_user' | 'disabled_user' | 'identity_mismatch' | 'unknown_account' | 'disabled_account' | 'no_membership' | 'disabled_membership' | 'insufficient_role';
+
+export type CustomerAccountAuthorization =
+  | { readonly allowed: true; readonly permission: CustomerAccountPermission; readonly accountId: string; readonly role: CustomerRole }
+  | { readonly allowed: false; readonly permission: CustomerAccountPermission; readonly denial: CustomerAccountDenial };
+
+/** May this customer create a project in this account? Re-resolves the membership server-side; a browser-supplied `accountId` is never trusted past this. */
+export async function authorizeCustomerAccountCreate(store: StateStore, principal: CustomerPrincipal, accountId: string): Promise<CustomerAccountAuthorization> {
+  const deny = (denial: CustomerAccountDenial): CustomerAccountAuthorization => ({ allowed: false, permission: 'create', denial });
+
+  const user = await store.customerUsers.findOne({ _id: principal.customerUserId });
+  if (!user) return deny('unknown_user');
+  if (user.status !== 'active') return deny('disabled_user');
+  if (user.issuer !== principal.externalIdentity.issuer || user.subject !== principal.externalIdentity.subject) return deny('identity_mismatch');
+
+  if (typeof accountId !== 'string' || accountId.length === 0) return deny('unknown_account');
+  const account = await store.customerAccounts.findOne({ _id: accountId });
+  if (!account) return deny('unknown_account');
+  if (account.status !== 'active') return deny('disabled_account');
+
+  const membership = await store.customerMemberships.findOne({ accountId, customerUserId: user._id });
+  if (!membership) return deny('no_membership');
+  if (membership.status !== 'active') return deny('disabled_membership');
+  if (!CUSTOMER_ACCOUNT_ROLE_PERMISSIONS[membership.role].includes('create')) return deny('insufficient_role');
+
+  return { allowed: true, permission: 'create', accountId, role: membership.role };
+}
+
+/**
+ * Every active account this customer may create a project in, with a
+ * customer-safe display name only — for the "which account" picker. A user in
+ * exactly one eligible account is the common case a caller can default
+ * silently; more than one means the browser must ask.
+ */
+export async function listCustomerCreateEligibleAccounts(store: StateStore, principal: CustomerPrincipal): Promise<Array<{ readonly accountId: string; readonly displayName: string }>> {
+  const user = await store.customerUsers.findOne({ _id: principal.customerUserId });
+  if (!user || user.status !== 'active') return [];
+  const memberships = await store.customerMemberships
+    .find({ customerUserId: user._id, status: 'active', role: { $in: ['owner', 'editor'] } })
+    .toArray();
+  if (memberships.length === 0) return [];
+  const accounts = await store.customerAccounts.find({ _id: { $in: memberships.map((m) => m.accountId) }, status: 'active' }).toArray();
+  return accounts.map((account) => ({ accountId: account._id, displayName: account.displayName }));
+}
+
 /** May this customer see this project? */
 export function authorizeCustomerProjectView(store: StateStore, principal: CustomerPrincipal, projectId: string): Promise<CustomerProjectAuthorization> {
   return authorizeProject(store, principal, projectId, 'view');

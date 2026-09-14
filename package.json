@@ -19,6 +19,7 @@
     "build:abandon": "node --env-file=.env.local --import tsx scripts/abandon-build.ts",
     "release:reconcile": "node --env-file=.env.local --import tsx scripts/reconcile-release.ts",
     "worker:semantic-edit": "node --env-file=.env.local --import tsx scripts/semantic-edit-worker.ts",
+    "worker:initial-draft": "node --env-file=.env.local --import tsx scripts/initial-draft-worker.ts",
     "scaffold:check": "node --import tsx scripts/scaffold-check.ts",
     "console": "cd apps/console && node --env-file=../../.env.local ./node_modules/next/dist/bin/next dev --port 3100",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p apps/console/tsconfig.json && tsc --noEmit -p apps/customer/tsconfig.json",

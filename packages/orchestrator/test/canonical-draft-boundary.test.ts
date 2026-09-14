@@ -246,10 +246,18 @@ describe('scope', () => {
       'apps/customer/app/api/projects/[projectId]/editor/route.ts',
       'apps/customer/app/api/projects/[projectId]/edits/[intentId]/route.ts',
       'apps/customer/app/api/projects/[projectId]/edits/route.ts',
+      'apps/customer/app/api/projects/[projectId]/generation/route.ts',
       'apps/customer/app/api/projects/[projectId]/preview/[draftId]/[[...route]]/route.ts',
+      'apps/customer/app/api/projects/accounts/route.ts',
       'apps/customer/app/api/projects/route.ts',
     ]);
-    expect((await productionFiles('apps/customer/app')).filter((f) => /page\.tsx$/.test(f)).sort()).toEqual(['apps/customer/app/page.tsx', 'apps/customer/app/projects/[projectId]/editor/page.tsx', 'apps/customer/app/projects/page.tsx']);
+    expect((await productionFiles('apps/customer/app')).filter((f) => /page\.tsx$/.test(f)).sort()).toEqual([
+      'apps/customer/app/page.tsx',
+      'apps/customer/app/projects/[projectId]/editor/page.tsx',
+      'apps/customer/app/projects/[projectId]/generating/page.tsx',
+      'apps/customer/app/projects/new/page.tsx',
+      'apps/customer/app/projects/page.tsx',
+    ]);
     // Draft authority reaches customers only as the editor's exact read: it claims, hands off, concludes or releases nothing.
     for (const file of await productionFiles('packages/customer-editor/src')) {
       expect(await src(file), file).not.toMatch(/claimCanonicalDraft|handOffCanonicalDraft|concludeCanonicalDraft|releaseCanonicalDraftClaim|canonicalDrafts\.(update|insert|delete|findOneAndUpdate)|promotions|releasePublications/);

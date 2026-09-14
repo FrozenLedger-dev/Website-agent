@@ -5,7 +5,7 @@
  * authors and cannot influence (Appendix B: "state belongs to the platform,
  * reasoning belongs to the model").
  */
-import type { ArtifactRef, AutonomyMode, JobRecord, JobSpec, ReviewOutcomeRecord, SemanticEditSuccessorProvenance, SemanticPatch, VisualRefinementSuccessorProvenance, WorkerRole } from '@statxai/contracts';
+import type { ArtifactRef, AutonomyMode, BusinessProfile, JobRecord, JobSpec, ReviewOutcomeRecord, SemanticEditSuccessorProvenance, SemanticPatch, VisualRefinementSuccessorProvenance, WorkerRole } from '@statxai/contracts';
 import type { Binary } from 'mongodb';
 
 /** Project lifecycle, distinct from job lifecycle. */
@@ -704,6 +704,79 @@ export interface CustomerLoginAttemptDocument {
   createdAt: Date;
   expiresAt: Date;
   consumedAt: Date | null;
+}
+
+// ---------------------------------------------------------------------------
+// Customer self-service initial draft generation
+// ---------------------------------------------------------------------------
+//
+// A separate authority from the operator console, exactly like customer
+// tenancy above: nothing here is created, read or trusted by operator HTTP
+// Basic auth. The customer never mints a project id, a job id or a draft id —
+// this document is the one durable record of "generate D0 for this project",
+// and everything downstream (`runProject`, its job lifecycle, its canonical
+// draft conclusion) is the same harness authority an operator run already
+// goes through.
+
+/** Forward only. There is no internal multi-stage status like a semantic edit's: one `runProject` call does the whole thing. */
+export type InitialDraftRequestStatus = 'queued' | 'active' | 'completed' | 'failed';
+
+/**
+ * A bounded, non-authoritative hint of where generation stands, derived from
+ * the run's own progress events. Never consulted to decide anything — only
+ * `status` and `disposition` are authority. Shown to the customer as-is.
+ */
+export type InitialDraftProgressHint = 'queued' | 'planning' | 'building' | 'validating' | 'finishing';
+
+/** One worker's lease on continuing one initial draft generation. Liveness only, exactly like a semantic edit's execution lease. */
+export interface InitialDraftExecutionLease {
+  token: string;
+  owner: string;
+  claimedAt: Date;
+  heartbeatAt: Date;
+  expiresAt: Date;
+}
+
+/** A failure a customer may be told about. Nothing internal — no provider message, stack trace, job id or lease token. */
+export type InitialDraftFailureReason =
+  /** The intake did not meet the minimum business-profile bar. Deterministic: retrying the same intake will not help. */
+  | 'invalid_request'
+  /** The build/validation/evaluation pipeline reached a known terminal stop for this intake. */
+  | 'generation_failed'
+  /** Bounded continuation attempts kept failing unexpectedly. */
+  | 'temporarily_unavailable'
+  /** Durable authority contradicts itself; an operator must look. */
+  | 'needs_attention';
+
+/**
+ * The durable authority for one customer-requested initial draft generation.
+ *
+ * `_id` is deterministic from the requesting account, the requesting customer
+ * user and the exact intake's content digest, so a replayed or double-submitted
+ * request always resolves to the same request, the same project and the same
+ * outcome — never a second project for the same brief. A *different* intake
+ * digests to a *different* id, so it is never rejected as a conflict: it is
+ * simply a different, independent request, for a different project.
+ */
+export interface InitialDraftRequestDocument {
+  _id: string;
+  accountId: string;
+  /** The one project this request generates a draft for — server-minted, before this document exists. */
+  projectId: string;
+  requestedBy: { customerUserId: string };
+  /** The exact validated intake this request was submitted with. Never widened or re-derived after creation. */
+  intake: BusinessProfile;
+  intakeDigest: string;
+  status: InitialDraftRequestStatus;
+  progress: InitialDraftProgressHint;
+  /** Set at `completed`. Never trusted alone — a reader re-proves the exact canonical draft before treating this as authority. */
+  resultDraftId?: string;
+  /** Set when this request will not be continued automatically again. */
+  disposition?: { kind: 'failed'; reason: InitialDraftFailureReason; at: Date };
+  execution?: InitialDraftExecutionLease;
+  executionFailures?: number;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 // ---------------------------------------------------------------------------

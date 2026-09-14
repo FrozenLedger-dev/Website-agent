@@ -57,7 +57,7 @@ describe('customer identity and project authority', () => {
       const code = await src(file);
       const imports = [...code.matchAll(/from '([^']+)'/g)].map((m) => m[1]);
       expect(imports.every((i) => i === '@statxai/customer-editor' || /\/lib\/deps$/.test(i!)), file).toBe(true);
-      expect(code, file).toMatch(/handleCustomer(Projects|EditorState|EditorPreview|EditSubmit|EditStatus)\(request, deps/);
+      expect(code, file).toMatch(/handleCustomer(Projects|ProjectCreate|CreateAccounts|EditorState|EditorPreview|EditSubmit|EditStatus|GenerationStatus)\(request, deps/);
     }
     for (const file of await allCustomerCode()) {
       const code = await src(file);

@@ -65,7 +65,9 @@ describe('the customer app surface', () => {
       'app/api/projects/[projectId]/editor/route.ts',
       'app/api/projects/[projectId]/edits/[intentId]/route.ts',
       'app/api/projects/[projectId]/edits/route.ts',
+      'app/api/projects/[projectId]/generation/route.ts',
       'app/api/projects/[projectId]/preview/[draftId]/[[...route]]/route.ts',
+      'app/api/projects/accounts/route.ts',
       'app/api/projects/route.ts',
       'app/error.tsx',
       'app/globals.css',
@@ -75,6 +77,10 @@ describe('the customer app surface', () => {
       'app/projects/[projectId]/editor/editor.tsx',
       'app/projects/[projectId]/editor/loading.tsx',
       'app/projects/[projectId]/editor/page.tsx',
+      'app/projects/[projectId]/generating/generating-status.tsx',
+      'app/projects/[projectId]/generating/page.tsx',
+      'app/projects/new/new-project-form.tsx',
+      'app/projects/new/page.tsx',
       'app/projects/page.tsx',
     ]);
   });

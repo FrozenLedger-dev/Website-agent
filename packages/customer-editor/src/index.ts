@@ -6,6 +6,7 @@
  * Browser code imports `@statxai/customer-editor/client` instead.
  */
 export * from './client.js';
+export * from './creation.js';
 export * from './editor-state.js';
 export * from './edits.js';
 export * from './http.js';

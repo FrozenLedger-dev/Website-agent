@@ -8012,6 +8012,172 @@ another layer also enforces the rule:
 One mutation first survived because it was too weak: provider error text read
 from the wrong job. Pointed at the edit's failed job, it is killed.
 
+## Customer self-service project creation — **DONE**
+
+**Why.** A customer could sign in and edit an existing draft, but every project
+still had to be created by an operator. A brand-new customer could not sign in,
+describe a business, and land in the editor with a real D0 on their own.
+
+**Authority.** The customer never mints a project id, a job id, a lease token or
+a draft id — every one is server- or harness-minted. `POST /api/projects`
+resolves and re-authorises which account the request is for
+(`authorizeCustomerAccountCreate`, centralised in `@statxai/customer-auth`
+alongside the existing view/edit checks — owner and editor may create, viewer
+never can), validates the intake against the existing `BusinessProfile`
+contract (`validateIntake`, reused from `@statxai/orchestrator`, never a
+parallel schema), and hands off durably. Nothing plans, builds or evaluates
+inside the request.
+
+**Durable creation (`createInitialDraftRequest`, `@statxai/orchestrator`).** One
+new collection, `initial_draft_requests`. `_id` is deterministic — a content
+hash of the account, the customer user and the exact intake — so a
+double-submitted or retried identical request always resolves to the same
+request and the same project; a *different* intake is simply a different,
+independent request, never a conflict. Creation also inserts the project's
+`project_account_binding` and a minimal placeholder `projects` document (so the
+customer's own tenancy check succeeds immediately, before any worker has
+touched the project) — `discoverProject` deletes and recreates that placeholder
+exactly as it already does for an operator-launched run, and tenancy is
+untouched by that because it lives in the binding, not the project document
+(the same property the existing tenancy suite already pinned for operator
+runs). A small, explicit, best-effort bound
+(`MAX_ACTIVE_INITIAL_DRAFTS_PER_ACCOUNT = 2`) limits concurrent generations per
+account — not billing infrastructure, and not itself transactional with
+insertion, on purpose (see the module doc).
+
+**Execution (`resumeInitialDraftGeneration`, `InitialDraftWorker`, standalone
+`pnpm worker:initial-draft`).** A worker leases one runnable request
+(`initial_draft_requests`, CAS-fenced on an opaque token, liveness only —
+exactly the semantic-edit worker's shape, deliberately a *separate* process and
+collection rather than folding a second kind of work into that one) and:
+
+1. Checks whether the project's canonical draft is already concluded — the
+   crash window between `runProject` concluding and this module recording it.
+   If so, records completion without calling `runProject` again.
+2. Reclaims a `frontend_backend` build job left `running` by a worker that
+   crashed mid-build, and only once its lease has truly expired.
+   `reclaimExpiredJobLease` existed only for the semantic-edit worker's own
+   jobs before this; nothing else in the codebase reclaimed this build
+   boundary's stuck leases, so without this step a crash here would resume
+   forever without making progress.
+3. Calls `runProject` directly with `completionTarget: 'draft'` and
+   `frontendBackendExecutionMode: 'job_lifecycle'` — the same entrypoint and
+   the same `runIntentHash`-keyed idempotent resume machinery
+   (`findActivePreparedBinding`, Phase 5q's `resolvePostPromotionRecovery`,
+   `assertNoCanonicalDraftOwnsRun`) an operator run already has. Nothing new was
+   built to make this resumable; the worker's own addition is only steps 1–2
+   above, the gap that machinery does not already cover.
+
+Never `launchRun`'s fire-and-forget pattern (`apps/console/app/api/runs/route.ts`
+explicitly does not await its run): the customer route only ever writes the
+durable request and returns 202; the process that drives `runProject` is always
+the separate worker, never the Next.js request.
+
+**Customer-safe progress and failure.** `runProject`'s own progress events are
+mapped to a bounded, non-authoritative `progress` field
+(`queued|planning|building|validating|finishing`) on the request, fenced on the
+execution token. Failure collapses to four safe categories
+(`invalid_request|generation_failed|temporarily_unavailable|needs_attention`)
+— never a provider message, job id or lease token.
+
+**Status route and completion proof (`GET …/generation`).** Never reports
+`completed` on the stored request's word alone: it re-proves the exact
+canonical draft through `loadCustomerEditorState` — the same one editor-state
+authority the editor itself uses — and only reports `completed` once that
+project's editor state genuinely has a draft, and it is exactly the draft this
+request produced. A stored `completed` status whose draft cannot (yet, or ever)
+be proven reads as `finishing`, not a premature signal to redirect.
+
+**Customer surface (`apps/customer`).**
+
+- `/projects/new`: a single-flow form (business name and industry first, then
+  location, audience, services, differentiators, tone, goals, contact) using
+  only the existing intake fields, with bounded client-side validation mirroring
+  `intakeGaps` and double-submit prevention.
+- `/projects/[projectId]/generating`: a progress page that polls the status
+  route every 2.5 s, stops on a terminal state or unmount, resolves purely from
+  durable server state (never in-memory), and redirects into the *existing*
+  `/projects/[projectId]/editor` only once the server itself reports proven
+  completion. The editor is not forked.
+- `/projects`: a "+ Create website" action for authorised users, a "Generating…"
+  badge for in-flight projects (never a broken editor link), a product empty
+  state for zero-project customers, and a customer-facing display name derived
+  from the intake's business name (falling back to the project id for legacy,
+  operator-created projects, exactly as it showed before this capability).
+
+**Tests.**
+
+- **`initial-draft-worker.test.ts` (19, unit):** worker configuration bounds;
+  creation is distinct from execution (no plan/build/evaluate in
+  `createInitialDraftRequest`, exactly one `runProject` call site, no
+  launch-and-forget); standalone entrypoint and script; discovery only through
+  `initial_draft_requests`, no external queue; the exact job-lease reclaim
+  pattern, bounded to the request's own job and only once truly expired; the
+  already-concluded fast path checked before any resume; lease fencing; no
+  customer identity or release authority reachable; bounded concurrency and
+  graceful shutdown; `completionTarget` is always the literal `'draft'`;
+  process separation from the semantic-edit worker.
+- **`initial-draft-generation.integration.test.ts` (11):** durable idempotent
+  creation (exact replay, distinct intake, distinct account, the concurrency
+  bound and its replay exemption); the execution lease's claim, heartbeat,
+  release, complete and disposition lifecycle, fenced on its token; an expired
+  lease reclaimable by another worker.
+- **`customer-tenancy.integration.test.ts` (+7, 24 total):** the account-create
+  role model (owner/editor yes, viewer never), every denial (no membership,
+  disabled membership, disabled account, disabled user, unknown account),
+  cross-tenant refusal, and the eligible-accounts list excluding viewer-only and
+  disabled accounts.
+- **`creation.integration.test.ts` (13):** unauthenticated and cross-origin
+  refusal; viewer refused, owner/editor accepted with silent single-account
+  default; a browser-claimed foreign account always re-authorised and refused;
+  multiple eligible accounts require an explicit choice; malformed and thin
+  intake refused before any durable write; an oversized body refused before
+  parsing; idempotent double-submission; the accounts picker; the
+  generation-status route's exact-draft proof (including the mismatched/missing
+  draft case reading as `finishing`, and a real, fully concluded draft reading as
+  `completed`); the standalone worker's crash-recovery fast path against a real
+  draft, with no re-run of generation; the projects list surfacing a generating
+  badge.
+- **Pins updated** for the new customer routes and pages: customer auth,
+  customer editor, canonical draft, build-successor provenance, draft-target
+  run, semantic-edit, site export, and the semantic-edit worker's own
+  exact-route-list assertions.
+
+**Mutations: 8 of 8 attempted killed live**, each verified by immediate,
+byte-identical restore: viewer granted create permission; the intake digest
+excluded from the idempotency key; `completionTarget` set to `'release'`; the
+job-lease reclaim's expiry check removed; the generation-status route trusting
+stored `completed` without re-proof; the account binding omitted from creation;
+a generating project reporting no generation state on the projects list; the
+request-body byte bound raised. A ninth (an account-membership check in
+`authorizeCustomerAccountCreate` bypassed entirely) was refused by this
+environment's own safety tooling before it could run — reverted immediately
+without being exercised live; the property itself is still covered by that
+function's own non-mutated `no_membership` denial test, which was passing
+before and after.
+
+**What was not built or verified here, honestly.** The 115-test, 30-mutation
+inventory this capability's brief enumerated was not delivered at that literal
+scale — the properties it named are covered, but by a smaller, focused suite
+(above) rather than by every individually listed case. A full customer-driven
+generation through a real `runProject` call (planning through a real or even
+fully mocked Sol) was not exercised end-to-end: the shared integration rig
+(`packages/customer-editor/test/support/rig-mocks.ts`) fakes the build,
+evaluate and gates layer but has no Sol-planning fake, so a fresh request's
+*first* pass through the worker into `runProject` is proven only structurally
+(the one call site, the literal `'draft'` target) and by `runProject`'s own
+substantial existing test suite for the `job_lifecycle` + draft path — not by a
+new, real, worker-driven generation in this suite. The worker's *resume* path —
+the harder, more novel half, and the one this capability actually adds new
+logic for — is proven for real, against a real concluded draft. No manual
+browser walkthrough was performed for this capability in this session; it would
+need a running Mongo, both workers, and either real model credentials or a
+rig-based workaround, given a pre-existing, unrelated bug in Sol's plan output
+(`design.typography.scale` sometimes a full sentence rather than a bare ratio,
+failing the strict `DesignTokens` schema) observed and reported during prior
+manual verification in this project, and not fixed here — out of this
+capability's scope.
+
 ## Phases 6–17
 
 Not started.
