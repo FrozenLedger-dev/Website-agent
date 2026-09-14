@@ -18,6 +18,12 @@ import type {
   ReleasePublicationDocument,
   ReviewDocument,
   VisualRefinementIntentDocument,
+  CustomerUserDocument,
+  CustomerAccountDocument,
+  CustomerMembershipDocument,
+  ProjectAccountBindingDocument,
+  CustomerSessionDocument,
+  CustomerLoginAttemptDocument,
 } from './documents.js';
 import type { RunDocument, RunEventDocument } from './runs.js';
 
@@ -124,6 +130,26 @@ export class StateStore {
    */
   get visualRefinementIntents(): Collection<VisualRefinementIntentDocument> {
     return this.db.collection<VisualRefinementIntentDocument>('visual_refinement_intents');
+  }
+  /** Customer people, by exact external identity. See `CustomerUserDocument`. */
+  get customerUsers(): Collection<CustomerUserDocument> {
+    return this.db.collection<CustomerUserDocument>('customer_users');
+  }
+  get customerAccounts(): Collection<CustomerAccountDocument> {
+    return this.db.collection<CustomerAccountDocument>('customer_accounts');
+  }
+  get customerMemberships(): Collection<CustomerMembershipDocument> {
+    return this.db.collection<CustomerMembershipDocument>('customer_memberships');
+  }
+  /** Which account each customer-accessible project belongs to. See `ProjectAccountBindingDocument`. */
+  get projectAccountBindings(): Collection<ProjectAccountBindingDocument> {
+    return this.db.collection<ProjectAccountBindingDocument>('project_account_bindings');
+  }
+  get customerSessions(): Collection<CustomerSessionDocument> {
+    return this.db.collection<CustomerSessionDocument>('customer_sessions');
+  }
+  get customerLoginAttempts(): Collection<CustomerLoginAttemptDocument> {
+    return this.db.collection<CustomerLoginAttemptDocument>('customer_login_attempts');
   }
 
   /**
@@ -284,6 +310,24 @@ export class StateStore {
     await this.visualRefinementIntents.createIndexes([
       { key: { projectId: 1, predecessorBindingId: 1 }, unique: true },
     ]);
+
+    // Customer identity and tenancy. Uniqueness here is the authority, not an
+    // optimisation: one external identity is one customer user, and one user
+    // has at most one membership in an account, so authority is never ambiguous.
+    await this.customerUsers.createIndexes([
+      { key: { issuer: 1, subject: 1 }, unique: true, name: 'issuer_1_subject_1' },
+    ]);
+    await this.customerMemberships.createIndexes([
+      { key: { accountId: 1, customerUserId: 1 }, unique: true, name: 'accountId_1_customerUserId_1' },
+      { key: { customerUserId: 1 } },
+    ]);
+    await this.projectAccountBindings.createIndexes([{ key: { accountId: 1 } }]);
+    // Expired rows are removed eventually; expiry is always checked on read regardless.
+    await this.customerSessions.createIndexes([
+      { key: { customerUserId: 1 } },
+      { key: { expiresAt: 1 }, expireAfterSeconds: 0 },
+    ]);
+    await this.customerLoginAttempts.createIndexes([{ key: { expiresAt: 1 }, expireAfterSeconds: 0 }]);
   }
 
   async close(): Promise<void> {

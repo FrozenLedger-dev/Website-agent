@@ -70,7 +70,8 @@ describe('identity is the harness’s, never positional or source-derived', () =
     const minters: string[] = [];
     for (const file of await allProductionFiles()) {
       const code = await src(file);
-      if (/`\$\{prefix\}_\$\{|`(pg|sec|blk|fld|ast)_\$\{/.test(code)) minters.push(file);
+      // Semantic IDs only: other opaque ids (customer users, accounts) are not the editable model's identity.
+      if ((/`\$\{prefix\}_\$\{/.test(code) && /'(pg|sec|blk|fld|ast)'/.test(code)) || /`(pg|sec|blk|fld|ast)_\$\{/.test(code)) minters.push(file);
       // No production file carries a hard-coded semantic ID.
       expect(code, file).not.toMatch(/\b(pg|sec|blk|fld|ast)_[a-f0-9]{16}\b/);
     }

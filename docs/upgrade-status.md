@@ -6853,6 +6853,213 @@ removed.
 **Not in this slice:** customer editor or UI, chat or click editing, applying
 patches to source, asset upload, rich text, and a Playwright-DOM marker check.
 
+## Customer authentication and project tenancy — **DONE**
+
+**Why.** The customer-editor gate stopped. The repository had one operator HTTP
+Basic login, no customer identity, no accounts, no project ownership, and APIs
+that trusted a `projectId` from the request. This slice is the security
+foundation: server-owned proof that authenticated customer P may view, or
+separately edit, project X. It builds no editor.
+
+**Gate findings.**
+
+- **Apps:** `apps/console` is the only app. Its operator middleware matches the
+  whole app except the `_next` build output, so adding customer routes there would
+  mean carving holes in operator protection.
+- **Auth libraries:** no auth library, IdP or customer configuration existed. The
+  registry is reachable, so OpenID Certified `openid-client` 6.8.8 (with `jose`
+  and `oauth4webapi`) is used. It is standards-based and provider-configurable,
+  so no vendor decision was needed.
+- **Tenancy storage:** discovery deletes and recreates `ProjectDocument` on every
+  fresh run, so a tenancy field stored on it would vanish.
+
+**Boundary.**
+
+- **Package:** `packages/customer-auth` holds the framework-agnostic
+  `Request → Response` authority.
+- **App:** `apps/customer` is a separate Next app on its own origin and port 3200.
+  It exposes only `GET /api/auth/login`, `GET /api/auth/callback`,
+  `POST /api/auth/logout` and `GET /api/auth/me`. It has no pages, no middleware
+  and no operator code.
+- **Operator side:** operator middleware and routes are unchanged.
+
+**Protocol and configuration.**
+
+- **Flow:** OpenID Connect Authorization Code with PKCE S256, plus `state` and
+  `nonce`. Discovery, the code exchange and ID token validation (issuer,
+  audience, expiry, nonce, state) are the library's.
+- **Signatures:** `enableNonRepudiationChecks` also verifies every ID token
+  signature against the provider JWKS.
+- **Environment variables (server-only):** `CUSTOMER_OIDC_ISSUER`,
+  `CUSTOMER_OIDC_CLIENT_ID`, `CUSTOMER_OIDC_CLIENT_SECRET` (optional: public
+  client plus PKCE), `CUSTOMER_APP_ORIGIN` and `CUSTOMER_SESSION_TTL_SECONDS`.
+- **Fail closed:**
+  - https is required in production;
+  - http is allowed only for a non-production localhost, and only there are
+    cookies not Secure;
+  - an unconfigured or undiscoverable provider makes every route return 503.
+- **Checks in our code:** the callback URL is rebuilt from the configured origin,
+  never the Host header. The ID token `iss` must equal the configured issuer, and
+  `sub` must be non-empty.
+- **Test-only setting:** `allowInsecureRequests` appears only in tests.
+
+**Principal, identity and sessions.**
+
+- **Boundary:** `requireCustomerPrincipal(request)` is the only way to resolve a
+  customer. It reads only the customer session cookie, never `Authorization`, so
+  Basic and bearer credentials are ignored.
+- **Session check:** it resolves a `customer_sessions` row keyed by the token's
+  sha256, which must be unexpired and unrevoked, then an active `customer_users`
+  row.
+- **Principal:** `{ customerUserId, externalIdentity: { issuer, subject }, authMethod: 'oidc_session' }`.
+- **Users:**
+  - `customer_users` has a unique index on `(issuer, subject)` and opaque
+    `cu_` ids;
+  - email and name are profile metadata only, and nothing looks a user up by
+    them;
+  - no provider token is stored.
+- **Login attempts:** a login attempt (state, nonce, PKCE verifier, a validated
+  same-site `returnTo`) is held server-side under a hashed, 10-minute cookie
+  token, and consumed exactly once.
+- **Cookies:** `__Host-` prefix, HttpOnly, SameSite=Lax, Path=/, host-only,
+  Max-Age bounded to 12 h by default and at most 7 days, and Secure.
+- **Revocation:**
+  - logout (a same-origin POST) revokes the session server-side at once;
+  - `revokeAllCustomerSessions` revokes everything a person holds;
+  - TTL indexes clean expired rows, and expiry is always checked on read.
+- **Same-origin rule:** `isSameOriginCustomerMutation` is the mutation rule every
+  future customer mutation route must call. Together with SameSite=Lax it replaces
+  any per-route token scheme.
+
+**Tenancy.**
+
+- **Accounts:** `customer_accounts` has opaque `acct_` ids, `status` and
+  `displayName`.
+- **Memberships:** `customer_memberships` holds `{accountId, customerUserId,
+  role: owner|editor|viewer, status}`, uniquely indexed on
+  `(accountId, customerUserId)`.
+- **Project ownership:** `project_account_bindings` is keyed by project id and
+  holds `{accountId, boundBy, boundAt}`. It is insert-only, is never transferred,
+  and survives discovery resetting the project document.
+- **Provisioning:** `createCustomerAccount`, `grantCustomerMembership`,
+  `setCustomerAccountStatus`, `setCustomerMembershipStatus` and
+  `bindProjectToCustomerAccount` are trusted server functions, not HTTP routes.
+- **Invite-only:** signing in creates no account and no membership.
+
+**Authorization.**
+
+- **Checks:** `authorizeCustomerProjectView(store, principal, projectId)` and
+  `authorizeCustomerProjectEdit(store, principal, projectId)`. They take no
+  account, role or membership parameter.
+- **Resolution, in order:**
+  1. the user is active, and their issuer and subject match the principal;
+  2. the project exists;
+  3. its persisted binding exists;
+  4. the account is active;
+  5. that user's membership in that account is active;
+  6. the role grants the permission.
+- **Roles:** `CUSTOMER_ROLE_PERMISSIONS` gives owner and editor view and edit,
+  and viewer view only.
+- **Denial:** typed denials stay server-side.
+  `customerProjectDenialResponse()` is one generic 404, so a project id reveals
+  nothing.
+- **Multiple accounts:** a person in several accounts gets authority only from
+  the project's own account.
+
+**Legacy.** Projects with no binding, meaning every historical and operator
+project, remain fully usable by the operator and are inaccessible to customers.
+There is no backfill and `ProjectDocument` is unchanged.
+
+**Tests.**
+
+- **`customer-auth.integration.test.ts` (24):**
+  - the real OIDC login against a local provider that signs RS256 tokens and
+    verifies PKCE;
+  - rejection of a tampered state, a foreign nonce, a wrong issuer, a wrong
+    audience, an expired token, a missing or empty subject, and a foreign
+    signing key;
+  - a wrong PKCE verifier, replay, a missing login cookie and a stale attempt;
+  - no secret or token in any response, and safe `returnTo`;
+  - identity uniqueness, email changes and same-email different subjects;
+  - logout revocation, cross-origin logout, expiry, revoke-all, forged cookies
+    and a disabled user;
+  - Basic and bearer credentials produce no principal;
+  - a safe `/me`.
+- **`customer-tenancy.integration.test.ts` (17):**
+  - the role matrix and no-membership case;
+  - disabled and re-enabled memberships and accounts;
+  - disabled users and identity mismatch;
+  - cross-tenant view and edit, dual-account authority, and smuggled fields;
+  - identical 404s;
+  - legacy projects;
+  - insert-only binding, survival of project resets, and durable membership
+    uniqueness;
+  - account validation.
+- **`customer-auth.test.ts` (13):** fail-closed configuration, cookie policy
+  and parsing, return paths, the same-origin rule, and the store never touched
+  without a session cookie.
+- **`apps/customer/test/customer-app.test.ts` (7):**
+  - a customer cookie does not authenticate the operator, and operator Basic
+    still works;
+  - exactly four routes;
+  - every route returns 503 unconfigured, even with operator Basic.
+- **`customer-auth-boundary.test.ts` (13, structural):**
+  - separation from operator auth;
+  - our explicit issuer and subject checks pinned;
+  - identity comes only from the cookie, and no route reads tenant ids;
+  - library-only OIDC with PKCE, state, nonce and signature checks;
+  - no insecure requests in production, and server-only secrets;
+  - hashed sessions and cookie flags;
+  - authorization resolves persisted tenancy only, bindings are insert-only, and
+    indexes are unique;
+  - no editor, patch endpoint or build import;
+  - no new successor kind, and the tool gateway unchanged.
+- **Build:** `next build` of `apps/customer` succeeds with no configuration,
+  producing four dynamic routes.
+
+**Mutations: 22 of 22 killed.** Each ran against the relevant unit, structural
+or integration suites. Sources were restored byte-identical after each.
+
+- **Separation:**
+  - operator Basic accepted as a customer principal;
+  - a customer session accepted as operator, at the console's auth function or
+    at a route.
+- **Identity checks:**
+  - our explicit issuer check removed;
+  - subject validation removed;
+  - identity keyed by email;
+  - external identity uniqueness removed.
+- **Sessions and cookies:**
+  - expired sessions accepted;
+  - revoked sessions accepted;
+  - HttpOnly dropped;
+  - Secure disabled in production;
+  - a session token exposed in `/me`.
+- **Tenancy:**
+  - the project's account replaced by a browser-claimed one;
+  - a project with no binding allowed;
+  - a missing membership allowed;
+  - a viewer allowed to edit;
+  - a disabled membership allowed;
+  - a disabled account allowed;
+  - cross-tenant view allowed;
+  - cross-tenant edit allowed;
+  - a duplicate membership accepted;
+  - the edit check bypassed.
+
+Two notes on how they were killed:
+
+- **Issuer check removed:** `openid-client` independently rejects a wrong issuer,
+  so the login test still refused the tampered token. The explicit check is
+  pinned structurally, and that structural test killed the mutation.
+- **Browser-claimed account:** the first run exposed a weak test that smuggled
+  an account the attacker did not belong to. It now smuggles the attacker's own
+  account and is killed behaviourally.
+
+**Not in this slice:** the customer editor, project routes, invitations or signup
+UX, organisation UI, IdP logout (RP-initiated), semantic-edit successor
+provenance, and patch-to-build application.
+
 ## Phases 6–17
 
 Not started.

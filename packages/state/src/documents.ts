@@ -413,6 +413,107 @@ export interface VisualRefinementIntentDocument {
 }
 
 // ---------------------------------------------------------------------------
+// Customer identity and tenancy
+// ---------------------------------------------------------------------------
+//
+// A separate authority from the operator console: nothing here is created,
+// read or trusted by operator HTTP Basic auth, and no operator credential is
+// ever a customer principal.
+
+/**
+ * One customer person, as the platform knows them.
+ *
+ * Identity is the exact external identity the configured OpenID provider
+ * asserted — `issuer` and `subject` together, uniquely indexed — never an email
+ * address. `email` and `displayName` are profile metadata, refreshed at login,
+ * and authorise nothing. No provider token is stored.
+ */
+export interface CustomerUserDocument {
+  /** Opaque, server-minted: `cu_` + 32 hex. */
+  _id: string;
+  issuer: string;
+  subject: string;
+  email: string | null;
+  emailVerified: boolean | null;
+  displayName: string | null;
+  status: 'active' | 'disabled';
+  createdAt: Date;
+  updatedAt: Date;
+  lastLoginAt: Date;
+}
+
+/** One customer tenant. Projects belong to exactly one; people reach them only through membership. */
+export interface CustomerAccountDocument {
+  /** Opaque, server-minted: `acct_` + 32 hex. */
+  _id: string;
+  displayName: string;
+  status: 'active' | 'disabled';
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export type CustomerRole = 'owner' | 'editor' | 'viewer';
+
+/** A customer user's authority in one account — at most one per (account, user), uniquely indexed. */
+export interface CustomerMembershipDocument {
+  _id: string;
+  accountId: string;
+  customerUserId: string;
+  role: CustomerRole;
+  status: 'active' | 'disabled';
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/**
+ * Which account one project belongs to — the persisted tenancy authority.
+ *
+ * Its own collection rather than a field on `ProjectDocument`, because a run
+ * deletes and recreates the project document at discovery: ownership stored
+ * there would silently vanish on the next run. `_id` is the project id, so a
+ * project can be bound at most once; a binding is insert-only and never
+ * transferred. A project with no binding — every historical and operator
+ * project — is not customer-accessible, and needs no migration.
+ */
+export interface ProjectAccountBindingDocument {
+  /** The project id. */
+  _id: string;
+  accountId: string;
+  /** Which trusted server authority bound it, for audit. */
+  boundBy: string;
+  boundAt: Date;
+}
+
+/**
+ * One customer login session. `_id` is the sha256 of the opaque cookie token,
+ * so the database never holds a usable credential. Expiry and revocation are
+ * decided here, server-side, on every request.
+ */
+export interface CustomerSessionDocument {
+  _id: string;
+  customerUserId: string;
+  createdAt: Date;
+  expiresAt: Date;
+  revokedAt: Date | null;
+}
+
+/**
+ * One in-flight OpenID login: the state, nonce and PKCE verifier the callback
+ * must match, held server-side under the sha256 of an opaque, short-lived
+ * cookie. Consumed at most once.
+ */
+export interface CustomerLoginAttemptDocument {
+  _id: string;
+  state: string;
+  nonce: string;
+  codeVerifier: string;
+  returnTo: string;
+  createdAt: Date;
+  expiresAt: Date;
+  consumedAt: Date | null;
+}
+
+// ---------------------------------------------------------------------------
 // Release publication (Phase 5p)
 // ---------------------------------------------------------------------------
 

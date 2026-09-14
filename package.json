@@ -20,7 +20,7 @@
     "release:reconcile": "node --env-file=.env.local --import tsx scripts/reconcile-release.ts",
     "scaffold:check": "node --import tsx scripts/scaffold-check.ts",
     "console": "cd apps/console && node --env-file=../../.env.local ./node_modules/next/dist/bin/next dev --port 3100",
-    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p apps/console/tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p apps/console/tsconfig.json && tsc --noEmit -p apps/customer/tsconfig.json",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "test": "vitest run",
